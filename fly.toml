@@ -17,6 +17,6 @@ primary_region = "iad"     # <-- keep this consistent with the volume region
   cpu_kind = "shared"
   cpus = 1
 
-[mounts]
-  source = "data"          # <-- volume name we'll create
-  destination = "/app/data"
+#[mounts]
+ # source = "data"          # <-- volume name we'll create
+#  destination = "/app/data"
