@@ -3,7 +3,11 @@ primary_region = "atl"
 
 [env]
   PORT = "8080"
-  DATA_DIR = "/data"   # only needed if you mount the volume (we will)
+  DATA_DIR = "/data"
+
+[mounts]
+  source = "data"
+  destination = "/data"
 
 [http_service]
   internal_port = 8080
@@ -15,17 +19,8 @@ primary_region = "atl"
 
   [[http_service.checks]]
     interval = "10s"
-    timeout = "2s"
+    timeout  = "2s"
     grace_period = "30s"
     method = "GET"
     path = "/health"
     protocol = "http"
-
-[mounts]
-  source = "data"
-  destination = "/data"
-
-[[vm]]
-  memory = "1gb"
-  cpu_kind = "shared"
-  cpus = 1
