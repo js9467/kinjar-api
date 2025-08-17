@@ -1,20 +1,16 @@
-# fly.toml app configuration file generated for kinjar-api on 2025-08-17T21:52:10Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
+app = "kinjar-api"
+primary_region = "iad"
 
-app = 'kinjar-api'
-primary_region = 'atl'
-
-[build]
+[env]
+  PORT = "8080"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = false      # <— turn off suspend
   auto_start_machines = true
-  min_machines_running = 0
-  processes = ['app']
+  min_machines_running = 1        # <— keep at least one up
+  processes = ["app"]
 
   [[http_service.checks]]
     interval = "10s"
@@ -25,12 +21,10 @@ primary_region = 'atl'
     protocol = "http"
 
 [[vm]]
-  memory = '512mb'
-  cpu_kind = 'shared'
+  memory = "512mb"
+  cpu_kind = "shared"
   cpus = 1
 
-  memory_mb = 512
-
+[mounts]
   source = "data"
   destination = "/app/data"
-
