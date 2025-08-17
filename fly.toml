@@ -25,6 +25,6 @@ primary_region = "iad"
   cpu_kind = "shared"
   cpus = 1
 
-[mounts]
-  source = "data"
-  destination = "/app/data"
+#[mounts]
+#  source = "data"
+#  destination = "/app/data"
