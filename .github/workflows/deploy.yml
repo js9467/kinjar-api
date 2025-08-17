@@ -1,4 +1,4 @@
-name: Deploy to Fly.io (ATL, 1 machine, 1 volume)
+name: Deploy to Fly.io (ATL • 1 machine • 1 volume)
 
 on:
   push:
@@ -21,11 +21,10 @@ jobs:
       - name: Install flyctl
         uses: superfly/flyctl-actions/setup-flyctl@v1
 
-      # Create app if missing (must specify org when non-interactive)
+      # Create the app once (non-interactive requires org slug)
       - name: Ensure app exists
         shell: bash
         run: |
-          set -euo pipefail
           if flyctl apps show "$FLY_APP" >/dev/null 2>&1; then
             echo "App exists."
           else
@@ -33,21 +32,23 @@ jobs:
             flyctl apps create "$FLY_APP" --org "$FLY_ORG"
           fi
 
-      # Force exactly one machine; primary_region in fly.toml handles placement
+      # Force exactly one machine (no prompt)
       - name: Scale to 1 machine
-        run: flyctl scale count 1 --app "$FLY_APP"
+        run: flyctl scale count 1 --app "$FLY_APP" --yes
 
-      # Ensure exactly one 'data' volume exists in ATL
+      # Ensure one 'data' volume exists in ATL (idempotent)
       - name: Ensure 'data' volume exists in ATL
         shell: bash
         run: |
           set -euo pipefail
-          if flyctl volumes list --app "$FLY_APP" | awk '$2=="data" && $4=="atl" {found=1} END{exit !found}'; then
+          if flyctl volumes list --app "$FLY_APP" | awk '$2=="data" && $4=="atl"{found=1} END{exit !found}'; then
             echo "Volume 'data' in atl already exists."
           else
             echo "Creating volume 'data' in atl…"
             flyctl volumes create data --app "$FLY_APP" --region "$FLY_REGION" --size 1
           fi
+          echo "Current volumes:"
+          flyctl volumes list --app "$FLY_APP"
 
       - name: Deploy (remote builder)
         run: flyctl deploy --app "$FLY_APP" --remote-only --verbose
