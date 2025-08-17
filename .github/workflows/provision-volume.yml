@@ -1,0 +1,31 @@
+name: Provision Fly Volume (ATL)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@v1
+
+      # Ensure we only need ONE volume and region is ATL
+      - name: Pin region to ATL & scale to 1
+        run: |
+          flyctl regions set atl --app kinjar-api
+          flyctl scale count 1 --app kinjar-api
+
+      # Create the volume if it doesn't already exist
+      - name: Create data volume in ATL if missing
+        shell: bash
+        run: |
+          if flyctl volumes list --app kinjar-api | grep -qE '\bdata\b.*\batl\b'; then
+            echo "Volume 'data' in atl already exists. Skipping."
+          else
+            flyctl volumes create data --app kinjar-api --region atl --size 1
+          fi
+
+      - name: Show volumes
+        run: flyctl volumes list --app kinjar-api
