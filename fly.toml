@@ -1,9 +1,9 @@
 app = "kinjar-api"
-primary_region = "atl"         # set to atl so placement matches your volumes
+primary_region = "atl"
 
 [env]
   PORT = "8080"
-  DATA_DIR = "/data"           # only if you're mounting the volume
+  DATA_DIR = "/data"   # only needed if you mount the volume (we will)
 
 [http_service]
   internal_port = 8080
