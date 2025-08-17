@@ -3,28 +3,32 @@ primary_region = "iad"
 
 [env]
   PORT = "8080"
+  # If you later add a volume mounted at /data, uncomment the next line:
+  # DATA_DIR = "/data"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = false      # <— turn off suspend
+  auto_stop_machines = true
   auto_start_machines = true
-  min_machines_running = 1        # <— keep at least one up
+  min_machines_running = 1
   processes = ["app"]
 
+  # Deploy/run-time HTTP health check hitting /health
   [[http_service.checks]]
     interval = "10s"
     timeout = "2s"
     grace_period = "30s"
-    method = "get"
+    method = "GET"
     path = "/health"
     protocol = "http"
 
 [[vm]]
-  memory = "512mb"
+  memory = "1gb"
   cpu_kind = "shared"
   cpus = 1
 
-#[mounts]
-#  source = "data"
-#  destination = "/app/data"
+# If/when you create a Fly volume named "data" in IAD, you can mount it:
+# [mounts]
+#   source = "data"
+#   destination = "/data"
