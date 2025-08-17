@@ -1,4 +1,4 @@
-name: Deploy to Fly.io (1 machine, 1 volume, ATL)
+name: Deploy to Fly.io (ATL, 1 machine, 1 volume)
 
 on:
   push:
@@ -8,10 +8,10 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     env:
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       FLY_APP: kinjar-api
+      FLY_ORG: kinjar
       FLY_REGION: atl
 
     steps:
@@ -21,27 +21,31 @@ jobs:
       - name: Install flyctl
         uses: superfly/flyctl-actions/setup-flyctl@v1
 
-      # Make the deployment idempotent and simple:
-      # - Create app if missing
-      # - Pin region ATL
-      # - Scale to 1 machine
-      # - Create one "data" volume in ATL if missing
-      - name: Prep infra (app/region/scale/volume)
+      # Create app if missing (must specify org when non-interactive)
+      - name: Ensure app exists
         shell: bash
         run: |
           set -euo pipefail
-          # create app if it doesn't exist (ignore if it already does)
-          flyctl apps create "$FLY_APP" || echo "App exists"
-
-          # pin region & scale to exactly 1 machine
-          flyctl regions set "$FLY_REGION" --app "$FLY_APP"
-          flyctl scale count 1 --app "$FLY_APP"
-
-          # ensure one 'data' volume exists in ATL
-          if flyctl volumes list --app "$FLY_APP" | grep -qE '\bdata\b.*\b'"$FLY_REGION"'\b'; then
-            echo "Volume 'data' in $FLY_REGION already exists."
+          if flyctl apps show "$FLY_APP" >/dev/null 2>&1; then
+            echo "App exists."
           else
-            echo "Creating volume 'data' in $FLY_REGION…"
+            echo "Creating app in org $FLY_ORG…"
+            flyctl apps create "$FLY_APP" --org "$FLY_ORG"
+          fi
+
+      # Force exactly one machine; primary_region in fly.toml handles placement
+      - name: Scale to 1 machine
+        run: flyctl scale count 1 --app "$FLY_APP"
+
+      # Ensure exactly one 'data' volume exists in ATL
+      - name: Ensure 'data' volume exists in ATL
+        shell: bash
+        run: |
+          set -euo pipefail
+          if flyctl volumes list --app "$FLY_APP" | awk '$2=="data" && $4=="atl" {found=1} END{exit !found}'; then
+            echo "Volume 'data' in atl already exists."
+          else
+            echo "Creating volume 'data' in atl…"
             flyctl volumes create data --app "$FLY_APP" --region "$FLY_REGION" --size 1
           fi
 
