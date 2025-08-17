@@ -1,0 +1,17 @@
+name: Create Fly Volume
+on:
+  workflow_dispatch:
+
+jobs:
+  create-volume:
+    runs-on: ubuntu-latest
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@v1
+      - name: Create volume
+        run: |
+          flyctl volumes create data --app kinjar-api --region iad --size 1
+      - name: Show volumes
+        run: |
+          flyctl volumes list --app kinjar-api
