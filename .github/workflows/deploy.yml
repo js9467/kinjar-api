@@ -1,0 +1,49 @@
+name: Deploy to Fly.io (1 machine, 1 volume, ATL)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      FLY_APP: kinjar-api
+      FLY_REGION: atl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@v1
+
+      # Make the deployment idempotent and simple:
+      # - Create app if missing
+      # - Pin region ATL
+      # - Scale to 1 machine
+      # - Create one "data" volume in ATL if missing
+      - name: Prep infra (app/region/scale/volume)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # create app if it doesn't exist (ignore if it already does)
+          flyctl apps create "$FLY_APP" || echo "App exists"
+
+          # pin region & scale to exactly 1 machine
+          flyctl regions set "$FLY_REGION" --app "$FLY_APP"
+          flyctl scale count 1 --app "$FLY_APP"
+
+          # ensure one 'data' volume exists in ATL
+          if flyctl volumes list --app "$FLY_APP" | grep -qE '\bdata\b.*\b'"$FLY_REGION"'\b'; then
+            echo "Volume 'data' in $FLY_REGION already exists."
+          else
+            echo "Creating volume 'data' in $FLY_REGION…"
+            flyctl volumes create data --app "$FLY_APP" --region "$FLY_REGION" --size 1
+          fi
+
+      - name: Deploy (remote builder)
+        run: flyctl deploy --app "$FLY_APP" --remote-only --verbose
