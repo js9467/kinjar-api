@@ -1,5 +1,5 @@
 app = "kinjar-api"
-primary_region = "iad"     # <-- keep this consistent with the volume region
+primary_region = "iad"
 
 [env]
   PORT = "8080"
@@ -17,6 +17,7 @@ primary_region = "iad"     # <-- keep this consistent with the volume region
   cpu_kind = "shared"
   cpus = 1
 
-#[mounts]
- # source = "data"          # <-- volume name we'll create
-#  destination = "/app/data"
+# Persist SQLite + uploads
+[mounts]
+  source = "data"
+  destination = "/app/data"
