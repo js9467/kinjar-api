@@ -1,54 +1,33 @@
-name: Deploy to Fly.io (ATL • 1 machine • 1 volume)
-
+name: Deploy to Fly
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
-  workflow_dispatch: {}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-      FLY_APP: kinjar-api
-      FLY_ORG: kinjar
-      FLY_REGION: atl
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
 
-      - name: Install flyctl
-        uses: superfly/flyctl-actions/setup-flyctl@v1
-
-      # Create the app once (non-interactive requires org slug)
-      - name: Ensure app exists
-        shell: bash
-        run: |
-          if flyctl apps show "$FLY_APP" >/dev/null 2>&1; then
-            echo "App exists."
-          else
-            echo "Creating app in org $FLY_ORG…"
-            flyctl apps create "$FLY_APP" --org "$FLY_ORG"
-          fi
-
-      # Force exactly one machine (no prompt)
-      - name: Scale to 1 machine
-        run: flyctl scale count 1 --app "$FLY_APP" --yes
-
-      # Ensure one 'data' volume exists in ATL (idempotent)
-      - name: Ensure 'data' volume exists in ATL
-        shell: bash
+      - name: Ensure volume exists (idempotent)
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP: kinjar-api
+          VOLUME_NAME: data
+          REGION: atl
         run: |
           set -euo pipefail
-          if flyctl volumes list --app "$FLY_APP" | awk '$2=="data" && $4=="atl"{found=1} END{exit !found}'; then
-            echo "Volume 'data' in atl already exists."
+          if flyctl volumes list --app "$FLY_APP" | awk '{print $1, $3}' | grep -q "^$VOLUME_NAME $REGION$"; then
+            echo "Volume $VOLUME_NAME in $REGION already exists."
           else
-            echo "Creating volume 'data' in atl…"
-            flyctl volumes create data --app "$FLY_APP" --region "$FLY_REGION" --size 1
+            echo "Creating volume $VOLUME_NAME in $REGION..."
+            flyctl volumes create "$VOLUME_NAME" --region "$REGION" --size 3 --app "$FLY_APP" --yes
           fi
-          echo "Current volumes:"
-          flyctl volumes list --app "$FLY_APP"
 
-      - name: Deploy (remote builder)
-        run: flyctl deploy --app "$FLY_APP" --remote-only --verbose
+      - name: Deploy
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl deploy --app kinjar-api --remote-only
