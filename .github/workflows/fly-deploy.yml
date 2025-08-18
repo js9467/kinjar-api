@@ -2,46 +2,53 @@ name: Deploy kinjar-api to Fly.io
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 env:
   FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
   FLY_APP: kinjar-api
-  MACHINE_ID: 2867643a606e08     # update if your machine ID changes
+  PRIMARY_REGION: atl
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Install flyctl
-        uses: superfly/flyctl-actions/setup-flyctl@master
+        uses: superfly/flyctl-actions/setup-flyctl@v1
 
-      - name: Preflight (prove we’re using the root fly.toml and it has [mounts])
+      - name: Verify flyctl
+        run: |
+          which fly
+          fly version
+
+      - name: Preflight (verify files and mounts)
         run: |
           set -euo pipefail
-          test -f ./fly.toml || { echo "fly.toml not found at repo root"; exit 1; }
-          test -f ./Dockerfile || { echo "Dockerfile not found at repo root"; exit 1; }
-          echo "=== fly.toml (first 200 lines) ==="
-          nl -ba ./fly.toml | sed -n '1,200p'
-          echo "=== Verify [mounts] block exists and points to /data ==="
+          test -f ./fly.toml
+          test -f ./Dockerfile
+          echo "=== Verify [mounts] -> /data ==="
           grep -n '^\[mounts\]' ./fly.toml
           grep -n 'source *= *"data"' ./fly.toml
           grep -n 'destination *= *"/data"' ./fly.toml
 
-      - name: Deploy (update existing machine only)
+      - name: Ensure volume exists
         run: |
           set -euo pipefail
-          fly deploy -a "$FLY_APP" \
-            --config ./fly.toml \
-            --dockerfile ./Dockerfile \
-            --only-machines "$MACHINE_ID" \
-            --update-only \
-            --now
+          if fly volumes list -a "$FLY_APP" | awk '{print $2}' | grep -qx data; then
+            echo "Volume 'data' already exists."
+          else
+            fly volumes create data -a "$FLY_APP" -r "$PRIMARY_REGION" --size 1
+          fi
+          fly volumes list -a "$FLY_APP"
+
+      - name: Deploy (remote build)
+        run: |
+          set -euo pipefail
+          fly deploy -a "$FLY_APP" --config ./fly.toml --dockerfile ./Dockerfile --remote-only --now
 
       - name: Post-deploy sanity
         run: |
