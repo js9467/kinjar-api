@@ -1,0 +1,120 @@
+name: Deploy kinjar-api to Fly.io
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      fly_app:
+        description: "Fly app name"
+        required: true
+        default: "kinjar-api"
+      machine_id:
+        description: "Target machine ID to update (no new machines)"
+        required: true
+        default: "2867643a606e08"
+      workdir:
+        description: "Path in repo with fly.toml & Dockerfile"
+        required: true
+        default: "backend"  # change if your files live elsewhere
+      use_existing_image:
+        description: "Set to a registry image tag to skip building (optional)"
+        required: false
+        default: ""
+
+env:
+  FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Ensure Fly token is present
+        run: |
+          set -euo pipefail
+          if [[ -z "${FLY_API_TOKEN:-}" ]]; then
+            echo "FLY_API_TOKEN secret is missing."
+            exit 1
+          fi
+
+      - name: Set inputs / defaults
+        id: cfg
+        run: |
+          set -euo pipefail
+          # Inputs (with defaults for push events)
+          FLY_APP="${{ github.event.inputs.fly_app || 'kinjar-api' }}"
+          MACHINE_ID="${{ github.event.inputs.machine_id || '2867643a606e08' }}"
+          WORKDIR="${{ github.event.inputs.workdir || 'backend' }}"
+          EXISTING_IMAGE="${{ github.event.inputs.use_existing_image || '' }}"
+
+          echo "fly_app=$FLY_APP" >> $GITHUB_OUTPUT
+          echo "machine_id=$MACHINE_ID" >> $GITHUB_OUTPUT
+          echo "workdir=$WORKDIR" >> $GITHUB_OUTPUT
+          echo "existing_image=$EXISTING_IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Show working dir and key files
+        run: |
+          set -euo pipefail
+          cd "${{ steps.cfg.outputs.workdir }}"
+          ls -la
+          test -f fly.toml || (echo "fly.toml not found in $PWD" && exit 1)
+          # Dockerfile is optional if using an existing image
+          if [[ ! -f Dockerfile && -z "${{ steps.cfg.outputs.existing_image }}" ]]; then
+            echo "Dockerfile not found and no existing image provided."
+            exit 1
+          fi
+
+      - name: Guardrail: block volume creation in CI
+        run: |
+          set -euo pipefail
+          # Prevent accidental new volume creation
+          if grep -R -nE "fly (volumes|volume) create" .; then
+            echo "Refusing to run: detected 'fly volumes create' in repo."
+            exit 1
+          fi
+          # Prevent implicit mounts that cause new volumes (machines flags)
+          if grep -R -nE -- "--mounts +source=" .; then
+            echo "Refusing to run: detected '--mounts source=' which can create volumes."
+            exit 1
+          fi
+
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy (update existing machine only)
+        working-directory: ${{ steps.cfg.outputs.workdir }}
+        run: |
+          set -euo pipefail
+          APP="${{ steps.cfg.outputs.fly_app }}"
+          MID="${{ steps.cfg.outputs.machine_id }}"
+          IMG="${{ steps.cfg.outputs.existing_image }}"
+
+          if [[ -n "$IMG" ]]; then
+            echo "Deploying existing image: $IMG"
+            fly deploy -a "$APP" \
+              --image "$IMG" \
+              --only-machines "$MID" \
+              --update-only \
+              --now
+          else
+            echo "Building from Dockerfile and deploying…"
+            fly deploy -a "$APP" \
+              --only-machines "$MID" \
+              --update-only \
+              --now
+          fi
+
+      - name: Post-deploy sanity
+        run: |
+          set -euo pipefail
+          fly status -a "${{ steps.cfg.outputs.fly_app }}"
+          fly machines list -a "${{ steps.cfg.outputs.fly_app }}"
+          # NOTE: We **do not** create or destroy volumes here.
