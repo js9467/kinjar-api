@@ -3,16 +3,38 @@ import json
 import logging
 from typing import List, Optional
 from uuid import uuid4
+from urllib.parse import urlparse
 
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 import boto3
 from botocore.config import Config as BotoConfig
+
 import psycopg
 from psycopg_pool import ConnectionPool
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://...pooler.neon.tech/... ?sslmode=require
+# ----------------------------
+# DB (Neon / Postgres)
+# ----------------------------
+DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://user:pass@proj.pooler.neon.tech/db?sslmode=require
 DB_POOL: ConnectionPool | None = None
+
+
+def db_exec(sql: str, params: tuple = ()):
+    if not DATABASE_URL or not DB_POOL:
+        return
+    with DB_POOL.connection() as conn:
+        conn.execute(sql, params)
+
+
+def db_fetchall(sql: str, params: tuple = ()):
+    if not DATABASE_URL or not DB_POOL:
+        return []
+    with DB_POOL.connection() as conn:
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+
 
 def init_db():
     """Tiny pool + create table if missing."""
@@ -21,31 +43,32 @@ def init_db():
         return
     DB_POOL = ConnectionPool(
         conninfo=DATABASE_URL,
-        min_size=1, max_size=4, timeout=10,
+        min_size=1,
+        max_size=4,
+        timeout=10,
         kwargs={"autocommit": True},
     )
     with DB_POOL.connection() as conn:
-        # No extensions needed. Use 'key' as the primary key.
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS assets (
-          key TEXT PRIMARY KEY,
-          tenant_slug TEXT NOT NULL,
-          filename TEXT NOT NULL,
-          content_type TEXT NOT NULL,
-          status TEXT NOT NULL,   -- 'presigned' | 'uploaded'
-          size BIGINT,
-          etag TEXT,
-          version_id TEXT,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        """)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS assets (
+              key TEXT PRIMARY KEY,
+              tenant_slug TEXT NOT NULL,
+              filename TEXT NOT NULL,
+              content_type TEXT NOT NULL,
+              status TEXT NOT NULL,   -- 'presigned' | 'uploaded'
+              size BIGINT,
+              etag TEXT,
+              version_id TEXT,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
 
-
-
-
-
-
+# ----------------------------
+# Env helpers
+# ----------------------------
 def env_str(name: str, default: Optional[str] = None) -> str:
     val = os.getenv(name, default)
     if val is None:
@@ -70,7 +93,6 @@ API_KEYS: List[str] = [x.strip() for x in os.getenv("API_KEYS", "").split(",") i
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv("ALLOWED_ORIGINS", "").split(",") if x.strip()]
 
 # R2 / S3-compatible storage
-# Prefer explicit S3_ENDPOINT; if not set, derive from R2_ACCOUNT_ID
 S3_ENDPOINT = os.getenv("S3_ENDPOINT")
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 if not S3_ENDPOINT and R2_ACCOUNT_ID:
@@ -78,17 +100,21 @@ if not S3_ENDPOINT and R2_ACCOUNT_ID:
 
 S3_ACCESS_KEY = env_str("S3_ACCESS_KEY_ID", os.getenv("R2_ACCESS_KEY_ID"))
 S3_SECRET_KEY = env_str("S3_SECRET_ACCESS_KEY", os.getenv("R2_SECRET_ACCESS_KEY"))
-S3_BUCKET     = env_str("S3_BUCKET")
+S3_BUCKET = env_str("S3_BUCKET")
 
 PRESIGN_EXPIRES_SECONDS = env_int("PRESIGN_EXPIRES_SECONDS", 60)
-PRESIGN_MAX_MB          = env_int("PRESIGN_MAX_MB", 50)
-PRESIGN_PREFIX          = os.getenv("PRESIGN_PREFIX", "t/")
-REQUIRE_TENANT          = os.getenv("REQUIRE_TENANT", "1") in ("1", "true", "TRUE")
+PRESIGN_MAX_MB = env_int("PRESIGN_MAX_MB", 50)
+PRESIGN_PREFIX = os.getenv("PRESIGN_PREFIX", "t/")
+REQUIRE_TENANT = os.getenv("REQUIRE_TENANT", "1") in ("1", "true", "TRUE")
+
+# Optional public base (e.g., r2.dev or CDN) for direct viewing
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # e.g. https://kinjar-media.r2.dev
 
 # ----------------------------
 # App setup
 # ----------------------------
 app = Flask(APP_NAME)
+init_db()
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(APP_NAME)
@@ -110,6 +136,7 @@ def require_api_key():
     if not provided or provided not in API_KEYS:
         return make_response(jsonify({"ok": False, "error": "Unauthorized"}), 401)
 
+
 def parse_tenant_slug() -> Optional[str]:
     slug = request.headers.get("x-tenant-slug")
     if slug:
@@ -121,22 +148,29 @@ def parse_tenant_slug() -> Optional[str]:
             return s
     return None
 
+
 def s3_client():
     if not S3_ENDPOINT:
         raise RuntimeError("S3_ENDPOINT (or R2_ACCOUNT_ID) is required")
     return boto3.client(
         "s3",
-        endpoint_url=S3_ENDPOINT,                 # e.g. https://<ACCOUNT>.r2.cloudflarestorage.com
-        region_name="auto",                       # required for R2 SigV4
+        endpoint_url=S3_ENDPOINT,  # https://<ACCOUNT>.r2.cloudflarestorage.com
+        region_name="auto",        # required for R2 SigV4
         aws_access_key_id=S3_ACCESS_KEY,
         aws_secret_access_key=S3_SECRET_KEY,
         config=BotoConfig(
-            signature_version="s3v4",            # <-- FORCE SigV4
-            s3={"addressing_style": "virtual"},  # <-- needed for R2
+            signature_version="s3v4",           # force SigV4
+            s3={"addressing_style": "virtual"}, # needed for R2
         ),
     )
 
-    
+
+def public_url_for(key: str) -> str:
+    """Build a public URL if the bucket is public; else, caller should use /presign-get."""
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL.rstrip('/')}/{key.lstrip('/')}"
+    host = urlparse(S3_ENDPOINT).netloc  # e.g. 6023...c616.r2.cloudflarestorage.com
+    return f"https://{S3_BUCKET}.{host}/{key}"
 
 # ----------------------------
 # Routes
@@ -144,6 +178,7 @@ def s3_client():
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "status": "healthy", "name": APP_NAME})
+
 
 @app.get("/version")
 def version():
@@ -154,6 +189,7 @@ def version():
     except FileNotFoundError:
         pass
     return jsonify({"ok": True, "version": v})
+
 
 @app.get("/presign-get")
 def presign_get():
@@ -168,9 +204,10 @@ def presign_get():
     url = s3.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": S3_BUCKET, "Key": key},
-        ExpiresIn=60,  # tweak as needed
+        ExpiresIn=60,
     )
     return jsonify({"ok": True, "url": url})
+
 
 @app.post("/presign")
 def presign():
@@ -193,11 +230,7 @@ def presign():
         return jsonify({"ok": False, "error": "filename and contentType required"}), 400
 
     # Guard key prefix if configured
-    if PRESIGN_PREFIX and not PRESIGN_PREFIX.endswith("/"):
-        prefix = PRESIGN_PREFIX + "/"
-    else:
-        prefix = PRESIGN_PREFIX
-
+    prefix = (PRESIGN_PREFIX + "/") if (PRESIGN_PREFIX and not PRESIGN_PREFIX.endswith("/")) else PRESIGN_PREFIX
     key = f"{prefix}{tenant}/posts/{uuid4()}/{filename}"
 
     # Generate presigned PUT URL (R2 supports PUT, not POST)
@@ -208,16 +241,37 @@ def presign():
             "Bucket": S3_BUCKET,
             "Key": key,
             "ContentType": content_type,
+            # Optionally add cache control:
+            # "CacheControl": "public, max-age=31536000, immutable",
         },
         ExpiresIn=PRESIGN_EXPIRES_SECONDS,
     )
 
-    return jsonify({
-        "ok": True,
-        "key": key,
-        "put": {"url": put_url, "headers": {"Content-Type": content_type}},
-        "maxMB": PRESIGN_MAX_MB,
-    })
+    # record presign intent in DB
+    db_exec(
+        """
+        INSERT INTO assets (key, tenant_slug, filename, content_type, status)
+        VALUES (%s, %s, %s, %s, 'presigned')
+        ON CONFLICT (key) DO UPDATE SET
+          tenant_slug = EXCLUDED.tenant_slug,
+          filename = EXCLUDED.filename,
+          content_type = EXCLUDED.content_type,
+          status = 'presigned',
+          updated_at = now();
+        """,
+        (key, tenant, filename, content_type),
+    )
+
+    return jsonify(
+        {
+            "ok": True,
+            "key": key,
+            "put": {"url": put_url, "headers": {"Content-Type": content_type}},
+            "publicUrl": public_url_for(key),  # if bucket is public, this will work directly
+            "maxMB": PRESIGN_MAX_MB,
+        }
+    )
+
 
 @app.get("/r2/head")
 def r2_head():
@@ -230,48 +284,99 @@ def r2_head():
     try:
         s3 = s3_client()
         obj = s3.head_object(Bucket=S3_BUCKET, Key=key)
-        return jsonify({
-            "ok": True,
-            "exists": True,
-            "size": obj.get("ContentLength"),
-            "contentType": obj.get("ContentType"),
-        })
+
+        # update DB on success
+        size = obj.get("ContentLength")
+        ctype = obj.get("ContentType")
+        etag = obj.get("ETag")
+        version_id = obj.get("VersionId")
+        db_exec(
+            """
+            UPDATE assets
+               SET status = 'uploaded',
+                   size = %s,
+                   etag = %s,
+                   version_id = %s,
+                   content_type = %s,
+                   updated_at = now()
+             WHERE key = %s;
+            """,
+            (size, etag, version_id, ctype, key),
+        )
+
+        return jsonify(
+            {
+                "ok": True,
+                "exists": True,
+                "size": size,
+                "contentType": ctype,
+            }
+        )
     except Exception as e:
         return jsonify({"ok": True, "exists": False, "error": str(e)})
+
+
+@app.get("/assets")
+def list_assets():
+    unauthorized = require_api_key()
+    if unauthorized:
+        return unauthorized
+    tenant = parse_tenant_slug() or request.args.get("tenant") or "default"
+    rows = db_fetchall(
+        """
+        SELECT key, filename, content_type, status, size, etag, version_id, created_at, updated_at
+          FROM assets
+         WHERE tenant_slug = %s
+         ORDER BY created_at DESC
+         LIMIT 50
+        """,
+        (tenant,),
+    )
+    return jsonify({"ok": True, "tenant": tenant, "items": rows})
+
 
 @app.get("/diag/s3")
 def diag_s3():
     try:
         c = s3_client()
-        # make a throwaway PUT presign to inspect query params (no upload)
         test_url = c.generate_presigned_url(
             ClientMethod="put_object",
             Params={"Bucket": S3_BUCKET, "Key": "diag/test.txt", "ContentType": "text/plain"},
             ExpiresIn=60,
         )
-        return jsonify({
-            "ok": True,
-            "sigv4_in_url": ("X-Amz-Signature=" in test_url),
-            "url_sample": test_url[:120] + "...",
-            "config_sigver": getattr(getattr(c, "meta", None), "config", None).signature_version if getattr(getattr(c, "meta", None), "config", None) else None
-        })
+        return jsonify(
+            {
+                "ok": True,
+                "sigv4_in_url": ("X-Amz-Signature=" in test_url) or ("X-Amz-Algorithm=AWS4-HMAC-SHA256" in test_url),
+                "url_sample": test_url[:120] + "...",
+                "config_sigver": getattr(getattr(c, "meta", None), "config", None).signature_version
+                if getattr(getattr(c, "meta", None), "config", None)
+                else None,
+            }
+        )
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.get("/diag/routes")
 def diag_routes():
     try:
-        return jsonify({
-            "ok": True,
-            "routes": [f"{r.rule} -> {','.join(sorted(r.methods or []))}" for r in app.url_map.iter_rules()]
-        })
+        return jsonify(
+            {
+                "ok": True,
+                "routes": [f"{r.rule} -> {','.join(sorted(r.methods or []))}" for r in app.url_map.iter_rules()],
+            }
+        )
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 # Global error handler
 @app.errorhandler(Exception)
 def handle_unexpected(e):
     logger.exception("unhandled error")
     return make_response(jsonify({"ok": False, "error": str(e)}), 500)
+
 
 # Dev entry
 if __name__ == "__main__":
