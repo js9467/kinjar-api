@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# System deps (optional, keeps image small)
+# System deps (keeps image small)
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -24,5 +24,5 @@ USER appuser
 
 EXPOSE 8080
 
-# Gunicorn (prod)
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "-w", "${GUNICORN_WORKERS}", "--threads", "${GUNICORN_THREADS}", "app:app"]
+# IMPORTANT: use shell form so ${...} env vars expand
+CMD gunicorn -b 0.0.0.0:8080 -w ${GUNICORN_WORKERS:-2} --threads ${GUNICORN_THREADS:-8} app:app
