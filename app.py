@@ -7,26 +7,21 @@ from uuid import uuid4
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 import boto3
-from botocore.client import Config as BotoConfig
+from botocore.config import Config as BotoConfig  # <- correct import
 
-
-# ----------------------------
-# Configuration helpers
-# ----------------------------
 def s3_client():
-    if not S3_ENDPOINT:
-        raise RuntimeError("S3_ENDPOINT (or R2_ACCOUNT_ID) is required")
     return boto3.client(
         "s3",
-        endpoint_url=S3_ENDPOINT,
-        region_name="auto",  # R2 accepts "auto" (or use "us-east-1")
-        aws_access_key_id=S3_ACCESS_KEY,
-        aws_secret_access_key=S3_SECRET_KEY,
+        endpoint_url=f"https://{os.getenv('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com",
+        region_name="auto",  # or "us-east-1"
+        aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"),
         config=BotoConfig(
-            signature_version="s3v4",                  # <-- force SigV4
-            s3={"addressing_style": "virtual"}         # needed for R2 path-style
+            signature_version="s3v4",
+            s3={"addressing_style": "virtual"},
         ),
     )
+
     
     def env_str(name: str, default: Optional[str] = None) -> str:
     val = os.getenv(name, default)
