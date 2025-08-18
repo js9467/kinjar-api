@@ -9,10 +9,26 @@ from flask_cors import CORS
 import boto3
 from botocore.client import Config as BotoConfig
 
+
 # ----------------------------
 # Configuration helpers
 # ----------------------------
-def env_str(name: str, default: Optional[str] = None) -> str:
+def s3_client():
+    if not S3_ENDPOINT:
+        raise RuntimeError("S3_ENDPOINT (or R2_ACCOUNT_ID) is required")
+    return boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT,
+        region_name="auto",  # R2 accepts "auto" (or use "us-east-1")
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY,
+        config=BotoConfig(
+            signature_version="s3v4",                  # <-- force SigV4
+            s3={"addressing_style": "virtual"}         # needed for R2 path-style
+        ),
+    )
+    
+    def env_str(name: str, default: Optional[str] = None) -> str:
     val = os.getenv(name, default)
     if val is None:
         raise RuntimeError(f"Missing required env var: {name}")
