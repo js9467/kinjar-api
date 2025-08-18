@@ -123,6 +123,23 @@ def version():
         pass
     return jsonify({"ok": True, "version": v})
 
+@app.get("/presign-get")
+def presign_get():
+    unauthorized = require_api_key()
+    if unauthorized:
+        return unauthorized
+    key = request.args.get("key")
+    if not key:
+        return jsonify({"ok": False, "error": "missing key"}), 400
+
+    s3 = s3_client()
+    url = s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=60,  # tweak as needed
+    )
+    return jsonify({"ok": True, "url": url})
+
 @app.post("/presign")
 def presign():
     # Auth
