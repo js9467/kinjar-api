@@ -8,7 +8,7 @@ on:
 env:
   FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
   FLY_APP: kinjar-api
-  PRIMARY_REGION: atl
+  PRIMARY_REGION: atl   # keep if you want, but volume may land in a fallback region
 
 jobs:
   deploy:
@@ -17,14 +17,14 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # Install flyctl via script and persist to PATH for later steps
-      - name: Install flyctl (script)
+      - name: Install flyctl + jq
         shell: bash
         run: |
           set -euo pipefail
           curl -L https://fly.io/install.sh | sh
           echo "$HOME/.fly/bin" >> "$GITHUB_PATH"
-          # For current step only (future steps use GITHUB_PATH)
+          sudo apt-get update -y
+          sudo apt-get install -y jq
           export PATH="$HOME/.fly/bin:$PATH"
           which fly
           fly version
@@ -34,29 +34,61 @@ jobs:
           set -euo pipefail
           test -f ./fly.toml
           test -f ./Dockerfile
-          echo "=== Verify [mounts] -> /data ==="
           grep -n '^\[mounts\]' ./fly.toml
           grep -n 'source *= *"data"' ./fly.toml
           grep -n 'destination *= *"/data"' ./fly.toml
 
-      - name: Ensure volume exists
+      - name: Ensure single data volume (with regional fallback)
+        shell: bash
         run: |
           set -euo pipefail
-          if fly volumes list -a "$FLY_APP" | awk '{print $2}' | grep -qx data; then
-            echo "Volume 'data' already exists."
+          export PATH="$HOME/.fly/bin:$PATH"
+
+          echo "Checking for existing 'data' volumes..."
+          EXISTING_JSON="$(fly volumes list -a "$FLY_APP" -j || echo '[]')"
+          COUNT="$(echo "$EXISTING_JSON" | jq '[.[] | select(.Name=="data")] | length')"
+          if [ "$COUNT" -ge 1 ]; then
+            echo "A 'data' volume already exists. Skipping creation."
+            echo "$EXISTING_JSON" | jq -r '.[] | select(.Name=="data") | "Volume: \(.ID) Region: \(.Region) SizeGB: \(.SizeGb)"'
           else
-            fly volumes create data -a "$FLY_APP" -r "$PRIMARY_REGION" --size 1
+            echo "No 'data' volume found. Attempting to create..."
+            # Regions to try in order (primary, then fallbacks)
+            REGIONS="$PRIMARY_REGION iad ord"
+            CREATED=0
+            for R in $REGIONS; do
+              echo "Trying region: $R"
+              if fly volumes create data -a "$FLY_APP" -r "$R" --size 1; then
+                echo "Created 'data' volume in region $R"
+                CREATED=1
+                break
+              else
+                echo "Failed to create volume in $R; trying next..."
+              fi
+            done
+            if [ "$CREATED" -ne 1 ]; then
+              echo "ERROR: Unable to create 'data' volume in any candidate region."
+              exit 1
+            fi
           fi
+
+          echo "Current volumes:"
           fly volumes list -a "$FLY_APP"
 
       - name: Deploy (remote build)
         run: |
           set -euo pipefail
-          fly deploy -a "$FLY_APP" --config ./fly.toml --dockerfile ./Dockerfile --remote-only --now
+          export PATH="$HOME/.fly/bin:$PATH"
+          fly deploy \
+            -a "$FLY_APP" \
+            --config ./fly.toml \
+            --dockerfile ./Dockerfile \
+            --remote-only \
+            --now
 
       - name: Post-deploy sanity
         run: |
           set -euo pipefail
+          export PATH="$HOME/.fly/bin:$PATH"
           fly status -a "$FLY_APP"
           fly machines list -a "$FLY_APP"
           fly volumes list -a "$FLY_APP"
