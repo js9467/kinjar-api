@@ -17,11 +17,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install flyctl
-        uses: superfly/flyctl-actions/setup-flyctl@v1
-
-      - name: Verify flyctl
+      # Install flyctl via script and persist to PATH for later steps
+      - name: Install flyctl (script)
+        shell: bash
         run: |
+          set -euo pipefail
+          curl -L https://fly.io/install.sh | sh
+          echo "$HOME/.fly/bin" >> "$GITHUB_PATH"
+          # For current step only (future steps use GITHUB_PATH)
+          export PATH="$HOME/.fly/bin:$PATH"
           which fly
           fly version
 
