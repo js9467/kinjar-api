@@ -8,9 +8,7 @@ on:
 env:
   FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
   FLY_APP: kinjar-api
-  MACHINE_ID: 2867643a606e08      # update if your machine ID changes
-  WORKDIR: backend                 # folder that contains fly.toml (change if needed)
-  EXISTING_IMAGE: ""               # set to an image tag to skip building (optional)
+  MACHINE_ID: 2867643a606e08     # update if your machine ID changes
 
 jobs:
   deploy:
@@ -23,37 +21,31 @@ jobs:
       - name: Install flyctl
         uses: superfly/flyctl-actions/setup-flyctl@master
 
-      - name: Sanity check files
+      - name: Preflight (prove we’re using the root fly.toml and it has [mounts])
         run: |
           set -euo pipefail
-          cd "$WORKDIR"
-          test -f fly.toml || { echo "fly.toml not found in $PWD"; exit 1; }
-          if [[ -z "$EXISTING_IMAGE" && ! -f Dockerfile ]]; then
-            echo "Dockerfile not found and no EXISTING_IMAGE provided."
-            exit 1
-          fi
+          test -f ./fly.toml || { echo "fly.toml not found at repo root"; exit 1; }
+          test -f ./Dockerfile || { echo "Dockerfile not found at repo root"; exit 1; }
+          echo "=== fly.toml (first 200 lines) ==="
+          nl -ba ./fly.toml | sed -n '1,200p'
+          echo "=== Verify [mounts] block exists and points to /data ==="
+          grep -n '^\[mounts\]' ./fly.toml
+          grep -n 'source *= *"data"' ./fly.toml
+          grep -n 'destination *= *"/data"' ./fly.toml
 
       - name: Deploy (update existing machine only)
         run: |
           set -euo pipefail
-          cd "$WORKDIR"
-          if [[ -n "$EXISTING_IMAGE" ]]; then
-            echo "Deploying existing image: $EXISTING_IMAGE"
-            fly deploy -a "$FLY_APP" \
-              --image "$EXISTING_IMAGE" \
-              --only-machines "$MACHINE_ID" \
-              --update-only \
-              --now
-          else
-            echo "Building from Dockerfile and deploying…"
-            fly deploy -a "$FLY_APP" \
-              --only-machines "$MACHINE_ID" \
-              --update-only \
-              --now
-          fi
+          fly deploy -a "$FLY_APP" \
+            --config ./fly.toml \
+            --dockerfile ./Dockerfile \
+            --only-machines "$MACHINE_ID" \
+            --update-only \
+            --now
 
       - name: Post-deploy sanity
         run: |
           set -euo pipefail
           fly status -a "$FLY_APP"
           fly machines list -a "$FLY_APP"
+          fly volumes list -a "$FLY_APP"
