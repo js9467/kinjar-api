@@ -1,9 +1,8 @@
 import os
-import uuid
 import json
 import logging
-from datetime import timedelta
 from typing import List, Optional
+from uuid import uuid4
 
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
@@ -11,7 +10,7 @@ import boto3
 from botocore.client import Config as BotoConfig
 
 # ----------------------------
-# Configuration
+# Configuration helpers
 # ----------------------------
 def env_str(name: str, default: Optional[str] = None) -> str:
     val = os.getenv(name, default)
@@ -28,53 +27,39 @@ def env_int(name: str, default: int) -> int:
 APP_NAME = os.getenv("APP_NAME", "kinjar-api")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# Security
-# Comma-separated API keys allowed to call sensitive endpoints (e.g., presign)
-# Generate one and set the same value in your Vercel project as X-API-Key
-API_KEYS: List[str] = [
-    x.strip() for x in os.getenv("API_KEYS", "").split(",") if x.strip()
-]
+# Security (comma-separated list)
+API_KEYS: List[str] = [x.strip() for x in os.getenv("API_KEYS", "").split(",") if x.strip()]
 
 # CORS
-ALLOWED_ORIGINS = [
-    x.strip() for x in os.getenv("ALLOWED_ORIGINS", "").split(",") if x.strip()
-]
+ALLOWED_ORIGINS = [x.strip() for x in os.getenv("ALLOWED_ORIGINS", "").split(",") if x.strip()]
 
 # R2 / S3-compatible storage
-# For Cloudflare R2: endpoint like https://<ACCOUNT_ID>.r2.cloudflarestorage.com
-S3_ENDPOINT = os.getenv("S3_ENDPOINT")  # if not set and R2_ACCOUNT_ID is set, we derive it below
+# Prefer explicit S3_ENDPOINT; if not set, derive from R2_ACCOUNT_ID
+S3_ENDPOINT = os.getenv("S3_ENDPOINT")
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 if not S3_ENDPOINT and R2_ACCOUNT_ID:
     S3_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
 S3_ACCESS_KEY = env_str("S3_ACCESS_KEY_ID", os.getenv("R2_ACCESS_KEY_ID"))
 S3_SECRET_KEY = env_str("S3_SECRET_ACCESS_KEY", os.getenv("R2_SECRET_ACCESS_KEY"))
-S3_BUCKET     = env_str("S3_BUCKET", None)
+S3_BUCKET     = env_str("S3_BUCKET")
 
-# Presign behavior
-PRESIGN_EXPIRES_SECONDS = env_int("PRESIGN_EXPIRES_SECONDS", 60)         # 1 min
-PRESIGN_MAX_MB          = env_int("PRESIGN_MAX_MB", 50)                  # 50MB
-PRESIGN_PREFIX          = os.getenv("PRESIGN_PREFIX", "t/")              # key prefix guard
-
-# Optional: require a tenant slug for presign
-REQUIRE_TENANT = os.getenv("REQUIRE_TENANT", "1") in ("1", "true", "TRUE")
+PRESIGN_EXPIRES_SECONDS = env_int("PRESIGN_EXPIRES_SECONDS", 60)
+PRESIGN_MAX_MB          = env_int("PRESIGN_MAX_MB", 50)
+PRESIGN_PREFIX          = os.getenv("PRESIGN_PREFIX", "t/")
+REQUIRE_TENANT          = os.getenv("REQUIRE_TENANT", "1") in ("1", "true", "TRUE")
 
 # ----------------------------
-# App & Logging
+# App setup
 # ----------------------------
 app = Flask(APP_NAME)
 
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(APP_NAME)
 
-# CORS: allow only the specified origins
 if ALLOWED_ORIGINS:
     CORS(app, supports_credentials=False, origins=ALLOWED_ORIGINS)
 else:
-    # Default to no cross-origin unless explicitly allowed
     CORS(app, supports_credentials=False, origins=[])
 
 # ----------------------------
@@ -83,25 +68,21 @@ else:
 def require_api_key():
     """Require X-API-Key for sensitive routes."""
     if not API_KEYS:
-        # If you really want to run without API keys (dev), allow it—but log loudly.
-        logger.warning("API_KEYS is empty; /presign is unsecured!")
+        logger.warning("API_KEYS is empty; sensitive endpoints are unsecured!")
         return
-    provided = request.headers.get("X-API-Key") or request.args.get("api_key")
+    provided = request.headers.get("X-API-Key") or request.headers.get("x-api-key") or request.args.get("api_key")
     if not provided or provided not in API_KEYS:
         return make_response(jsonify({"ok": False, "error": "Unauthorized"}), 401)
 
 def parse_tenant_slug() -> Optional[str]:
-    # Accept either header or JSON body field
     slug = request.headers.get("x-tenant-slug")
     if slug:
         return slug.strip()
     if request.is_json:
-        try:
-            data = request.get_json(silent=True) or {}
-            slug = (data.get("tenant_slug") or "").strip()
-            return slug or None
-        except Exception:
-            return None
+        data = (request.get_json(silent=True) or {})
+        s = (data.get("tenant_slug") or "").strip()
+        if s:
+            return s
     return None
 
 def s3_client():
@@ -112,7 +93,7 @@ def s3_client():
         endpoint_url=S3_ENDPOINT,
         aws_access_key_id=S3_ACCESS_KEY,
         aws_secret_access_key=S3_SECRET_KEY,
-        config=BotoConfig(s3={"addressing_style": "virtual"})
+        config=BotoConfig(s3={"addressing_style": "virtual"}),  # needed for R2
     )
 
 # ----------------------------
@@ -132,44 +113,35 @@ def version():
         pass
     return jsonify({"ok": True, "version": v})
 
-from flask import Flask, request, jsonify
-import os
-import boto3
-from uuid import uuid4
-
-app = Flask(__name__)
-
-def s3_client():
-    return boto3.client(
-        "s3",
-        endpoint_url=f"https://{os.getenv('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com",
-        aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"),
-    )
-
-S3_BUCKET = os.getenv("S3_BUCKET", "kinjar-media")
-
-@app.route("/presign", methods=["POST"])
+@app.post("/presign")
 def presign():
-    # auth
-    api_key = request.headers.get("x-api-key")
-    expected_keys = os.getenv("API_KEYS", "").split(",")
-    if not api_key or api_key not in expected_keys:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    # Auth
+    unauthorized = require_api_key()
+    if unauthorized:
+        return unauthorized
 
-    # tenant
-    tenant = request.headers.get("x-tenant-slug")
-    if not tenant:
+    # Tenant (optional enforcement)
+    tenant = parse_tenant_slug()
+    if REQUIRE_TENANT and not tenant:
         return jsonify({"ok": False, "error": "missing tenant slug"}), 400
+    tenant = tenant or "default"
 
+    # Body
     data = request.get_json(force=True)
     filename = data.get("filename")
     content_type = data.get("contentType")
     if not filename or not content_type:
         return jsonify({"ok": False, "error": "filename and contentType required"}), 400
 
-    key = f"t/{tenant}/posts/{uuid4()}/{filename}"
+    # Guard key prefix if configured
+    if PRESIGN_PREFIX and not PRESIGN_PREFIX.endswith("/"):
+        prefix = PRESIGN_PREFIX + "/"
+    else:
+        prefix = PRESIGN_PREFIX
 
+    key = f"{prefix}{tenant}/posts/{uuid4()}/{filename}"
+
+    # Generate presigned PUT URL (R2 supports PUT, not POST)
     s3 = s3_client()
     put_url = s3.generate_presigned_url(
         ClientMethod="put_object",
@@ -178,18 +150,15 @@ def presign():
             "Key": key,
             "ContentType": content_type,
         },
-        ExpiresIn=int(os.getenv("PRESIGN_EXPIRES_SECONDS", "60")),
+        ExpiresIn=PRESIGN_EXPIRES_SECONDS,
     )
 
     return jsonify({
         "ok": True,
         "key": key,
-        "put": { "url": put_url, "headers": { "Content-Type": content_type } }
+        "put": {"url": put_url, "headers": {"Content-Type": content_type}},
+        "maxMB": PRESIGN_MAX_MB,
     })
-
-
-
-
 
 @app.get("/r2/head")
 def r2_head():
@@ -202,17 +171,31 @@ def r2_head():
     try:
         s3 = s3_client()
         obj = s3.head_object(Bucket=S3_BUCKET, Key=key)
-        return jsonify({"ok": True, "exists": True, "size": obj.get("ContentLength"), "contentType": obj.get("ContentType")})
+        return jsonify({
+            "ok": True,
+            "exists": True,
+            "size": obj.get("ContentLength"),
+            "contentType": obj.get("ContentType"),
+        })
     except Exception as e:
         return jsonify({"ok": True, "exists": False, "error": str(e)})
 
-# Global error handler (clean JSON)
+@app.get("/diag/routes")
+def diag_routes():
+    try:
+        return jsonify({
+            "ok": True,
+            "routes": [f"{r.rule} -> {','.join(sorted(r.methods or []))}" for r in app.url_map.iter_rules()]
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# Global error handler
 @app.errorhandler(Exception)
 def handle_unexpected(e):
     logger.exception("unhandled error")
     return make_response(jsonify({"ok": False, "error": str(e)}), 500)
 
-# Gunicorn entrypoint expects "app:app"
+# Dev entry
 if __name__ == "__main__":
-    # Dev server (not used on Fly)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
