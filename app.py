@@ -5,7 +5,7 @@ import uuid
 import shutil
 import logging
 from datetime import datetime
-from typing import Tuple, Dict, Any, List
+from typing import Tuple, Dict, Any, List, Optional
 
 from flask import Flask, request, jsonify, send_from_directory, abort
 from werkzeug.utils import secure_filename
@@ -53,6 +53,8 @@ def tenant_dir(tenant: str) -> str:
     os.makedirs(td, exist_ok=True)
     os.makedirs(os.path.join(td, "uploads"), exist_ok=True)
     os.makedirs(os.path.join(td, "notes"), exist_ok=True)
+    # ==== NEW: posts storage directory ====
+    os.makedirs(os.path.join(td, "data"), exist_ok=True)
     return td
 
 def disk_info(path: str) -> Dict[str, Any]:
@@ -95,6 +97,47 @@ def list_files_for_tenant(tenant: str) -> List[Dict[str, Any]]:
             except FileNotFoundError:
                 continue
     return sorted(files, key=lambda x: x["name"])
+
+# ==== NEW: tenant resolution & posts persistence helpers ====
+def _sanitize_tenant(raw: str) -> Optional[str]:
+    # allow simple family slugs: letters, numbers, dash, underscore
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    for ch in raw:
+        if not (ch.isalnum() or ch in "-_"):
+            return None
+    return raw
+
+def resolve_tenant_from_request() -> Optional[str]:
+    # Prefer X-Family header (frontend default)
+    t = request.headers.get("X-Family")
+    t = t or request.args.get("tenant") or request.form.get("tenant")
+    return _sanitize_tenant(t or "")
+
+def posts_path(tenant: str) -> str:
+    return os.path.join(tenant_dir(tenant), "data", "posts.json")
+
+def load_posts(tenant: str) -> List[Dict[str, Any]]:
+    fp = posts_path(tenant)
+    if not os.path.exists(fp):
+        return []
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            return []
+    except Exception as e:
+        log.warning("Failed to read posts for %s: %s", tenant, e)
+        return []
+
+def save_posts(tenant: str, posts: List[Dict[str, Any]]) -> None:
+    fp = posts_path(tenant)
+    tmp = fp + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(posts, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, fp)
 
 # -----------------------
 # Core Endpoints
@@ -178,13 +221,13 @@ def list_notes(tenant: str):
 def upload():
     """
     Multipart upload with fields:
-      - tenant (required)
+      - tenant (required)  (or use X-Family header instead)
       - file (required)
     Saves to /data/tenants/<tenant>/uploads/<safe_filename>
     """
-    tenant = (request.form.get("tenant") or "").strip()
+    tenant = resolve_tenant_from_request()
     if not tenant:
-        return _err("Missing 'tenant' form field", 400)
+        return _err("Missing tenant (X-Family header or tenant form field)", 400)
 
     if "file" not in request.files:
         return _err("Missing 'file' in form-data", 400)
@@ -225,11 +268,11 @@ def upload():
 def list_files():
     """
     List files for a tenant.
-    Query params: ?tenant=<tenant>
+    Query params: ?tenant=<tenant> (or X-Family header)
     """
-    tenant = (request.args.get("tenant") or "").strip()
+    tenant = resolve_tenant_from_request()
     if not tenant:
-        return _err("Missing 'tenant' query param", 400)
+        return _err("Missing tenant (X-Family header or tenant query param)", 400)
 
     files = list_files_for_tenant(tenant)
     return jsonify({"tenant": tenant, "files": files})
@@ -238,18 +281,102 @@ def list_files():
 def get_file(tenant: str, filename: str):
     up_dir = os.path.join(tenant_dir(tenant), "uploads")
     safe_name = secure_filename(filename)  # ensure traversal safety
-    # Maintain subpaths if any (e.g., album/name.jpg) by normalizing
-    # but only serve from uploads root:
     requested = os.path.normpath(os.path.join(up_dir, safe_name))
     if not requested.startswith(up_dir):
         abort(404)
     if not os.path.exists(requested):
         abort(404)
-    # Use send_from_directory with relative path to avoid exposing full paths
     rel_dir = os.path.relpath(os.path.dirname(requested), up_dir)
     rel_name = os.path.basename(requested)
     serve_dir = up_dir if rel_dir == "." else os.path.join(up_dir, rel_dir)
     return send_from_directory(serve_dir, rel_name, as_attachment=False)
+
+# -----------------------
+# ==== NEW: Posts API (matches frontend contract) ====
+# -----------------------
+# Schema:
+# {
+#   "id": "uuid",
+#   "kind": "text" | "image",
+#   "body": "str?"           # for text posts
+#   "image_url": "str?"      # for image posts
+#   "created_at": "ISO8601Z",
+#   "public": bool,
+#   "author": "str?"
+# }
+
+@app.get("/posts")
+def list_posts():
+    """
+    Returns posts for a tenant (family).
+    - Tenant resolved via X-Family header, ?tenant query param, or form fallback.
+    - Optional filter: ?public=1 to return only public posts.
+    """
+    tenant = resolve_tenant_from_request()
+    if not tenant:
+        return _err("Missing tenant (X-Family header or tenant query param)", 400)
+
+    only_public = (request.args.get("public") in ("1", "true", "True"))
+
+    posts = load_posts(tenant)
+    if only_public:
+        posts = [p for p in posts if bool(p.get("public"))]
+
+    # Sort newest first by created_at (fallback to id if missing)
+    def _key(p: Dict[str, Any]):
+        ts = p.get("created_at") or ""
+        return ts
+    posts_sorted = sorted(posts, key=_key, reverse=True)
+    return jsonify(posts_sorted), 200
+
+@app.post("/posts")
+def create_post():
+    """
+    Create a post for the tenant (family).
+    Body JSON:
+      { kind: "text" | "image", body?, image_url?, public?: bool, author?: str }
+    """
+    tenant = resolve_tenant_from_request()
+    if not tenant:
+        return _err("Missing tenant (X-Family header or tenant query param)", 400)
+
+    try:
+        data = request.get_json(force=True, silent=False)
+    except Exception:
+        return _err("Invalid JSON body", 400)
+
+    if not isinstance(data, dict):
+        return _err("JSON body must be an object", 400)
+
+    kind = (data.get("kind") or "").strip().lower()
+    if kind not in ("text", "image"):
+        return _err("Field 'kind' must be 'text' or 'image'", 400)
+
+    body = (data.get("body") or "").strip()
+    image_url = (data.get("image_url") or "").strip()
+    author = (data.get("author") or "").strip()
+    is_public = bool(data.get("public", False))
+
+    if kind == "text" and not body:
+        return _err("Text post requires 'body'", 400)
+    if kind == "image" and not image_url:
+        return _err("Image post requires 'image_url'", 400)
+
+    post = {
+        "id": uuid.uuid4().hex,
+        "kind": kind,
+        "body": body if kind == "text" else None,
+        "image_url": image_url if kind == "image" else None,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "public": is_public,
+        "author": author or None,
+    }
+
+    posts = load_posts(tenant)
+    posts.append(post)
+    save_posts(tenant, posts)
+
+    return jsonify(post), 201
 
 # -----------------------
 # Error Handlers
