@@ -1,4 +1,4 @@
-app = "kinjar-api"         # <-- change if creating a new app
+app = "kinjar-api"         # change if different
 primary_region = "atl"
 
 [env]
