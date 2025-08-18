@@ -16,6 +16,7 @@ primary_region = 'atl'
   min_machines_running = 0
   processes = ['app']
 
+
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
