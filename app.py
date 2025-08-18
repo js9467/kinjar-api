@@ -335,6 +335,21 @@ def list_assets():
     return jsonify({"ok": True, "tenant": tenant, "items": rows})
 
 
+@app.get("/diag/db")
+def diag_db():
+    if not DATABASE_URL:
+        return jsonify({"ok": False, "error": "DATABASE_URL not set"}), 500
+    if not DB_POOL:
+        return jsonify({"ok": False, "error": "DB pool not initialized"}), 500
+    try:
+        with DB_POOL.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("select current_database(), current_user, now()")
+                db, usr, ts = cur.fetchone()
+        return jsonify({"ok": True, "db": db, "user": usr, "now": ts.isoformat()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.get("/diag/s3")
 def diag_s3():
     try:
