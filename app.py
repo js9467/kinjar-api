@@ -11,20 +11,7 @@ from botocore.config import Config as BotoConfig
 
 
 
-def s3_client():
-    if not S3_ENDPOINT:
-        raise RuntimeError("S3_ENDPOINT (or R2_ACCOUNT_ID) is required")
-    return boto3.client(
-        "s3",
-        endpoint_url=S3_ENDPOINT,                # e.g. https://<ACCOUNT>.r2.cloudflarestorage.com
-        region_name="auto",                      # or "us-east-1"
-        aws_access_key_id=S3_ACCESS_KEY,
-        aws_secret_access_key=S3_SECRET_KEY,
-        config=BotoConfig(
-            signature_version="s3v4",           # <-- FORCE SigV4
-            s3={"addressing_style": "virtual"}, # <-- needed for R2
-        ),
-    )
+
 
 
 def env_str(name: str, default: Optional[str] = None) -> str:
@@ -107,10 +94,16 @@ def s3_client():
         raise RuntimeError("S3_ENDPOINT (or R2_ACCOUNT_ID) is required")
     return boto3.client(
         "s3",
-        endpoint_url=S3_ENDPOINT,
+        endpoint_url=S3_ENDPOINT,                 # e.g. https://<ACCOUNT>.r2.cloudflarestorage.com
+        region_name="auto",                       # required for R2 SigV4
         aws_access_key_id=S3_ACCESS_KEY,
         aws_secret_access_key=S3_SECRET_KEY,
-        config=BotoConfig(s3={"addressing_style": "virtual"}),  # needed for R2
+        config=BotoConfig(
+            signature_version="s3v4",            # <-- FORCE SigV4
+            s3={"addressing_style": "virtual"},  # <-- needed for R2
+        ),
+    )
+
     )
 
 # ----------------------------
