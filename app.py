@@ -8,6 +8,38 @@ from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 import boto3
 from botocore.config import Config as BotoConfig
+import psycopg
+from psycopg_pool import ConnectionPool
+
+DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://...pooler.neon.tech/... ?sslmode=require
+DB_POOL: ConnectionPool | None = None
+
+def init_db():
+    """Tiny pool + create table if missing."""
+    global DB_POOL
+    if not DATABASE_URL:
+        return
+    DB_POOL = ConnectionPool(
+        conninfo=DATABASE_URL,
+        min_size=1, max_size=4, timeout=10,
+        kwargs={"autocommit": True},
+    )
+    with DB_POOL.connection() as conn:
+        # No extensions needed. Use 'key' as the primary key.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS assets (
+          key TEXT PRIMARY KEY,
+          tenant_slug TEXT NOT NULL,
+          filename TEXT NOT NULL,
+          content_type TEXT NOT NULL,
+          status TEXT NOT NULL,   -- 'presigned' | 'uploaded'
+          size BIGINT,
+          etag TEXT,
+          version_id TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        """)
 
 
 
