@@ -30,3 +30,8 @@ primary_region = "atl"
   memory = "512mb"
   cpu_kind = "shared"
   cpus = 1
+# ...your existing fly.toml...
+
+[[mounts]]
+  source = "data"        # the volume NAME from `fly volumes list`
+  destination = "/data"  # typical mount path; use the actual one if you set it differently
