@@ -1,5 +1,8 @@
 app = "kinjar-api"
 primary_region = "atl"
+[deploy]
+  strategy = "immediate"
+
 
 [env]
   PORT = "8080"
