@@ -19,12 +19,13 @@ primary_region = "atl"
   processes = ["app"]
 
   [[http_service.checks]]
-    interval = "10s"
-    timeout = "2s"
+    interval = "15s"
+    timeout  = "5s"
+    grace_period = "60s"
     method = "GET"
     path = "/health"
     protocol = "http"
-    grace_period = "30s"
+
 
 [[vm]]
   memory = "512mb"
