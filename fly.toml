@@ -1,9 +1,8 @@
-# fly.toml
 app = 'kinjar-api'
 primary_region = 'atl'
 
 [env]
-  DATA_DIR = "/data"        # if your app expects it
+  DATA_DIR = "/data"   # if your app expects it
 
 [http_service]
   internal_port = 8080
@@ -14,7 +13,7 @@ primary_region = 'atl'
   processes = ['app']
 
 [mounts]
-  source = "data"           # must match the volume NAME
+  source = "data"       # must match the VOLUME NAME
   destination = "/data"
 
 [[vm]]
