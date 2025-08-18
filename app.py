@@ -139,7 +139,6 @@ from uuid import uuid4
 
 app = Flask(__name__)
 
-# ---- helpers ----
 def s3_client():
     return boto3.client(
         "s3",
@@ -150,31 +149,27 @@ def s3_client():
 
 S3_BUCKET = os.getenv("S3_BUCKET", "kinjar-media")
 
-# ---- presign route ----
 @app.route("/presign", methods=["POST"])
 def presign():
-    # --- auth guard ---
+    # auth
     api_key = request.headers.get("x-api-key")
     expected_keys = os.getenv("API_KEYS", "").split(",")
     if not api_key or api_key not in expected_keys:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    # --- tenant guard ---
+    # tenant
     tenant = request.headers.get("x-tenant-slug")
     if not tenant:
         return jsonify({"ok": False, "error": "missing tenant slug"}), 400
 
-    # --- parse request body ---
     data = request.get_json(force=True)
     filename = data.get("filename")
     content_type = data.get("contentType")
     if not filename or not content_type:
         return jsonify({"ok": False, "error": "filename and contentType required"}), 400
 
-    # --- generate unique key ---
     key = f"t/{tenant}/posts/{uuid4()}/{filename}"
 
-    # --- presign PUT url ---
     s3 = s3_client()
     put_url = s3.generate_presigned_url(
         ClientMethod="put_object",
@@ -189,11 +184,9 @@ def presign():
     return jsonify({
         "ok": True,
         "key": key,
-        "put": {
-            "url": put_url,
-            "headers": { "Content-Type": content_type }
-        }
+        "put": { "url": put_url, "headers": { "Content-Type": content_type } }
     })
+
 
 
 @app.get("/r2/head")
