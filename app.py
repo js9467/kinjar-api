@@ -132,55 +132,70 @@ def version():
         pass
     return jsonify({"ok": True, "version": v})
 
-@app.post("/presign")
+from flask import Flask, request, jsonify
+import os
+import boto3
+from uuid import uuid4
+
+app = Flask(__name__)
+
+# ---- helpers ----
+def s3_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{os.getenv('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com",
+        aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"),
+    )
+
+S3_BUCKET = os.getenv("S3_BUCKET", "kinjar-media")
+
+# ---- presign route ----
+@app.route("/presign", methods=["POST"])
 def presign():
-    # Auth
-    unauthorized = require_api_key()
-    if unauthorized:
-        return unauthorized
+    # --- auth guard ---
+    api_key = request.headers.get("x-api-key")
+    expected_keys = os.getenv("API_KEYS", "").split(",")
+    if not api_key or api_key not in expected_keys:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    # Inputs
-    if not request.is_json:
-        return make_response(jsonify({"ok": False, "error": "Expected JSON body"}), 400)
-    body = request.get_json(force=True)
+    # --- tenant guard ---
+    tenant = request.headers.get("x-tenant-slug")
+    if not tenant:
+        return jsonify({"ok": False, "error": "missing tenant slug"}), 400
 
-    filename = (body.get("filename") or "upload").strip()
-    content_type = (body.get("contentType") or "application/octet-stream").strip()
-    tenant_slug = parse_tenant_slug()
+    # --- parse request body ---
+    data = request.get_json(force=True)
+    filename = data.get("filename")
+    content_type = data.get("contentType")
+    if not filename or not content_type:
+        return jsonify({"ok": False, "error": "filename and contentType required"}), 400
 
-    if REQUIRE_TENANT and not tenant_slug:
-        return make_response(jsonify({"ok": False, "error": "Missing tenant slug"}), 400)
+    # --- generate unique key ---
+    key = f"t/{tenant}/posts/{uuid4()}/{filename}"
 
-    # Build key: t/<tenant>/posts/<uuid>/<filename> (or fallback if tenant is optional)
-    safe_tenant = (tenant_slug or "public").replace("/", "-")
-    key = f"{PRESIGN_PREFIX}{safe_tenant}/posts/{uuid.uuid4()}/{filename}"
+    # --- presign PUT url ---
+    s3 = s3_client()
+    put_url = s3.generate_presigned_url(
+        ClientMethod="put_object",
+        Params={
+            "Bucket": S3_BUCKET,
+            "Key": key,
+            "ContentType": content_type,
+        },
+        ExpiresIn=int(os.getenv("PRESIGN_EXPIRES_SECONDS", "60")),
+    )
 
-    # Guard: ensure key starts with allowed prefix
-    if not key.startswith(PRESIGN_PREFIX):
-        return make_response(jsonify({"ok": False, "error": "Invalid key prefix"}), 400)
+    return jsonify({
+        "ok": True,
+        "key": key,
+        "put": {
+            "url": put_url,
+            "headers": { "Content-Type": content_type }
+        }
+    })
 
-    max_bytes = PRESIGN_MAX_MB * 1024 * 1024
-    try:
-        s3 = s3_client()
-        conditions = [
-            {"bucket": S3_BUCKET},
-            ["content-length-range", 0, max_bytes],
-            {"Content-Type": content_type},
-            ["starts-with", "$key", f"{PRESIGN_PREFIX}{safe_tenant}/posts/"]
-        ]
-        presigned = s3.generate_presigned_post(
-            Bucket=S3_BUCKET,
-            Key=key,
-            Fields={"Content-Type": content_type},
-            Conditions=conditions,
-            ExpiresIn=PRESIGN_EXPIRES_SECONDS,
-        )
-        return jsonify({"ok": True, "key": key, "presign": presigned})
-    except Exception as e:
-        logger.exception("presign error")
-        return make_response(jsonify({"ok": False, "error": str(e)}), 500)
 
-# Optional: simple existence check (debugging uploads)
 @app.get("/r2/head")
 def r2_head():
     unauthorized = require_api_key()
