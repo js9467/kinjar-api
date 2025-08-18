@@ -7,19 +7,22 @@ from uuid import uuid4
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 import boto3
-from botocore.config import Config as BotoConfig  # <- correct import
+from botocore.config import Config as BotoConfig
+
 
 
 def s3_client():
+    if not S3_ENDPOINT:
+        raise RuntimeError("S3_ENDPOINT (or R2_ACCOUNT_ID) is required")
     return boto3.client(
         "s3",
-        endpoint_url=f"https://{os.getenv('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com",
-        region_name="auto",  # or "us-east-1"
-        aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"),
+        endpoint_url=S3_ENDPOINT,                # e.g. https://<ACCOUNT>.r2.cloudflarestorage.com
+        region_name="auto",                      # or "us-east-1"
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY,
         config=BotoConfig(
-            signature_version="s3v4",
-            s3={"addressing_style": "virtual"},
+            signature_version="s3v4",           # <-- FORCE SigV4
+            s3={"addressing_style": "virtual"}, # <-- needed for R2
         ),
     )
 
@@ -194,6 +197,24 @@ def r2_head():
     except Exception as e:
         return jsonify({"ok": True, "exists": False, "error": str(e)})
 
+@app.get("/diag/s3")
+def diag_s3():
+    try:
+        c = s3_client()
+        # make a throwaway PUT presign to inspect query params (no upload)
+        test_url = c.generate_presigned_url(
+            ClientMethod="put_object",
+            Params={"Bucket": S3_BUCKET, "Key": "diag/test.txt", "ContentType": "text/plain"},
+            ExpiresIn=60,
+        )
+        return jsonify({
+            "ok": True,
+            "sigv4_in_url": ("X-Amz-Signature=" in test_url),
+            "url_sample": test_url[:120] + "...",
+            "config_sigver": getattr(getattr(c, "meta", None), "config", None).signature_version if getattr(getattr(c, "meta", None), "config", None) else None
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 @app.get("/diag/routes")
 def diag_routes():
     try:
