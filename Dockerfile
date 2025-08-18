@@ -1,19 +1,28 @@
-FROM python:3.12-slim
+# syntax=docker/dockerfile:1
+FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=8080 \
-    DATA_DIR=/data
+    GUNICORN_WORKERS=2 \
+    GUNICORN_THREADS=8
 
 WORKDIR /app
 
-COPY requirements.txt /app/
+# System deps (optional, keeps image small)
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY app.py /app/
+COPY app.py ./app.py
+COPY version.txt ./version.txt
 
-# ensure /data exists (volume will mount here in prod)
-RUN mkdir -p /data && chmod -R 777 /data
+# Security: run as non-root
+RUN useradd -m appuser
+USER appuser
 
 EXPOSE 8080
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "app:app"]
+
+# Gunicorn (prod)
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "-w", "${GUNICORN_WORKERS}", "--threads", "${GUNICORN_THREADS}", "app:app"]
