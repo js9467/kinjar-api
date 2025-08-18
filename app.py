@@ -9,18 +9,18 @@ from flask_cors import CORS
 import boto3
 from botocore.config import Config as BotoConfig  # <- correct import
 
-def s3_client():
-    return boto3.client(
-        "s3",
-        endpoint_url=f"https://{os.getenv('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com",
-        region_name="auto",  # or "us-east-1"
-        aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"),
-        config=BotoConfig(
-            signature_version="s3v4",
-            s3={"addressing_style": "virtual"},
-        ),
-    )
+    def s3_client():
+        return boto3.client(
+            "s3",
+            endpoint_url=f"https://{os.getenv('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com",
+            region_name="auto",  # or "us-east-1"
+            aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"),
+            config=BotoConfig(
+                signature_version="s3v4",
+                s3={"addressing_style": "virtual"},
+            ),
+        )
 
     
     def env_str(name: str, default: Optional[str] = None) -> str:
