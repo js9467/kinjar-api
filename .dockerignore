@@ -1,5 +1,45 @@
-__pycache__/
-*.pyc
-.env*
+# git
 .git
 .gitignore
+
+# python
+__pycache__/
+*.pyc
+.venv
+venv
+.env
+.env.*
+
+# node/other artifacts just in case
+node_modules
+dist
+build
+.next
+*.log
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# large/binary junk
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.iso
+*.img
+*.mp4
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.gif
+
+# local caches
+data
+cache
+artifacts
