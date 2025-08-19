@@ -267,12 +267,14 @@ def presign():
     # Sign the PUT (fail only if signing/R2 fails)
     try:
         s3 = s3_client()
+        # NEW (looser: does NOT sign Content-Type)
         put_url = s3.generate_presigned_url(
             ClientMethod="put_object",
-            Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": ctype},
+            Params={"Bucket": S3_BUCKET, "Key": key},
             ExpiresIn=300,
             HttpMethod="PUT",
         )
+
     except Exception:
         log.exception("presign failed while signing")
         return corsify(jsonify({"ok": False, "error": "presign_failed"}), origin), 500
