@@ -264,20 +264,20 @@ def presign():
     mid = str(uuid4())
     key = f"t/{tenant}/posts/{mid}/{filename}"
 
-    # Sign the PUT (fail only if signing/R2 fails)
+    # Sign the PUT (no Content-Type in signature)
     try:
         s3 = s3_client()
-put_url = s3.generate_presigned_url(
-    ClientMethod="put_object",
-    Params={"Bucket": S3_BUCKET, "Key": key},
-    ExpiresIn=300,
-    HttpMethod="PUT",
-)
+        put_url = s3.generate_presigned_url(
+            ClientMethod="put_object",
+            Params={"Bucket": S3_BUCKET, "Key": key},
+            ExpiresIn=300,
+            HttpMethod="PUT",
+        )
     except Exception:
         log.exception("presign failed while signing")
         return corsify(jsonify({"ok": False, "error": "presign_failed"}), origin), 500
 
-    # Try to record in DB, but DO NOT block on DB availability
+    # Try to record in DB, but DO NOT block presign on DB availability
     try:
         db_insert_presign(mid, tenant, key, filename, ctype)
     except Exception:
