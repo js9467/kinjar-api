@@ -1,13 +1,8 @@
-# # kinjar-api (Fly)
+# kinjar-api (Fly.io + Cloudflare R2 presign)
 
-A minimal Flask service for:
-- Health/Version checks
-- Presigned POST URLs for S3-compatible storage (Cloudflare R2)
-- Strict CORS and API key auth
-
-## Endpoints
-
-### GET /health
-Used by Fly health checks.
+## Run locally
 ```bash
-curl https://<your-app>.fly.dev/health
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env  # edit if needed
+python app.py
