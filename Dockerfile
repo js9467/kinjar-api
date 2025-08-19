@@ -1,28 +1,16 @@
-# syntax=docker/dockerfile:1
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PORT=8080 \
-    GUNICORN_WORKERS=2 \
-    GUNICORN_THREADS=8
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# System deps (keeps image small)
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install -r requirements.txt
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py ./app.py
-COPY version.txt ./version.txt
-
-# Security: run as non-root
-RUN useradd -m appuser
-USER appuser
+COPY . .
 
 EXPOSE 8080
-
-# IMPORTANT: use shell form so ${...} env vars expand
-CMD gunicorn -b 0.0.0.0:8080 -w ${GUNICORN_WORKERS:-2} --threads ${GUNICORN_THREADS:-8} app:app
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "-w", "2", "app:app"]
