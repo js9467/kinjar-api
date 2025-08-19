@@ -99,6 +99,7 @@ def db_connect_once():
     try:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL not set")
+        from psycopg_pool import ConnectionPool
         pool = ConnectionPool(
             DATABASE_URL,
             min_size=0,
@@ -106,11 +107,31 @@ def db_connect_once():
             kwargs={"autocommit": True, "prepare_threshold": 0},
         )
         with pool.connection() as con, con.cursor() as cur:
-            cur.execute(DDL)
+            # Run DDL in separate statements (psycopg3 disallows multiple-in-one)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS media_objects (
+                  id            uuid PRIMARY KEY,
+                  tenant        text NOT NULL,
+                  r2_key        text NOT NULL UNIQUE,
+                  filename      text NOT NULL,
+                  content_type  text NOT NULL,
+                  size_bytes    bigint,
+                  status        text NOT NULL,           -- presigned | uploaded | deleted
+                  created_at    timestamptz NOT NULL DEFAULT now(),
+                  updated_at    timestamptz NOT NULL DEFAULT now(),
+                  deleted_at    timestamptz
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_media_objects_tenant_created
+                  ON media_objects (tenant, created_at DESC);
+            """)
         DB_READY = True
+        DB_ERR = None
     except Exception as e:
         DB_ERR = str(e)
         log.exception("DB init failed; continuing without DB")
+
 
 def with_db():
     db_connect_once()
@@ -220,9 +241,12 @@ def health():
 @app.post("/presign")
 def presign():
     origin = request.headers.get("Origin")
+
+    # Auth
     if not is_authorized(request):
         return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
 
+    # Tenant + input validation
     tenant = sanitize_tenant(request.headers.get("x-tenant-slug", "default"))
     if not tenant:
         return corsify(jsonify({"ok": False, "error": "invalid_tenant"}), origin), 400
@@ -236,9 +260,11 @@ def presign():
     if ALLOWED_CONTENT_TYPES and ctype not in ALLOWED_CONTENT_TYPES:
         return corsify(jsonify({"ok": False, "error": "unsupported_content_type"}), origin), 415
 
-    mid = str(uuid4())  # DB id
+    # Generate object key (id also used as DB primary key)
+    mid = str(uuid4())
     key = f"t/{tenant}/posts/{mid}/{filename}"
 
+    # Sign the PUT (fail only if signing/R2 fails)
     try:
         s3 = s3_client()
         put_url = s3.generate_presigned_url(
@@ -247,27 +273,32 @@ def presign():
             ExpiresIn=300,
             HttpMethod="PUT",
         )
-        # DB row for tracking
-        db_insert_presign(mid, tenant, key, filename, ctype)
-
-        resp = {
-            "ok": True,
-            "id": mid,
-            "key": key,
-            "maxMB": 50,
-            "put": {"url": put_url, "headers": {"Content-Type": ctype}},
-        }
-        if PUBLIC_MEDIA_BASE:
-            resp["publicUrl"] = f"{PUBLIC_MEDIA_BASE.rstrip('/')}/{key}"
-
-        audit("presign", tenant=tenant, id=mid, key=key, ctype=ctype)
-        return corsify(jsonify(resp), origin)
     except Exception:
-        log.exception("presign failed")
+        log.exception("presign failed while signing")
         return corsify(jsonify({"ok": False, "error": "presign_failed"}), origin), 500
 
-# GET /r2/head?key=...
-# (also marks DB row as uploaded)
+    # Try to record in DB, but DO NOT block on DB availability
+    try:
+        db_insert_presign(mid, tenant, key, filename, ctype)
+    except Exception:
+        log.exception("DB insert failed during presign; continuing without DB")
+
+    # Response
+    resp = {
+        "ok": True,
+        "id": mid,
+        "key": key,
+        "maxMB": 50,
+        "put": {"url": put_url, "headers": {"Content-Type": ctype}},
+    }
+    if PUBLIC_MEDIA_BASE:
+        resp["publicUrl"] = f"{PUBLIC_MEDIA_BASE.rstrip('/')}/{key}"
+
+    audit("presign", tenant=tenant, id=mid, key=key, ctype=ctype)
+    return corsify(jsonify(resp), origin)
+
+
+
 @app.get("/r2/head")
 def head_meta():
     origin = request.headers.get("Origin")
