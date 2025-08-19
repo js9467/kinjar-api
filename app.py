@@ -267,8 +267,7 @@ def presign():
     # Sign the PUT (fail only if signing/R2 fails)
     try:
         s3 = s3_client()
-        # NEW (looser: does NOT sign Content-Type)
-        put_url = s3.generate_presigned_url(
+put_url = s3.generate_presigned_url(
     ClientMethod="put_object",
     Params={"Bucket": S3_BUCKET, "Key": key},
     ExpiresIn=300,
