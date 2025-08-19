@@ -2,11 +2,18 @@ name: Deploy kinjar-api to Fly.io
 
 on:
   push:
-    branches: ["main"]
-  workflow_dispatch:
+    branches: [ main ]
+  workflow_dispatch: {}
 
 env:
   FLY_APP: kinjar-api
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
@@ -14,14 +21,34 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Ensure required files exist
+        run: |
+          test -f fly.toml
+          test -f Dockerfile
+          test -f .dockerignore || (echo "::error::.dockerignore missing at repo root" && exit 1)
+
+      # This helps catch the 5GB context problem BEFORE the remote build starts.
+      - name: Show build context & big files (preflight)
+        run: |
+          echo "== PWD ==" && pwd
+          echo "== Top-level files ==" && ls -la
+          echo "== Context size (rough) ==" && du -sh .
+          echo "== .dockerignore =="
+          sed -n '1,200p' .dockerignore
+          echo "== Files >50MB not ignored (should be none) =="
+          # list large files that aren't excluded by .dockerignore
+          git ls-files -z | xargs -0 -I{} bash -c 'f="{}"; [ -f "$f" ] && [ $(du -m "$f" | cut -f1) -ge 50 ] && echo "$f ($(du -h "$f" | cut -f1))" || true'
+          echo "== Largest 50 tracked files (FYI) =="
+          git ls-files -z | xargs -0 du -b 2>/dev/null | sort -nr | head -n 50 | awk '{printf "%10d %s\n",$1,$2}'
 
       - name: Setup flyctl
-        uses: superfly/flyctl-actions/setup-flyctl@master
+        uses: superfly/flyctl-actions/setup-flyctl@v1
 
-      - name: Preflight
+      - name: Preflight (Fly state)
         run: |
-          test -f ./fly.toml
-          test -f ./Dockerfile
           flyctl status -a "$FLY_APP" || true
           flyctl volumes list -a "$FLY_APP" || true
         env:
@@ -29,20 +56,40 @@ jobs:
 
       - name: Deploy (remote build)
         run: |
+          # NOTE: --remote-only respects .dockerignore. If logs show huge context,
+          # your .dockerignore isn't being picked up or repo has big tracked files.
           flyctl deploy \
             --app "$FLY_APP" \
-            --config ./fly.toml \
-            --dockerfile ./Dockerfile \
+            --config fly.toml \
+            --dockerfile Dockerfile \
             --remote-only \
             --strategy immediate \
-            --now
+            --yes
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+            FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
-      - name: Post-deploy sanity
+      - name: Post-deploy sanity (Fly)
         run: |
           flyctl status -a "$FLY_APP"
           flyctl machines list -a "$FLY_APP"
           flyctl volumes list -a "$FLY_APP"
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Health check (retry for readiness)
+        run: |
+          set -e
+          URL="https://${{ env.FLY_APP }}.fly.dev/health"
+          echo "Polling $URL ..."
+          for i in {1..20}; do
+            echo "Attempt $i..."
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$URL" || true)
+            if [ "$code" = "200" ]; then
+              echo "Healthy ✅"
+              curl -s "$URL" && echo
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::App did not become healthy"
+          exit 1
