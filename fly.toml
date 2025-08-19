@@ -1,14 +1,9 @@
-app = "kinjar-api"         # change if different
+app = "kinjar-api"
 primary_region = "atl"
 
 [env]
   PORT = "8080"
-  APP_NAME = "kinjar-api"
-  LOG_LEVEL = "INFO"
-  PRESIGN_EXPIRES_SECONDS = "60"
-  PRESIGN_MAX_MB = "50"
-  PRESIGN_PREFIX = "t/"
-  REQUIRE_TENANT = "1"
+  DATA_DIR = "/data"
 
 [http_service]
   internal_port = 8080
@@ -19,20 +14,18 @@ primary_region = "atl"
   processes = ["app"]
 
   [[http_service.checks]]
-    interval = "15s"
-    timeout  = "5s"
-    grace_period = "60s"
+    interval = "10s"
+    timeout  = "2s"
+    grace_period = "30s"
     method = "GET"
     path = "/health"
     protocol = "http"
 
+[mounts]
+  source = "data"
+  destination = "/data"
 
 [[vm]]
-  memory = "512mb"
+  memory = "1gb"
   cpu_kind = "shared"
   cpus = 1
-# ...your existing fly.toml...
-
-[[mounts]]
-  source = "data"        # the volume NAME from `fly volumes list`
-  destination = "/data"  # typical mount path; use the actual one if you set it differently
