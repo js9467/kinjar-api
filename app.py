@@ -68,12 +68,13 @@ def s3_client():
     )
 
 # ---------------- DB (Neon) ----------------
-pool = ConnectionPool(
-    DATABASE_URL,
-    min_size=0,
-    max_size=5,
-    kwargs={"autocommit": True, "prepare_threshold": 0},
-)
+import psycopg
+from psycopg_pool import ConnectionPool
+
+DATABASE_URL = os.getenv("DATABASE_URL")  # may be unset/invalid at boot
+pool = None
+DB_READY = False
+DB_ERR = None
 
 DDL = """
 CREATE TABLE IF NOT EXISTS media_objects (
@@ -83,7 +84,7 @@ CREATE TABLE IF NOT EXISTS media_objects (
   filename      text NOT NULL,
   content_type  text NOT NULL,
   size_bytes    bigint,
-  status        text NOT NULL,           -- presigned | uploaded | deleted
+  status        text NOT NULL,
   created_at    timestamptz NOT NULL DEFAULT now(),
   updated_at    timestamptz NOT NULL DEFAULT now(),
   deleted_at    timestamptz
@@ -91,65 +92,75 @@ CREATE TABLE IF NOT EXISTS media_objects (
 CREATE INDEX IF NOT EXISTS idx_media_objects_tenant_created ON media_objects (tenant, created_at DESC);
 """
 
-def db_init():
-    with pool.connection() as con, con.cursor() as cur:
-        cur.execute(DDL)
+def db_connect_once():
+    global pool, DB_READY, DB_ERR
+    if DB_READY or DB_ERR:
+        return
+    try:
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL not set")
+        pool = ConnectionPool(
+            DATABASE_URL,
+            min_size=0,
+            max_size=5,
+            kwargs={"autocommit": True, "prepare_threshold": 0},
+        )
+        with pool.connection() as con, con.cursor() as cur:
+            cur.execute(DDL)
+        DB_READY = True
+    except Exception as e:
+        DB_ERR = str(e)
+        log.exception("DB init failed; continuing without DB")
 
-def db_insert_presign(mid: str, tenant: str, key: str, filename: str, ctype: str):
+def with_db():
+    db_connect_once()
+    if not DB_READY:
+        raise RuntimeError(f"DB not ready: {DB_ERR or 'unknown'}")
+
+def db_insert_presign(mid, tenant, key, filename, ctype):
+    with_db()
     with pool.connection() as con, con.cursor() as cur:
         cur.execute(
-            """
-            INSERT INTO media_objects (id, tenant, r2_key, filename, content_type, status)
-            VALUES (%s, %s, %s, %s, %s, 'presigned')
-            ON CONFLICT (r2_key) DO NOTHING
-            """,
+            """INSERT INTO media_objects (id, tenant, r2_key, filename, content_type, status)
+               VALUES (%s,%s,%s,%s,%s,'presigned')
+               ON CONFLICT (r2_key) DO NOTHING""",
             (mid, tenant, key, filename, ctype),
         )
 
-def db_mark_uploaded(key: str, size: Optional[int], ctype: Optional[str]):
+def db_mark_uploaded(key, size, ctype):
+    with_db()
     with pool.connection() as con, con.cursor() as cur:
         cur.execute(
-            """
-            UPDATE media_objects
-               SET status='uploaded',
-                   size_bytes=COALESCE(%s, size_bytes),
-                   content_type=COALESCE(%s, content_type),
-                   updated_at=now()
-             WHERE r2_key=%s
-            """,
+            """UPDATE media_objects
+                  SET status='uploaded',
+                      size_bytes=COALESCE(%s,size_bytes),
+                      content_type=COALESCE(%s,content_type),
+                      updated_at=now()
+                WHERE r2_key=%s""",
             (size, ctype, key),
         )
 
-def db_soft_delete(key: str):
+def db_soft_delete(key):
+    with_db()
     with pool.connection() as con, con.cursor() as cur:
         cur.execute(
-            """
-            UPDATE media_objects
-               SET status='deleted',
-                   deleted_at=now(),
-                   updated_at=now()
-             WHERE r2_key=%s
-            """,
+            "UPDATE media_objects SET status='deleted', deleted_at=now(), updated_at=now() WHERE r2_key=%s",
             (key,),
         )
 
-def db_list(tenant: str, limit: int = 50) -> List[dict]:
+def db_list(tenant, limit=50):
+    with_db()
     with pool.connection() as con, con.cursor(row_factory=psycopg.rows.dict_row) as cur:
         cur.execute(
-            """
-            SELECT id, tenant, r2_key AS key, filename, content_type, size_bytes AS size,
-                   status, created_at, updated_at, deleted_at
-              FROM media_objects
-             WHERE tenant=%s AND (deleted_at IS NULL)
-             ORDER BY created_at DESC
-             LIMIT %s
-            """,
+            """SELECT id, tenant, r2_key AS key, filename, content_type,
+                      size_bytes AS size, status, created_at, updated_at, deleted_at
+               FROM media_objects
+               WHERE tenant=%s AND deleted_at IS NULL
+               ORDER BY created_at DESC
+               LIMIT %s""",
             (tenant, limit),
         )
         return list(cur.fetchall())
-
-# ensure table exists at boot
-db_init()
 
 # ---------------- helpers ----------------
 def is_authorized(req) -> bool:
@@ -195,16 +206,17 @@ def audit(event: str, **fields):
 # ---------------- Routes ----------------
 @app.get("/health")
 def health():
+    db_connect_once()
     return jsonify({
         "status": "ok",
         "bucket": S3_BUCKET,
         "public_media_base": PUBLIC_MEDIA_BASE or None,
         "allowed_origins": list(ALLOWED_ORIGINS) or ["* (not restricted)"],
-        "audit": os.path.basename(AUDIT_FILE),
-        "db": "connected"
+        "db_ready": DB_READY,
+        "db_error": DB_ERR,
     })
 
-# POST /presign  -> returns signed PUT url and creates DB row
+
 @app.post("/presign")
 def presign():
     origin = request.headers.get("Origin")
