@@ -1758,25 +1758,6 @@ def invite_family_member(family_slug: str):
         log.exception("Failed to invite family member")
         return corsify(jsonify({"ok": False, "error": f"invite_failed: {str(e)}"}), origin), 500
 
-                # Create invitation
-                invite_id = str(uuid4())
-                invite_token = str(uuid4())
-                expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)
-                
-                cur.execute("""
-                    INSERT INTO tenant_invitations (id, tenant_id, invited_by, email, role, invite_token, expires_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    RETURNING *
-                """, (invite_id, tenant_id, user["id"], email, "MEMBER", invite_token, expires_at))
-                invitation = cur.fetchone()
-
-            audit("family_invited", family_slug=family_slug, email=email, invited_by=user["email"])
-            return corsify(jsonify({"ok": True, "invitation": dict(invitation)}), origin)
-
-    except Exception as e:
-        log.exception("Failed to invite family member")
-        return corsify(jsonify({"ok": False, "error": "invite_failed"}), origin), 500
-
 # CORS preflight
 @app.route("/presign", methods=["OPTIONS"])
 @app.route("/r2/head", methods=["OPTIONS"])
