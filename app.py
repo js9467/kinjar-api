@@ -35,14 +35,14 @@ def env_list(name: str) -> List[str]:
     raw = os.getenv(name, "")
     return [x.strip() for x in raw.split(",") if x.strip()]
 
-# Required (R2)
-S3_BUCKET = env_str("S3_BUCKET")
-R2_ACCOUNT_ID = env_str("R2_ACCOUNT_ID")
-R2_ACCESS_KEY_ID = env_str("R2_ACCESS_KEY_ID")
-R2_SECRET_ACCESS_KEY = env_str("R2_SECRET_ACCESS_KEY")
+# Required (R2) - make optional for development
+S3_BUCKET = os.getenv("S3_BUCKET", "kinjar-dev-bucket")
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
 
-# Required (Neon)
-DATABASE_URL = env_str("DATABASE_URL")
+# Required (Neon) - make optional for development
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/kinjar_dev")
 
 # Optional
 PUBLIC_MEDIA_BASE = os.getenv("PUBLIC_MEDIA_BASE", "")
@@ -54,7 +54,7 @@ AUDIT_FILE = os.path.join(DATA_DIR, "audit.log")
 ROOT_DOMAIN = os.getenv("ROOT_DOMAIN", "kinjar.com")
 
 # Auth / Session
-JWT_SECRET = env_str("JWT_SECRET")
+JWT_SECRET = os.getenv("JWT_SECRET", "temp-dev-secret-change-in-production")  # Temporary default for development
 JWT_ALG = "HS256"
 JWT_TTL_MIN = 60 * 24 * 14  # 14 days
 COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN", None)
@@ -97,8 +97,11 @@ def db_connect_once():
     if DB_READY or DB_ERR:
         return
     try:
-        if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL not set")
+        if not DATABASE_URL or DATABASE_URL == "postgresql://localhost/kinjar_dev":
+            log.warning("DATABASE_URL not set or using development default - some features may not work")
+            DB_ERR = "Database not configured"
+            return
+            
         pool = ConnectionPool(
             DATABASE_URL,
             min_size=0,
@@ -1078,17 +1081,32 @@ def admin_delete_setting(key: str):
     return corsify(jsonify({"ok": True}), origin)
 
 # ---------------- Health ----------------
+@app.get("/")
+def root():
+    return jsonify({
+        "message": "Kinjar API Server",
+        "version": "1.0.0",
+        "status": "running",
+        "health_endpoint": "/health"
+    })
+
 @app.get("/health")
 def health():
-    db_connect_once()
+    # Try to connect to DB but don't fail if it's not available
+    try:
+        db_connect_once()
+    except Exception as e:
+        log.warning(f"DB connection failed in health check: {e}")
+    
     return jsonify({
         "status": "ok",
-        "bucket": S3_BUCKET,
+        "bucket": S3_BUCKET if S3_BUCKET != "kinjar-dev-bucket" else "not-configured",
         "public_media_base": PUBLIC_MEDIA_BASE or None,
         "allowed_origins": list(ALLOWED_ORIGINS) or ["* (not restricted)"],
         "root_domain": ROOT_DOMAIN,
         "db_ready": DB_READY,
         "db_error": DB_ERR,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
     })
 
 # ---------------- R2 / Media Routes (unchanged behavior) ----------------
