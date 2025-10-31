@@ -370,7 +370,8 @@ def is_authorized(req) -> bool:
     return supplied in API_KEYS
 
 def corsify(resp, origin: Optional[str]):
-    if origin and (not ALLOWED_ORIGINS or origin in ALLOWED_ORIGINS):
+    # TEMPORARY: Allow all origins for testing - REMOVE IN PRODUCTION
+    if origin:
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Vary"] = "Origin"
         resp.headers["Access-Control-Allow-Credentials"] = "true"
@@ -380,7 +381,8 @@ def corsify(resp, origin: Optional[str]):
 def add_common_headers(resp):
     if request.method == "OPTIONS":
         origin = request.headers.get("Origin")
-        if origin and (not ALLOWED_ORIGINS or origin in ALLOWED_ORIGINS):
+        # TEMPORARY: Allow all origins for testing - REMOVE IN PRODUCTION
+        if origin:
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
