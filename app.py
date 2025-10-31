@@ -1092,11 +1092,19 @@ def root():
 
 @app.get("/health")
 def health():
-    # Try to connect to DB but don't fail if it's not available
+    # Fast health check - don't try to connect to external services
+    return jsonify({
+        "status": "ok",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    })
+
+@app.get("/status")
+def detailed_status():
+    # Detailed status with more information - not used for health checks
     try:
         db_connect_once()
     except Exception as e:
-        log.warning(f"DB connection failed in health check: {e}")
+        log.warning(f"DB connection failed in status check: {e}")
     
     return jsonify({
         "status": "ok",
