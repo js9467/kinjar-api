@@ -1083,30 +1083,33 @@ def admin_delete_setting(key: str):
 # ---------------- Health ----------------
 @app.get("/")
 def root():
-    return jsonify({
+    origin = request.headers.get("Origin")
+    return corsify(jsonify({
         "message": "Kinjar API Server",
         "version": "1.0.0",
         "status": "running",
         "health_endpoint": "/health"
-    })
+    }), origin)
 
 @app.get("/health")
 def health():
     # Fast health check - don't try to connect to external services
-    return jsonify({
+    origin = request.headers.get("Origin")
+    return corsify(jsonify({
         "status": "ok",
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
-    })
+    }), origin)
 
 @app.get("/status")
 def detailed_status():
     # Detailed status with more information - not used for health checks
+    origin = request.headers.get("Origin")
     try:
         db_connect_once()
     except Exception as e:
         log.warning(f"DB connection failed in status check: {e}")
     
-    return jsonify({
+    return corsify(jsonify({
         "status": "ok",
         "bucket": S3_BUCKET if S3_BUCKET != "kinjar-dev-bucket" else "not-configured",
         "public_media_base": PUBLIC_MEDIA_BASE or None,
@@ -1115,7 +1118,7 @@ def detailed_status():
         "db_ready": DB_READY,
         "db_error": DB_ERR,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
-    })
+    }), origin)
 
 # ---------------- R2 / Media Routes (unchanged behavior) ----------------
 @app.post("/presign")
@@ -1759,6 +1762,9 @@ def invite_family_member(family_slug: str):
         return corsify(jsonify({"ok": False, "error": f"invite_failed: {str(e)}"}), origin), 500
 
 # CORS preflight
+@app.route("/", methods=["OPTIONS"])
+@app.route("/health", methods=["OPTIONS"])
+@app.route("/status", methods=["OPTIONS"])
 @app.route("/presign", methods=["OPTIONS"])
 @app.route("/r2/head", methods=["OPTIONS"])
 @app.route("/media/signed-get", methods=["OPTIONS"])
