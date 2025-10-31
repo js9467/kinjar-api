@@ -370,24 +370,50 @@ def is_authorized(req) -> bool:
     return supplied in API_KEYS
 
 def corsify(resp, origin: Optional[str]):
-    # TEMPORARY: Allow all origins for testing - REMOVE IN PRODUCTION
     if origin:
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Vary"] = "Origin"
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        # Allow specific origins from ALLOWED_ORIGINS
+        if ALLOWED_ORIGINS and origin in ALLOWED_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+        # Allow all kinjar.com subdomains (*.kinjar.com)
+        elif origin.endswith('.kinjar.com') or origin == 'https://kinjar.com':
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+        # Allow if ALLOWED_ORIGINS is empty (for testing)
+        elif not ALLOWED_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
     return resp
 
 @app.after_request
 def add_common_headers(resp):
     if request.method == "OPTIONS":
         origin = request.headers.get("Origin")
-        # TEMPORARY: Allow all origins for testing - REMOVE IN PRODUCTION
         if origin:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Vary"] = "Origin"
+            # Allow specific origins from ALLOWED_ORIGINS
+            if ALLOWED_ORIGINS and origin in ALLOWED_ORIGINS:
+                resp.headers["Access-Control-Allow-Origin"] = origin
+                resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
+                resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
+                resp.headers["Access-Control-Allow-Credentials"] = "true"
+                resp.headers["Vary"] = "Origin"
+            # Allow all kinjar.com subdomains (*.kinjar.com)
+            elif origin.endswith('.kinjar.com') or origin == 'https://kinjar.com':
+                resp.headers["Access-Control-Allow-Origin"] = origin
+                resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
+                resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
+                resp.headers["Access-Control-Allow-Credentials"] = "true"
+                resp.headers["Vary"] = "Origin"
+            # Allow if ALLOWED_ORIGINS is empty (for testing)
+            elif not ALLOWED_ORIGINS:
+                resp.headers["Access-Control-Allow-Origin"] = origin
+                resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
+                resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
+                resp.headers["Access-Control-Allow-Credentials"] = "true"
+                resp.headers["Vary"] = "Origin"
     return resp
 
 def sanitize_tenant(tenant: str) -> Optional[str]:
