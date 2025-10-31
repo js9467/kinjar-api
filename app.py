@@ -186,6 +186,121 @@ def db_connect_once():
                 CREATE INDEX IF NOT EXISTS idx_signup_requests_status_created
                   ON signup_requests (status, created_at DESC);
             """)
+
+            # --- VIDEO BLOG FEATURES ---
+            # Enhanced media_objects to include more metadata
+            cur.execute("""
+                ALTER TABLE media_objects 
+                ADD COLUMN IF NOT EXISTS title text,
+                ADD COLUMN IF NOT EXISTS description text,
+                ADD COLUMN IF NOT EXISTS thumbnail_url text,
+                ADD COLUMN IF NOT EXISTS duration_seconds integer,
+                ADD COLUMN IF NOT EXISTS width integer,
+                ADD COLUMN IF NOT EXISTS height integer,
+                ADD COLUMN IF NOT EXISTS uploaded_by uuid REFERENCES users(id),
+                ADD COLUMN IF NOT EXISTS is_public boolean DEFAULT false,
+                ADD COLUMN IF NOT EXISTS view_count integer DEFAULT 0;
+            """)
+
+            # Content posts - represents a video blog post
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS content_posts (
+                  id            uuid PRIMARY KEY,
+                  tenant_id     uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                  author_id     uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  media_id      uuid REFERENCES media_objects(id) ON DELETE SET NULL,
+                  title         text NOT NULL,
+                  content       text,                    -- main text content/commentary
+                  content_type  text NOT NULL DEFAULT 'video_blog', -- video_blog, photo_blog, text_post
+                  status        text NOT NULL DEFAULT 'published', -- draft, published, archived
+                  is_public     boolean DEFAULT true,
+                  view_count    integer DEFAULT 0,
+                  created_at    timestamptz NOT NULL DEFAULT now(),
+                  updated_at    timestamptz NOT NULL DEFAULT now(),
+                  published_at  timestamptz
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_content_posts_tenant_published
+                  ON content_posts (tenant_id, published_at DESC) WHERE status = 'published';
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_content_posts_author
+                  ON content_posts (author_id, created_at DESC);
+            """)
+
+            # Comments on content posts
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS content_comments (
+                  id         uuid PRIMARY KEY,
+                  post_id    uuid NOT NULL REFERENCES content_posts(id) ON DELETE CASCADE,
+                  author_id  uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  parent_id  uuid REFERENCES content_comments(id) ON DELETE CASCADE, -- for threaded comments
+                  content    text NOT NULL,
+                  status     text NOT NULL DEFAULT 'published', -- published, hidden, deleted
+                  created_at timestamptz NOT NULL DEFAULT now(),
+                  updated_at timestamptz NOT NULL DEFAULT now()
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_content_comments_post_created
+                  ON content_comments (post_id, created_at ASC) WHERE status = 'published';
+            """)
+
+            # User invitations to tenants
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tenant_invitations (
+                  id           uuid PRIMARY KEY,
+                  tenant_id    uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                  invited_by   uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  email        text NOT NULL,
+                  role         text NOT NULL DEFAULT 'MEMBER',
+                  status       text NOT NULL DEFAULT 'pending', -- pending, accepted, expired, revoked
+                  invite_token text UNIQUE NOT NULL,
+                  expires_at   timestamptz NOT NULL,
+                  created_at   timestamptz NOT NULL DEFAULT now(),
+                  accepted_at  timestamptz
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tenant_invitations_tenant_status
+                  ON tenant_invitations (tenant_id, status);
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tenant_invitations_token
+                  ON tenant_invitations (invite_token) WHERE status = 'pending';
+            """)
+
+            # User profiles for additional info
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                  user_id     uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                  display_name text,
+                  avatar_url  text,
+                  bio         text,
+                  phone       text,
+                  updated_at  timestamptz NOT NULL DEFAULT now()
+                );
+            """)
+
+            # Activity feed for showing recent actions
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS activity_feed (
+                  id          uuid PRIMARY KEY,
+                  tenant_id   uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                  user_id     uuid REFERENCES users(id) ON DELETE SET NULL,
+                  action_type text NOT NULL, -- post_created, comment_added, user_joined, etc.
+                  entity_type text NOT NULL, -- content_post, comment, user, etc.
+                  entity_id   uuid,
+                  metadata    jsonb,
+                  created_at  timestamptz NOT NULL DEFAULT now()
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_activity_feed_tenant_created
+                  ON activity_feed (tenant_id, created_at DESC);
+            """)
+
         DB_READY = True
         DB_ERR = None
     except Exception as e:
@@ -1027,6 +1142,344 @@ def delete_media():
         log.exception("delete failed")
         return corsify(jsonify({"ok": False, "error": "delete_failed"}), origin), 500
 
+# ---------------- Video Blog API Routes ----------------
+
+# Helper functions for video blog features
+def create_content_post(con, tenant_id: str, author_id: str, title: str, content: str = "", 
+                       media_id: str = None, content_type: str = "video_blog", is_public: bool = True) -> Dict[str, Any]:
+    """Create a new content post (video blog entry)"""
+    post_id = str(uuid4())
+    published_at = datetime.datetime.now(datetime.timezone.utc)
+    
+    with con.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            INSERT INTO content_posts (id, tenant_id, author_id, media_id, title, content, 
+                                     content_type, is_public, published_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+        """, (post_id, tenant_id, author_id, media_id, title, content, content_type, is_public, published_at))
+        post = cur.fetchone()
+        
+        # Add to activity feed
+        cur.execute("""
+            INSERT INTO activity_feed (id, tenant_id, user_id, action_type, entity_type, entity_id, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (str(uuid4()), tenant_id, author_id, "post_created", "content_post", post_id, 
+              json.dumps({"title": title, "content_type": content_type})))
+        
+    return post
+
+def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+    """Get published posts for a tenant with author and media info"""
+    with con.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            SELECT 
+                p.*,
+                u.email as author_email,
+                up.display_name as author_name,
+                up.avatar_url as author_avatar,
+                m.filename as media_filename,
+                m.content_type as media_content_type,
+                m.r2_key as media_r2_key,
+                m.thumbnail_url as media_thumbnail,
+                m.duration_seconds as media_duration
+            FROM content_posts p
+            JOIN users u ON p.author_id = u.id
+            LEFT JOIN user_profiles up ON u.id = up.user_id
+            LEFT JOIN media_objects m ON p.media_id = m.id
+            WHERE p.tenant_id = %s AND p.status = 'published'
+            ORDER BY p.published_at DESC
+            LIMIT %s OFFSET %s
+        """, (tenant_id, limit, offset))
+        return cur.fetchall()
+
+def get_post_comments(con, post_id: str) -> List[Dict[str, Any]]:
+    """Get comments for a post with author info"""
+    with con.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            SELECT 
+                c.*,
+                u.email as author_email,
+                up.display_name as author_name,
+                up.avatar_url as author_avatar
+            FROM content_comments c
+            JOIN users u ON c.author_id = u.id
+            LEFT JOIN user_profiles up ON u.id = up.user_id
+            WHERE c.post_id = %s AND c.status = 'published'
+            ORDER BY c.created_at ASC
+        """, (post_id,))
+        return cur.fetchall()
+
+def add_comment(con, post_id: str, author_id: str, content: str, parent_id: str = None) -> Dict[str, Any]:
+    """Add a comment to a post"""
+    comment_id = str(uuid4())
+    
+    with con.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            INSERT INTO content_comments (id, post_id, author_id, parent_id, content)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING *
+        """, (comment_id, post_id, author_id, parent_id, content))
+        comment = cur.fetchone()
+        
+        # Get tenant_id for activity feed
+        cur.execute("SELECT tenant_id FROM content_posts WHERE id = %s", (post_id,))
+        tenant_row = cur.fetchone()
+        if tenant_row:
+            cur.execute("""
+                INSERT INTO activity_feed (id, tenant_id, user_id, action_type, entity_type, entity_id, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (str(uuid4()), tenant_row['tenant_id'], author_id, "comment_added", "comment", comment_id,
+                  json.dumps({"post_id": post_id, "content_preview": content[:100]})))
+        
+    return comment
+
+# API Routes
+@app.post("/api/posts")
+def create_post():
+    """Create a new video blog post"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug", "")
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "missing_tenant"}), origin), 400
+
+    body = request.get_json(silent=True) or {}
+    title = body.get("title", "").strip()
+    content = body.get("content", "").strip()
+    media_id = body.get("media_id")
+    content_type = body.get("content_type", "video_blog")
+    is_public = body.get("is_public", True)
+
+    if not title:
+        return corsify(jsonify({"ok": False, "error": "title_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            # Get tenant by slug
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT * FROM tenants WHERE slug = %s", (tenant_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+
+                # Check user is member of tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (user["id"], tenant["id"]))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+
+            post = create_content_post(con, tenant["id"], user["id"], title, content, 
+                                     media_id, content_type, is_public)
+            
+            audit("post_created", tenant=tenant_slug, post_id=post["id"], title=title)
+            return corsify(jsonify({"ok": True, "post": post}), origin)
+
+    except Exception as e:
+        log.exception("Failed to create post")
+        return corsify(jsonify({"ok": False, "error": "create_failed"}), origin), 500
+
+@app.get("/api/posts")
+def list_posts():
+    """List posts for a tenant"""
+    origin = request.headers.get("Origin")
+    
+    tenant_slug = request.args.get("tenant", "")
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "missing_tenant"}), origin), 400
+
+    limit = min(max(int(request.args.get("limit", "20")), 1), 100)
+    offset = max(int(request.args.get("offset", "0")), 0)
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT * FROM tenants WHERE slug = %s", (tenant_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+
+            posts = get_tenant_posts(con, tenant["id"], limit, offset)
+            
+            # Add signed URLs for media
+            for post in posts:
+                if post.get("media_r2_key"):
+                    try:
+                        signed_url = s3_client().generate_presigned_url(
+                            ClientMethod="get_object",
+                            Params={"Bucket": S3_BUCKET, "Key": post["media_r2_key"]},
+                            ExpiresIn=3600,
+                        )
+                        post["media_url"] = signed_url
+                    except Exception:
+                        log.exception(f"Failed to generate signed URL for {post['media_r2_key']}")
+
+            return corsify(jsonify({"ok": True, "posts": posts}), origin)
+
+    except Exception as e:
+        log.exception("Failed to list posts")
+        return corsify(jsonify({"ok": False, "error": "list_failed"}), origin), 500
+
+@app.get("/api/posts/<post_id>")
+def get_post(post_id: str):
+    """Get a specific post with comments"""
+    origin = request.headers.get("Origin")
+    
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get post with author and media info
+                cur.execute("""
+                    SELECT 
+                        p.*,
+                        u.email as author_email,
+                        up.display_name as author_name,
+                        up.avatar_url as author_avatar,
+                        m.filename as media_filename,
+                        m.content_type as media_content_type,
+                        m.r2_key as media_r2_key,
+                        m.thumbnail_url as media_thumbnail,
+                        m.duration_seconds as media_duration,
+                        t.slug as tenant_slug
+                    FROM content_posts p
+                    JOIN users u ON p.author_id = u.id
+                    JOIN tenants t ON p.tenant_id = t.id
+                    LEFT JOIN user_profiles up ON u.id = up.user_id
+                    LEFT JOIN media_objects m ON p.media_id = m.id
+                    WHERE p.id = %s AND p.status = 'published'
+                """, (post_id,))
+                post = cur.fetchone()
+                
+                if not post:
+                    return corsify(jsonify({"ok": False, "error": "post_not_found"}), origin), 404
+
+                # Increment view count
+                cur.execute("UPDATE content_posts SET view_count = view_count + 1 WHERE id = %s", (post_id,))
+
+            # Get comments
+            comments = get_post_comments(con, post_id)
+            
+            # Add signed URL for media
+            if post.get("media_r2_key"):
+                try:
+                    signed_url = s3_client().generate_presigned_url(
+                        ClientMethod="get_object",
+                        Params={"Bucket": S3_BUCKET, "Key": post["media_r2_key"]},
+                        ExpiresIn=3600,
+                    )
+                    post["media_url"] = signed_url
+                except Exception:
+                    log.exception(f"Failed to generate signed URL for {post['media_r2_key']}")
+
+            return corsify(jsonify({"ok": True, "post": dict(post), "comments": comments}), origin)
+
+    except Exception as e:
+        log.exception("Failed to get post")
+        return corsify(jsonify({"ok": False, "error": "get_failed"}), origin), 500
+
+@app.post("/api/posts/<post_id>/comments")
+def add_post_comment(post_id: str):
+    """Add a comment to a post"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    body = request.get_json(silent=True) or {}
+    content = body.get("content", "").strip()
+    parent_id = body.get("parent_id")
+
+    if not content:
+        return corsify(jsonify({"ok": False, "error": "content_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            # Verify post exists and user can comment
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute("""
+                    SELECT p.*, t.slug as tenant_slug FROM content_posts p
+                    JOIN tenants t ON p.tenant_id = t.id
+                    WHERE p.id = %s AND p.status = 'published'
+                """, (post_id,))
+                post = cur.fetchone()
+                if not post:
+                    return corsify(jsonify({"ok": False, "error": "post_not_found"}), origin), 404
+
+                # Check user is member of tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (user["id"], post["tenant_id"]))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+
+            comment = add_comment(con, post_id, user["id"], content, parent_id)
+            
+            audit("comment_added", post_id=post_id, comment_id=comment["id"], tenant=post["tenant_slug"])
+            return corsify(jsonify({"ok": True, "comment": comment}), origin)
+
+    except Exception as e:
+        log.exception("Failed to add comment")
+        return corsify(jsonify({"ok": False, "error": "comment_failed"}), origin), 500
+
+@app.post("/api/tenants/<tenant_id>/invite")
+def invite_user(tenant_id: str):
+    """Invite a user to join a tenant"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    body = request.get_json(silent=True) or {}
+    email = body.get("email", "").strip().lower()
+    role = body.get("role", "MEMBER")
+
+    if not email or role not in TENANT_ROLES:
+        return corsify(jsonify({"ok": False, "error": "invalid_input"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Check user can invite (is admin/owner of tenant)
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s AND role IN ('ADMIN', 'OWNER')
+                """, (user["id"], tenant_id))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                # Create invitation
+                invite_id = str(uuid4())
+                invite_token = str(uuid4())
+                expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)
+                
+                cur.execute("""
+                    INSERT INTO tenant_invitations (id, tenant_id, invited_by, email, role, invite_token, expires_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                """, (invite_id, tenant_id, user["id"], email, role, invite_token, expires_at))
+                invitation = cur.fetchone()
+
+            audit("user_invited", tenant_id=tenant_id, email=email, role=role, invited_by=user["email"])
+            return corsify(jsonify({"ok": True, "invitation": dict(invitation)}), origin)
+
+    except Exception as e:
+        log.exception("Failed to invite user")
+        return corsify(jsonify({"ok": False, "error": "invite_failed"}), origin), 500
+
 # CORS preflight
 @app.route("/presign", methods=["OPTIONS"])
 @app.route("/r2/head", methods=["OPTIONS"])
@@ -1046,6 +1499,10 @@ def delete_media():
 @app.route("/admin/tenants/<tenant_id>/members", methods=["OPTIONS"])
 @app.route("/admin/settings", methods=["OPTIONS"])
 @app.route("/admin/settings/<key>", methods=["OPTIONS"])
+@app.route("/api/posts", methods=["OPTIONS"])
+@app.route("/api/posts/<post_id>", methods=["OPTIONS"])
+@app.route("/api/posts/<post_id>/comments", methods=["OPTIONS"])
+@app.route("/api/tenants/<tenant_id>/invite", methods=["OPTIONS"])
 def options():
     return make_response(("", 204))
 
