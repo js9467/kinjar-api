@@ -601,6 +601,69 @@ def auth_logout():
     clear_session_cookie(resp)
     return corsify(resp, origin)
 
+@app.post("/auth/change-password")
+def auth_change_password():
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+    
+    data = request.get_json(silent=True) or {}
+    current_password = data.get("currentPassword") or ""
+    new_password = data.get("newPassword") or ""
+    
+    if not current_password or not new_password:
+        return corsify(jsonify({"ok": False, "error": "Missing current or new password"}), origin), 400
+    
+    if len(new_password) < 8:
+        return corsify(jsonify({"ok": False, "error": "New password must be at least 8 characters"}), origin), 400
+    
+    with_db()
+    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        # Verify current password
+        cur.execute("SELECT password_hash FROM users WHERE id=%s", (user["id"],))
+        row = cur.fetchone()
+        
+        if not row or not row["password_hash"]:
+            return corsify(jsonify({"ok": False, "error": "Account has no password set"}), origin), 400
+        
+        try:
+            ph.verify(row["password_hash"], current_password)
+        except Exception:
+            return corsify(jsonify({"ok": False, "error": "Current password is incorrect"}), origin), 401
+        
+        # Update to new password
+        new_password_hash = ph.hash(new_password)
+        cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (new_password_hash, user["id"]))
+    
+    audit("password_changed", user=str(user["id"]))
+    return corsify(jsonify({"ok": True, "message": "Password changed successfully"}), origin)
+
+@app.post("/auth/forgot-password")
+def auth_forgot_password():
+    origin = request.headers.get("Origin")
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    
+    if not email:
+        return corsify(jsonify({"ok": False, "error": "Email is required"}), origin), 400
+    
+    with_db()
+    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT id, email FROM users WHERE email=%s", (email,))
+        user = cur.fetchone()
+        
+        if not user:
+            # Don't reveal if email exists - always return success
+            return corsify(jsonify({"ok": True, "message": "If the email exists, a reset link has been sent"}), origin)
+        
+        # TODO: Generate reset token and send email
+        # For now, just log it for demo purposes
+        log.info(f"Password reset requested for {email}")
+        audit("password_reset_requested", user=str(user["id"]))
+    
+    return corsify(jsonify({"ok": True, "message": "If the email exists, a reset link has been sent"}), origin)
+
 # Optional: self-serve register for ROOT emails only (bootstrap)
 @app.post("/auth/register")
 def auth_register():
