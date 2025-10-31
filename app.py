@@ -1233,6 +1233,113 @@ def delete_media():
         log.exception("delete failed")
         return corsify(jsonify({"ok": False, "error": "delete_failed"}), origin), 500
 
+@app.post("/upload")
+def direct_upload():
+    """Direct file upload endpoint for family media"""
+    origin = request.headers.get("Origin")
+    if not is_authorized(request):
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    # Check if file was uploaded
+    if 'file' not in request.files:
+        return corsify(jsonify({"ok": False, "error": "no_file"}), origin), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return corsify(jsonify({"ok": False, "error": "no_filename"}), origin), 400
+    
+    # Get form data
+    family_slug = request.form.get('family_slug', '')
+    upload_type = request.form.get('type', 'photo')  # photo or video
+    
+    if not family_slug:
+        return corsify(jsonify({"ok": False, "error": "missing_family_slug"}), origin), 400
+    
+    tenant = sanitize_tenant(family_slug)
+    if not tenant:
+        return corsify(jsonify({"ok": False, "error": "invalid_tenant"}), origin), 400
+    
+    # Validate file type
+    allowed_extensions = {
+        'photo': ['jpg', 'jpeg', 'png', 'gif', 'webp'],
+        'video': ['mp4', 'mov', 'avi', 'webm', 'mkv']
+    }
+    
+    file_ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+    if file_ext not in allowed_extensions.get(upload_type, []):
+        return corsify(jsonify({"ok": False, "error": "invalid_file_type"}), origin), 400
+    
+    # Generate unique ID and key
+    mid = str(uuid4())
+    safe_filename = sanitize_filename(file.filename)
+    key = f"t/{tenant}/posts/{mid}/{safe_filename}"
+    
+    try:
+        # Upload to R2
+        s3 = s3_client()
+        s3.upload_fileobj(
+            file,
+            S3_BUCKET,
+            key,
+            ExtraArgs={
+                'ContentType': file.content_type or f'image/{file_ext}' if upload_type == 'photo' else f'video/{file_ext}'
+            }
+        )
+        
+        # Save to database
+        file.seek(0, 2)  # Seek to end to get size
+        file_size = file.tell()
+        
+        db_insert_presign(mid, tenant, key, safe_filename, file.content_type)
+        db_mark_uploaded(key, file_size, file.content_type)
+        
+        # Create content post entry
+        with_db()
+        with pool.connection() as con:
+            # Get tenant ID
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (tenant,))
+                tenant_row = cur.fetchone()
+                if not tenant_row:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+                
+                tenant_id = tenant_row['id']
+                
+                # For now, use system user as author (can be enhanced later)
+                author_id = "system"
+                title = f"{upload_type.title()} upload - {safe_filename}"
+                
+                create_content_post(
+                    con, 
+                    tenant_id=tenant_id,
+                    author_id=author_id,
+                    title=title,
+                    content=f"Uploaded {upload_type}",
+                    media_id=mid,
+                    content_type=upload_type,
+                    is_public=True
+                )
+        
+        audit("upload", tenant=tenant, id=mid, key=key, type=upload_type, size=file_size)
+        
+        resp = {
+            "ok": True,
+            "id": mid,
+            "key": key,
+            "type": upload_type,
+            "filename": safe_filename,
+            "size": file_size
+        }
+        
+        if PUBLIC_MEDIA_BASE:
+            resp["publicUrl"] = f"{PUBLIC_MEDIA_BASE.rstrip('/')}/{key}"
+        
+        return corsify(jsonify(resp), origin)
+        
+    except Exception as e:
+        log.exception("Upload failed")
+        return corsify(jsonify({"ok": False, "error": f"upload_failed: {str(e)}"}), origin), 500
+
 # ---------------- Video Blog API Routes ----------------
 
 # Helper functions for video blog features
@@ -1571,12 +1678,71 @@ def invite_user(tenant_id: str):
         log.exception("Failed to invite user")
         return corsify(jsonify({"ok": False, "error": "invite_failed"}), origin), 500
 
+@app.post("/families/<family_slug>/invite")
+def invite_family_member(family_slug: str):
+    """Invite a user to join a family (by slug)"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    body = request.get_json(silent=True) or {}
+    email = body.get("email", "").strip().lower()
+
+    if not email:
+        return corsify(jsonify({"ok": False, "error": "email_required"}), origin), 400
+
+    tenant = sanitize_tenant(family_slug)
+    if not tenant:
+        return corsify(jsonify({"ok": False, "error": "invalid_family"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get tenant ID from slug
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (tenant,))
+                tenant_row = cur.fetchone()
+                if not tenant_row:
+                    return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+
+                tenant_id = tenant_row['id']
+
+                # Check user can invite (is admin/owner of tenant or allow all for simplicity)
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (user["id"], tenant_id))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "not_family_member"}), origin), 403
+
+                # Create invitation
+                invite_id = str(uuid4())
+                invite_token = str(uuid4())
+                expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)
+                
+                cur.execute("""
+                    INSERT INTO tenant_invitations (id, tenant_id, invited_by, email, role, invite_token, expires_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                """, (invite_id, tenant_id, user["id"], email, "MEMBER", invite_token, expires_at))
+                invitation = cur.fetchone()
+
+            audit("family_invited", family_slug=family_slug, email=email, invited_by=user["email"])
+            return corsify(jsonify({"ok": True, "invitation": dict(invitation)}), origin)
+
+    except Exception as e:
+        log.exception("Failed to invite family member")
+        return corsify(jsonify({"ok": False, "error": "invite_failed"}), origin), 500
+
 # CORS preflight
 @app.route("/presign", methods=["OPTIONS"])
 @app.route("/r2/head", methods=["OPTIONS"])
 @app.route("/media/signed-get", methods=["OPTIONS"])
 @app.route("/media/list", methods=["OPTIONS"])
 @app.route("/media/delete", methods=["OPTIONS"])
+@app.route("/upload", methods=["OPTIONS"])
 @app.route("/auth/login", methods=["OPTIONS"])
 @app.route("/auth/register", methods=["OPTIONS"])
 @app.route("/auth/me", methods=["OPTIONS"])
@@ -1594,6 +1760,7 @@ def invite_user(tenant_id: str):
 @app.route("/api/posts/<post_id>", methods=["OPTIONS"])
 @app.route("/api/posts/<post_id>/comments", methods=["OPTIONS"])
 @app.route("/api/tenants/<tenant_id>/invite", methods=["OPTIONS"])
+@app.route("/families/<family_slug>/invite", methods=["OPTIONS"])
 def options():
     return make_response(("", 204))
 
