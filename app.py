@@ -51,6 +51,7 @@ ALLOWED_ORIGINS = set(env_list("ALLOWED_ORIGINS"))        # for API CORS
 PORT = int(os.getenv("PORT", "8080"))
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit.log")
+ROOT_DOMAIN = os.getenv("ROOT_DOMAIN", "kinjar.com")
 
 # Auth / Session
 JWT_SECRET = env_str("JWT_SECRET")
@@ -69,6 +70,7 @@ ALLOWED_CONTENT_TYPES = set((
 ))
 TENANT_RE = re.compile(r"^[a-z0-9-]{1,63}$")
 FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+TENANT_ROLES = {"OWNER", "ADMIN", "MEMBER"}
 
 # ---------------- R2 client ----------------
 def s3_client():
@@ -148,6 +150,22 @@ def db_connect_once():
                   tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
                   role      text NOT NULL DEFAULT 'OWNER',
                   PRIMARY KEY (user_id, tenant_id)
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS global_settings (
+                  key        text PRIMARY KEY,
+                  value      jsonb NOT NULL,
+                  updated_at timestamptz NOT NULL DEFAULT now()
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tenant_settings (
+                  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                  key       text NOT NULL,
+                  value     jsonb NOT NULL,
+                  updated_at timestamptz NOT NULL DEFAULT now(),
+                  PRIMARY KEY (tenant_id, key)
                 );
             """)
             cur.execute("""
@@ -334,7 +352,8 @@ def require_root():
 def slugify_base(name: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", name.strip().lower())
     s = re.sub(r"-+", "-", s).strip("-")
-    return s or "family"
+    s = s or "family"
+    return s[:63]
 
 def unique_slug(conn, base: str) -> str:
     # ensure slug uniqueness; append short suffix if needed
@@ -347,6 +366,42 @@ def unique_slug(conn, base: str) -> str:
             cur.execute("SELECT 1 FROM tenants WHERE slug=%s", (slug,))
             i += 1
     return slug
+
+def ensure_user_basic(con, email: str) -> Dict[str, Any]:
+    email = email.strip().lower()
+    if not email:
+        raise ValueError("email_required")
+    with con.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT id, email, global_role FROM users WHERE email=%s", (email,))
+        row = cur.fetchone()
+        if row:
+            return {"id": str(row["id"]), "email": row["email"], "role": row["global_role"]}
+    uid = str(uuid4())
+    role = "ROOT" if email in ROOT_EMAILS else "USER"
+    with con.cursor() as cur:
+        cur.execute(
+            """INSERT INTO users (id, email, password_hash, global_role)
+                   VALUES (%s,%s,NULL,%s)""",
+            (uid, email, role),
+        )
+    return {"id": uid, "email": email, "role": role}
+
+def create_tenant(con, name: str, desired_slug: Optional[str], owner_user_id: Optional[str] = None) -> Dict[str, Any]:
+    base = slugify_base(desired_slug or name)
+    if not TENANT_RE.match(base):
+        base = slugify_base(base)
+    slug = unique_slug(con, base)
+    tid = str(uuid4())
+    with con.cursor() as cur:
+        cur.execute("INSERT INTO tenants (id, slug, name) VALUES (%s,%s,%s)", (tid, slug, name))
+        if owner_user_id:
+            cur.execute(
+                """INSERT INTO tenant_users (user_id, tenant_id, role)
+                       VALUES (%s,%s,'OWNER')
+                       ON CONFLICT (user_id, tenant_id) DO UPDATE SET role='OWNER'""",
+                (owner_user_id, tid),
+            )
+    return {"id": tid, "slug": slug, "name": name}
 
 # ---------------- Auth & Accounts Routes ----------------
 @app.post("/auth/login")
@@ -499,15 +554,6 @@ def ensure_user_with_password(con, email: str, pw_hash: str) -> Dict[str, Any]:
                        VALUES (%s,%s,%s,%s)""", (uid, email, pw_hash, role))
         return {"id": uid, "email": email, "role": role}
 
-def create_tenant_and_owner(con, name: str, desired_slug: Optional[str], owner_user_id: str) -> Dict[str, Any]:
-    base = slugify_base(desired_slug or name)
-    slug = unique_slug(con, base)
-    tid = str(uuid4())
-    with con.cursor() as cur:
-        cur.execute("INSERT INTO tenants (id, slug, name) VALUES (%s,%s,%s)", (tid, slug, name))
-        cur.execute("INSERT INTO tenant_users (user_id, tenant_id, role) VALUES (%s,%s,'OWNER')", (owner_user_id, tid))
-    return {"id": tid, "slug": slug, "name": name}
-
 @app.post("/admin/signup/approve")
 def approve_signup():
     """
@@ -535,7 +581,7 @@ def approve_signup():
         # ensure user
         user = ensure_user_with_password(con, r["email"], r["password_hash"])
         # create tenant + membership
-        tenant = create_tenant_and_owner(con, r["tenant_name"], r["desired_slug"], user["id"])
+        tenant = create_tenant(con, r["tenant_name"], r["desired_slug"], user["id"])
 
         # mark request approved
         cur.execute("""UPDATE signup_requests
@@ -574,6 +620,257 @@ def deny_signup():
     audit("signup_denied", request_id=req_id, reason=reason)
     return corsify(jsonify({"ok": True}), origin)
 
+def tenant_to_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    payload = {
+        "id": row["id"],
+        "slug": row["slug"],
+        "name": row["name"],
+        "createdAt": row["created_at"].isoformat() if isinstance(row["created_at"], datetime.datetime) else row["created_at"],
+    }
+    if ROOT_DOMAIN:
+        payload["domain"] = f"{row['slug']}.{ROOT_DOMAIN}"
+    members = row.get("members")
+    if members is not None:
+        payload["members"] = members if isinstance(members, list) else json.loads(members)
+    return payload
+
+def fetch_tenant(con, tenant_id: str) -> Optional[Dict[str, Any]]:
+    with con.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT t.id, t.slug, t.name, t.created_at,
+                   COALESCE(json_agg(json_build_object('userId', tu.user_id, 'email', u.email, 'role', tu.role)
+                                     ORDER BY tu.role)
+                            FILTER (WHERE tu.user_id IS NOT NULL), '[]'::json) AS members
+            FROM tenants t
+            LEFT JOIN tenant_users tu ON tu.tenant_id = t.id
+            LEFT JOIN users u ON u.id = tu.user_id
+            WHERE t.id = %s
+            GROUP BY t.id
+            """,
+            (tenant_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return tenant_to_payload(row)
+
+@app.get("/admin/tenants")
+def admin_list_tenants():
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    with_db()
+    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT t.id, t.slug, t.name, t.created_at,
+                   COALESCE(json_agg(json_build_object('userId', tu.user_id, 'email', u.email, 'role', tu.role)
+                                     ORDER BY tu.role)
+                            FILTER (WHERE tu.user_id IS NOT NULL), '[]'::json) AS members
+            FROM tenants t
+            LEFT JOIN tenant_users tu ON tu.tenant_id = t.id
+            LEFT JOIN users u ON u.id = tu.user_id
+            GROUP BY t.id
+            ORDER BY t.created_at DESC
+            """
+        )
+        tenants = [tenant_to_payload(row) for row in cur.fetchall()]
+
+    return corsify(jsonify({"ok": True, "tenants": tenants}), origin)
+
+@app.post("/admin/tenants")
+def admin_create_tenant():
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or data.get("familyName") or "").strip()
+    desired_slug = (data.get("slug") or data.get("desiredSlug") or "").strip().lower() or None
+    owner_email = (data.get("ownerEmail") or "").strip().lower()
+    if not name:
+        return corsify(jsonify({"ok": False, "error": "name_required"}), origin), 400
+    if desired_slug and not TENANT_RE.match(desired_slug):
+        desired_slug = slugify_base(desired_slug)
+        if not desired_slug or not TENANT_RE.match(desired_slug):
+            return corsify(jsonify({"ok": False, "error": "invalid_slug"}), origin), 400
+
+    with_db()
+    with pool.connection() as con:
+        owner = None
+        if owner_email:
+            try:
+                owner = ensure_user_basic(con, owner_email)
+            except ValueError:
+                return corsify(jsonify({"ok": False, "error": "invalid_owner_email"}), origin), 400
+        tenant = create_tenant(con, name, desired_slug, owner["id"] if owner else None)
+        payload = fetch_tenant(con, tenant["id"])
+
+    audit("tenant_created", tenant=tenant["slug"], admin=str(admin["id"]))
+    return corsify(jsonify({"ok": True, "tenant": payload}), origin), 201
+
+@app.patch("/admin/tenants/<tenant_id>")
+def admin_update_tenant(tenant_id: str):
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    desired_slug = (data.get("slug") or data.get("desiredSlug") or "").strip().lower()
+
+    if not name and not desired_slug:
+        return corsify(jsonify({"ok": False, "error": "nothing_to_update"}), origin), 400
+
+    with_db()
+    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT id, slug, name FROM tenants WHERE id=%s FOR UPDATE", (tenant_id,))
+        current = cur.fetchone()
+        if not current:
+            return corsify(jsonify({"ok": False, "error": "not_found"}), origin), 404
+
+        updates = []
+        values: List[Any] = []
+        if name:
+            updates.append("name=%s")
+            values.append(name)
+        if desired_slug:
+            cleaned = desired_slug if TENANT_RE.match(desired_slug) else slugify_base(desired_slug)
+            if not cleaned or not TENANT_RE.match(cleaned):
+                return corsify(jsonify({"ok": False, "error": "invalid_slug"}), origin), 400
+            with con.cursor() as c2:
+                c2.execute("SELECT 1 FROM tenants WHERE slug=%s AND id<>%s", (cleaned, tenant_id))
+                if c2.fetchone():
+                    return corsify(jsonify({"ok": False, "error": "slug_in_use"}), origin), 409
+            updates.append("slug=%s")
+            values.append(cleaned)
+
+        if updates:
+            values.append(tenant_id)
+            cur.execute(f"UPDATE tenants SET {', '.join(updates)} WHERE id=%s", values)
+
+        payload = fetch_tenant(con, tenant_id)
+
+    audit("tenant_updated", tenant=tenant_id, admin=str(admin["id"]))
+    return corsify(jsonify({"ok": True, "tenant": payload}), origin)
+
+@app.post("/admin/tenants/<tenant_id>/members")
+def admin_add_tenant_member(tenant_id: str):
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    role = (data.get("role") or "MEMBER").strip().upper()
+    if role not in TENANT_ROLES:
+        return corsify(jsonify({"ok": False, "error": "invalid_role"}), origin), 400
+
+    with_db()
+    with pool.connection() as con:
+        tenant = fetch_tenant(con, tenant_id)
+        if not tenant:
+            return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+        try:
+            user = ensure_user_basic(con, email)
+        except ValueError:
+            return corsify(jsonify({"ok": False, "error": "invalid_email"}), origin), 400
+        with con.cursor() as cur:
+            cur.execute(
+                """INSERT INTO tenant_users (user_id, tenant_id, role)
+                       VALUES (%s,%s,%s)
+                       ON CONFLICT (user_id, tenant_id) DO UPDATE SET role=EXCLUDED.role""",
+                (user["id"], tenant_id, role),
+            )
+        tenant = fetch_tenant(con, tenant_id)
+
+    audit("tenant_member_upserted", tenant=tenant_id, user=email, role=role, admin=str(admin["id"]))
+    return corsify(jsonify({"ok": True, "tenant": tenant}), origin)
+
+@app.delete("/admin/tenants/<tenant_id>/members")
+def admin_remove_tenant_member(tenant_id: str):
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return corsify(jsonify({"ok": False, "error": "email_required"}), origin), 400
+
+    with_db()
+    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+        user = cur.fetchone()
+        if not user:
+            return corsify(jsonify({"ok": False, "error": "user_not_found"}), origin), 404
+        cur.execute("DELETE FROM tenant_users WHERE user_id=%s AND tenant_id=%s", (user["id"], tenant_id))
+        tenant = fetch_tenant(con, tenant_id)
+
+    audit("tenant_member_removed", tenant=tenant_id, user=email, admin=str(admin["id"]))
+    return corsify(jsonify({"ok": True, "tenant": tenant}), origin)
+
+@app.get("/admin/settings")
+def admin_list_settings():
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    with_db()
+    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT key, value, updated_at FROM global_settings ORDER BY key ASC")
+        items = [
+            {"key": row["key"], "value": row["value"], "updatedAt": row["updated_at"].isoformat()}
+            for row in cur.fetchall()
+        ]
+
+    return corsify(jsonify({"ok": True, "settings": items}), origin)
+
+@app.put("/admin/settings/<key>")
+def admin_upsert_setting(key: str):
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    data = request.get_json(silent=True)
+    if data is None or "value" not in data:
+        return corsify(jsonify({"ok": False, "error": "value_required"}), origin), 400
+
+    with_db()
+    with pool.connection() as con, con.cursor() as cur:
+        cur.execute(
+            """INSERT INTO global_settings (key, value)
+                   VALUES (%s, %s::jsonb)
+                   ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()""",
+            (key, json.dumps(data["value"])),
+        )
+
+    audit("setting_upsert", key=key, admin=str(admin["id"]))
+    return corsify(jsonify({"ok": True, "key": key, "value": data["value"]}), origin)
+
+@app.delete("/admin/settings/<key>")
+def admin_delete_setting(key: str):
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    with_db()
+    with pool.connection() as con, con.cursor() as cur:
+        cur.execute("DELETE FROM global_settings WHERE key=%s", (key,))
+
+    audit("setting_deleted", key=key, admin=str(admin["id"]))
+    return corsify(jsonify({"ok": True}), origin)
+
 # ---------------- Health ----------------
 @app.get("/health")
 def health():
@@ -583,6 +880,7 @@ def health():
         "bucket": S3_BUCKET,
         "public_media_base": PUBLIC_MEDIA_BASE or None,
         "allowed_origins": list(ALLOWED_ORIGINS) or ["* (not restricted)"],
+        "root_domain": ROOT_DOMAIN,
         "db_ready": DB_READY,
         "db_error": DB_ERR,
     })
@@ -743,6 +1041,11 @@ def delete_media():
 @app.route("/admin/signup/requests", methods=["OPTIONS"])
 @app.route("/admin/signup/approve", methods=["OPTIONS"])
 @app.route("/admin/signup/deny", methods=["OPTIONS"])
+@app.route("/admin/tenants", methods=["OPTIONS"])
+@app.route("/admin/tenants/<tenant_id>", methods=["OPTIONS"])
+@app.route("/admin/tenants/<tenant_id>/members", methods=["OPTIONS"])
+@app.route("/admin/settings", methods=["OPTIONS"])
+@app.route("/admin/settings/<key>", methods=["OPTIONS"])
 def options():
     return make_response(("", 204))
 
