@@ -426,6 +426,13 @@ def add_common_headers(resp):
             resp.headers["Expires"] = "0"
     return resp
 
+def corsify(response, origin=None):
+    """
+    CORS helper function - returns response as-is since CORS headers
+    are already handled by @app.after_request decorator
+    """
+    return response
+
 def sanitize_tenant(tenant: str) -> Optional[str]:
     t = (tenant or "default").strip().lower()
     return t if TENANT_RE.match(t) else None
