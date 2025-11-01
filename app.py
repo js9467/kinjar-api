@@ -1829,7 +1829,9 @@ def invite_family_member(family_slug: str):
 @app.route("/api/tenants/<tenant_id>/invite", methods=["OPTIONS"])
 @app.route("/families/<family_slug>/invite", methods=["OPTIONS"])
 def options():
-    return make_response(("", 204))
+    origin = request.headers.get("Origin")
+    response = make_response(("", 204))
+    return corsify(response, origin)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
