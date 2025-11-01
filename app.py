@@ -23,8 +23,11 @@ import jwt
 # ---------------- Setup ----------------
 app = Flask(__name__)
 
-# Configure Flask for larger file uploads
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB limit
+# Configure Flask for larger file uploads. Some iOS Live Photos and newer
+# devices can easily exceed 50MB even when they appear "small" in the photo
+# picker, so allow up to 150MB to avoid spurious 413 errors while still
+# preventing runaway uploads.
+app.config['MAX_CONTENT_LENGTH'] = 150 * 1024 * 1024  # 150MB limit
 app.config['UPLOAD_TIMEOUT'] = 300  # 5 minutes
 
 logging.basicConfig(level=logging.INFO)
