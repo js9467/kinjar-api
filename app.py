@@ -556,11 +556,6 @@ def create_tenant(con, name: str, desired_slug: Optional[str], owner_user_id: Op
     return {"id": tid, "slug": slug, "name": name}
 
 # ---------------- Health & Status Routes ----------------
-@app.get("/")
-def root():
-    origin = request.headers.get("Origin")
-    return corsify(jsonify({"ok": True, "service": "kinjar-api", "status": "running"}), origin)
-
 @app.get("/health")
 def health():
     origin = request.headers.get("Origin")
