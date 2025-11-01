@@ -1,0 +1,26 @@
+{
+  "name": "kinjar-api",
+  "version": "1.0.0",
+  "description": "```bash\r python -m venv .venv && source .venv/bin/activate\r pip install -r requirements.txt\r cp .env.example .env  # edit if needed\r python app.py\r ```",
+  "main": "dev_mock_server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/js9467/kinjar-api.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/js9467/kinjar-api/issues"
+  },
+  "homepage": "https://github.com/js9467/kinjar-api#readme",
+  "dependencies": {
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "uuid": "^13.0.0"
+  }
+}
