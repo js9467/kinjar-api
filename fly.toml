@@ -21,9 +21,9 @@ primary_region = "atl"
     h2_backend = true
 
   [[http_service.checks]]
-    interval = "15s"
-    timeout  = "5s"
-    grace_period = "60s"
+    interval = "30s"
+    timeout  = "10s"
+    grace_period = "120s"
     method = "GET"
     path = "/health"
     protocol = "http"

@@ -1,9 +1,12 @@
-"""WSGI entry point for Gunicorn"""
+"""ASGI adapter for Flask application"""
+from asgiref.wsgi import WsgiToAsgi
 from app import app
 
-# This is the entry point for Gunicorn
-# Use: gunicorn --config gunicorn.conf.py app:app
-# Or: gunicorn wsgi:app
+# Convert Flask WSGI app to ASGI
+asgi_app = WsgiToAsgi(app)
+
+# For Uvicorn
+application = asgi_app
 
 if __name__ == "__main__":
     # For local development only
