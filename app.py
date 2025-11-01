@@ -30,6 +30,12 @@ app.config['UPLOAD_TIMEOUT'] = 300  # 5 minutes
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("kinjar-api")
 
+
+class StorageNotConfigured(RuntimeError):
+    """Raised when required storage configuration is missing."""
+
+    pass
+
 def env_str(name: str, default: Optional[str] = None) -> str:
     val = os.getenv(name, default)
     if val is None:
@@ -79,6 +85,18 @@ TENANT_ROLES = {"OWNER", "ADMIN", "MEMBER"}
 
 # ---------------- R2 client ----------------
 def s3_client():
+    missing = []
+    if not R2_ACCOUNT_ID:
+        missing.append("R2_ACCOUNT_ID")
+    if not R2_ACCESS_KEY_ID:
+        missing.append("R2_ACCESS_KEY_ID")
+    if not R2_SECRET_ACCESS_KEY:
+        missing.append("R2_SECRET_ACCESS_KEY")
+    if missing:
+        raise StorageNotConfigured(
+            "Missing R2 configuration: " + ", ".join(sorted(missing))
+        )
+
     return boto3.client(
         "s3",
         endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
@@ -1190,6 +1208,10 @@ def presign():
 
     try:
         s3 = s3_client()
+    except StorageNotConfigured as e:
+        log.warning("presign requested but storage is not configured: %s", e)
+        return corsify(jsonify({"ok": False, "error": "storage_not_configured"}), origin), 503
+    try:
         put_url = s3.generate_presigned_url(
             ClientMethod="put_object",
             Params={"Bucket": S3_BUCKET, "Key": key},
@@ -1229,7 +1251,13 @@ def head_meta():
         return corsify(jsonify({"ok": False, "error": "missing_key"}), origin), 400
 
     try:
-        h = s3_client().head_object(Bucket=S3_BUCKET, Key=key)
+        s3 = s3_client()
+    except StorageNotConfigured as e:
+        log.warning("head_meta requested but storage is not configured: %s", e)
+        return corsify(jsonify({"ok": False, "error": "storage_not_configured"}), origin), 503
+
+    try:
+        h = s3.head_object(Bucket=S3_BUCKET, Key=key)
         size = h.get("ContentLength")
         ctype = h.get("ContentType")
         db_mark_uploaded(key, size, ctype)
@@ -1253,7 +1281,13 @@ def signed_get():
         return corsify(jsonify({"ok": False, "error": "missing_key"}), origin), 400
 
     try:
-        url = s3_client().generate_presigned_url(
+        s3 = s3_client()
+    except StorageNotConfigured as e:
+        log.warning("signed_get requested but storage is not configured: %s", e)
+        return corsify(jsonify({"ok": False, "error": "storage_not_configured"}), origin), 503
+
+    try:
+        url = s3.generate_presigned_url(
             ClientMethod="get_object",
             Params={"Bucket": S3_BUCKET, "Key": key},
             ExpiresIn=expires,
@@ -1299,7 +1333,13 @@ def delete_media():
         return corsify(jsonify({"ok": False, "error": "forbidden_key"}), origin), 403
 
     try:
-        s3_client().delete_object(Bucket=S3_BUCKET, Key=key)
+        s3 = s3_client()
+    except StorageNotConfigured as e:
+        log.warning("delete requested but storage is not configured: %s", e)
+        return corsify(jsonify({"ok": False, "error": "storage_not_configured"}), origin), 503
+
+    try:
+        s3.delete_object(Bucket=S3_BUCKET, Key=key)
         db_soft_delete(key)
         audit("delete", key=key, tenant=tenant)
         return corsify(jsonify({"ok": True}), origin)
@@ -1352,6 +1392,11 @@ def direct_upload():
     try:
         # Upload to R2
         s3 = s3_client()
+    except StorageNotConfigured as e:
+        log.warning("direct upload requested but storage is not configured: %s", e)
+        return corsify(jsonify({"ok": False, "error": "storage_not_configured"}), origin), 503
+
+    try:
         s3.upload_fileobj(
             file,
             S3_BUCKET,
@@ -1656,10 +1701,16 @@ def list_posts():
             posts = get_tenant_posts(con, tenant["id"], limit, offset)
             
             # Add signed URLs for media
+            try:
+                media_s3 = s3_client()
+            except StorageNotConfigured as e:
+                media_s3 = None
+                log.warning("list_posts skipping media URL sign because storage is not configured: %s", e)
+
             for post in posts:
-                if post.get("media_r2_key"):
+                if post.get("media_r2_key") and media_s3:
                     try:
-                        signed_url = s3_client().generate_presigned_url(
+                        signed_url = media_s3.generate_presigned_url(
                             ClientMethod="get_object",
                             Params={"Bucket": S3_BUCKET, "Key": post["media_r2_key"]},
                             ExpiresIn=3600,
@@ -1717,14 +1768,21 @@ def get_post(post_id: str):
             # Add signed URL for media
             if post.get("media_r2_key"):
                 try:
-                    signed_url = s3_client().generate_presigned_url(
-                        ClientMethod="get_object",
-                        Params={"Bucket": S3_BUCKET, "Key": post["media_r2_key"]},
-                        ExpiresIn=3600,
-                    )
-                    post["media_url"] = signed_url
-                except Exception:
-                    log.exception(f"Failed to generate signed URL for {post['media_r2_key']}")
+                    media_s3 = s3_client()
+                except StorageNotConfigured as e:
+                    media_s3 = None
+                    log.warning("get_post skipping media URL sign because storage is not configured: %s", e)
+
+                if media_s3:
+                    try:
+                        signed_url = media_s3.generate_presigned_url(
+                            ClientMethod="get_object",
+                            Params={"Bucket": S3_BUCKET, "Key": post["media_r2_key"]},
+                            ExpiresIn=3600,
+                        )
+                        post["media_url"] = signed_url
+                    except Exception:
+                        log.exception(f"Failed to generate signed URL for {post['media_r2_key']}")
 
             return corsify(jsonify({"ok": True, "post": dict(post), "comments": comments}), origin)
 
