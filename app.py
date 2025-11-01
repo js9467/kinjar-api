@@ -1415,6 +1415,79 @@ def direct_upload():
         log.exception("Upload failed")
         return corsify(jsonify({"ok": False, "error": f"upload_failed: {str(e)}"}), origin), 500
 
+@app.post("/upload/complete")
+def upload_complete():
+    """Notify API that a presigned upload has completed"""
+    origin = request.headers.get("Origin")
+    # TODO: Add proper authentication later - allowing for development
+    # if not is_authorized(request):
+    #     return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant = sanitize_tenant(request.headers.get("x-tenant-slug", "default"))
+    if not tenant:
+        return corsify(jsonify({"ok": False, "error": "invalid_tenant"}), origin), 400
+
+    body = request.get_json(silent=True) or {}
+    upload_id = body.get("id")
+    key = body.get("key") 
+    upload_type = body.get("type", "photo")
+    file_size = body.get("size", 0)
+
+    if not upload_id or not key:
+        return corsify(jsonify({"ok": False, "error": "missing_required_fields"}), origin), 400
+
+    try:
+        # Mark the upload as completed in the database
+        db_mark_uploaded(key, file_size, "")
+        
+        # Create a content post for the uploaded media
+        try:
+            if pool:
+                with pool.connection() as con:
+                    tenant_id = get_or_create_tenant(con, tenant)
+                    
+                    # For now, use a default author - in production you'd get this from auth
+                    author_id = tenant_id  # Using tenant_id as default author
+                    
+                    # Extract filename from key
+                    filename = key.split('/')[-1] if '/' in key else key
+                    title = f"{upload_type.title()} upload - {filename}"
+                    
+                    result = create_content_post(
+                        con, 
+                        tenant_id, 
+                        author_id, 
+                        title,
+                        content=f"Uploaded {upload_type} via presigned URL",
+                        media_id=upload_id,
+                        content_type="media_upload",
+                        is_public=True
+                    )
+                    
+                    log.info(f"Created content post for upload: {result['id']}")
+                    
+        except Exception as e:
+            log.exception("Failed to create content post for upload")
+            # Don't fail the upload completion for this
+
+        resp = {
+            "ok": True,
+            "id": upload_id,
+            "key": key,
+            "type": upload_type,
+            "size": file_size
+        }
+        
+        if PUBLIC_MEDIA_BASE:
+            resp["publicUrl"] = f"{PUBLIC_MEDIA_BASE.rstrip('/')}/{key}"
+        
+        audit("upload_complete", tenant=tenant, id=upload_id, key=key, size=file_size)
+        return corsify(jsonify(resp), origin)
+        
+    except Exception as e:
+        log.exception("Upload completion failed")
+        return corsify(jsonify({"ok": False, "error": f"completion_failed: {str(e)}"}), origin), 500
+
 # ---------------- Video Blog API Routes ----------------
 
 # Helper functions for video blog features
@@ -1816,6 +1889,7 @@ def invite_family_member(family_slug: str):
 @app.route("/media/list", methods=["OPTIONS"])
 @app.route("/media/delete", methods=["OPTIONS"])
 @app.route("/upload", methods=["OPTIONS"])
+@app.route("/upload/complete", methods=["OPTIONS"])
 @app.route("/auth/login", methods=["OPTIONS"])
 @app.route("/auth/register", methods=["OPTIONS"])
 @app.route("/auth/me", methods=["OPTIONS"])
