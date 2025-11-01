@@ -381,6 +381,10 @@ def corsify(resp, origin: Optional[str]):
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
             resp.headers["Access-Control-Allow-Credentials"] = "true"
             resp.headers["Vary"] = "Origin"
+            # Prevent caching of CORS responses
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
         # Allow if ALLOWED_ORIGINS is empty (for testing)
         elif not ALLOWED_ORIGINS:
             resp.headers["Access-Control-Allow-Origin"] = origin
@@ -388,27 +392,38 @@ def corsify(resp, origin: Optional[str]):
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
             resp.headers["Access-Control-Allow-Credentials"] = "true"
             resp.headers["Vary"] = "Origin"
+            # Prevent caching of CORS responses
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
     return resp
 
 @app.after_request
 def add_common_headers(resp):
-    if request.method == "OPTIONS":
-        origin = request.headers.get("Origin")
-        if origin:
-            # Allow specific origins from ALLOWED_ORIGINS OR any kinjar.com subdomain
-            if (ALLOWED_ORIGINS and origin in ALLOWED_ORIGINS) or origin.endswith('.kinjar.com') or origin == 'https://kinjar.com':
-                resp.headers["Access-Control-Allow-Origin"] = origin
-                resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS,PUT,PATCH"
-                resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
-                resp.headers["Access-Control-Allow-Credentials"] = "true"
-                resp.headers["Vary"] = "Origin"
-            # Allow if ALLOWED_ORIGINS is empty (for testing)
-            elif not ALLOWED_ORIGINS:
-                resp.headers["Access-Control-Allow-Origin"] = origin
-                resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS,PUT,PATCH"
-                resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
-                resp.headers["Access-Control-Allow-Credentials"] = "true"
-                resp.headers["Vary"] = "Origin"
+    origin = request.headers.get("Origin")
+    if origin:
+        # Allow specific origins from ALLOWED_ORIGINS OR any kinjar.com subdomain
+        if (ALLOWED_ORIGINS and origin in ALLOWED_ORIGINS) or origin.endswith('.kinjar.com') or origin == 'https://kinjar.com':
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS,PUT,PATCH"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Vary"] = "Origin"
+            # Prevent caching of CORS responses
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
+        # Allow if ALLOWED_ORIGINS is empty (for testing)
+        elif not ALLOWED_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS,PUT,PATCH"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Vary"] = "Origin"
+            # Prevent caching of CORS responses
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
     return resp
 
 def sanitize_tenant(tenant: str) -> Optional[str]:
@@ -1100,11 +1115,22 @@ def root():
 @app.get("/health")
 def health():
     # Fast health check - don't try to connect to external services
-    origin = request.headers.get("Origin")
-    return corsify(jsonify({
+    return jsonify({
         "status": "ok",
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
-    }), origin)
+    })
+
+@app.get("/debug")
+def debug():
+    # Debug endpoint to see request headers
+    return jsonify({
+        "status": "ok",
+        "headers": dict(request.headers),
+        "method": request.method,
+        "url": request.url,
+        "remote_addr": request.remote_addr,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    })
 
 @app.get("/status")
 def detailed_status():
