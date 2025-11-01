@@ -12,4 +12,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 EXPOSE 8080
-CMD ["uvicorn", "wsgi:asgi_app", "--host", "0.0.0.0", "--port", "8080", "--access-log"]
+CMD ["uvicorn", "wsgi:asgi_app", "--host", "0.0.0.0", "--port", "8080", "--access-log", "--timeout-keep-alive", "300", "--limit-max-requests", "1000"]
