@@ -374,15 +374,8 @@ def is_authorized(req) -> bool:
 
 def corsify(resp, origin: Optional[str]):
     if origin:
-        # Allow specific origins from ALLOWED_ORIGINS
-        if ALLOWED_ORIGINS and origin in ALLOWED_ORIGINS:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS,PUT,PATCH"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Vary"] = "Origin"
-        # Allow all kinjar.com subdomains (*.kinjar.com)
-        elif origin.endswith('.kinjar.com') or origin == 'https://kinjar.com':
+        # Allow specific origins from ALLOWED_ORIGINS OR any kinjar.com subdomain
+        if (ALLOWED_ORIGINS and origin in ALLOWED_ORIGINS) or origin.endswith('.kinjar.com') or origin == 'https://kinjar.com':
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS,PUT,PATCH"
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
@@ -402,15 +395,8 @@ def add_common_headers(resp):
     if request.method == "OPTIONS":
         origin = request.headers.get("Origin")
         if origin:
-            # Allow specific origins from ALLOWED_ORIGINS
-            if ALLOWED_ORIGINS and origin in ALLOWED_ORIGINS:
-                resp.headers["Access-Control-Allow-Origin"] = origin
-                resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS,PUT,PATCH"
-                resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
-                resp.headers["Access-Control-Allow-Credentials"] = "true"
-                resp.headers["Vary"] = "Origin"
-            # Allow all kinjar.com subdomains (*.kinjar.com)
-            elif origin.endswith('.kinjar.com') or origin == 'https://kinjar.com':
+            # Allow specific origins from ALLOWED_ORIGINS OR any kinjar.com subdomain
+            if (ALLOWED_ORIGINS and origin in ALLOWED_ORIGINS) or origin.endswith('.kinjar.com') or origin == 'https://kinjar.com':
                 resp.headers["Access-Control-Allow-Origin"] = origin
                 resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS,PUT,PATCH"
                 resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
@@ -556,42 +542,7 @@ def create_tenant(con, name: str, desired_slug: Optional[str], owner_user_id: Op
     return {"id": tid, "slug": slug, "name": name}
 
 # ---------------- Health & Status Routes ----------------
-@app.get("/health")
-def health():
-    origin = request.headers.get("Origin")
-    try:
-        # Test database connection
-        with_db()
-        with pool.connection() as con, con.cursor() as cur:
-            cur.execute("SELECT 1")
-            cur.fetchone()
-        
-        # Test S3/R2 connection (if configured)
-        s3_status = "not_configured"
-        if R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY:
-            try:
-                s3 = s3_client()
-                s3.head_bucket(Bucket=S3_BUCKET)
-                s3_status = "ok"
-            except Exception:
-                s3_status = "error"
-        
-        return corsify(jsonify({
-            "ok": True,
-            "service": "kinjar-api",
-            "status": "healthy",
-            "database": "ok",
-            "storage": s3_status,
-            "timestamp": datetime.datetime.utcnow().isoformat()
-        }), origin)
-    except Exception as e:
-        return corsify(jsonify({
-            "ok": False,
-            "service": "kinjar-api", 
-            "status": "unhealthy",
-            "error": str(e),
-            "timestamp": datetime.datetime.utcnow().isoformat()
-        }), origin), 503
+# Note: /health endpoint is defined later in the file around line 1149
 
 @app.get("/status")
 def status():
