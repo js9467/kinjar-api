@@ -586,7 +586,11 @@ def clear_session_cookie(resp):
 def current_user_row() -> Optional[Dict[str, Any]]:
     token = request.cookies.get("kinjar_session")
     if not token:
-        return None
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[len("Bearer ") :].strip()
+        if not token:
+            return None
     payload = verify_jwt(token)
     if not payload or "uid" not in payload:
         return None
