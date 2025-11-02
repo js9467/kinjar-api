@@ -1,0 +1,53 @@
+{
+  "name": "kinjar-frontend",
+  "version": "1.0.0",
+  "description": "Kinjar Family Social Platform - Mobile-first React/Next.js frontend",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "^14.2.33",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "@vercel/blob": "^0.15.1",
+    "clsx": "^2.0.0",
+    "tailwind-merge": "^2.0.0",
+    "tailwindcss": "^3.3.0",
+    "autoprefixer": "^10.4.16",
+    "postcss": "^8.4.31",
+    "@types/node": "^20.9.0",
+    "@types/react": "^18.2.37",
+    "@types/react-dom": "^18.2.15",
+    "typescript": "^5.2.2"
+  },
+  "devDependencies": {
+    "eslint": "^8.53.0",
+    "eslint-config-next": "^14.0.3"
+  },
+  "optionalDependencies": {
+    "@next/swc-darwin-arm64": "14.2.33",
+    "@next/swc-darwin-x64": "14.2.33",
+    "@next/swc-linux-arm64-gnu": "14.2.33",
+    "@next/swc-linux-arm64-musl": "14.2.33",
+    "@next/swc-linux-x64-gnu": "14.2.33",
+    "@next/swc-linux-x64-musl": "14.2.33",
+    "@next/swc-win32-arm64-msvc": "14.2.33",
+    "@next/swc-win32-ia32-msvc": "14.2.33",
+    "@next/swc-win32-x64-msvc": "14.2.33"
+  },
+  "keywords": [
+    "family",
+    "social",
+    "platform",
+    "nextjs",
+    "react",
+    "mobile",
+    "photos",
+    "videos"
+  ]
+}
