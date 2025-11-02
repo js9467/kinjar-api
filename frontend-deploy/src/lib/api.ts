@@ -65,7 +65,7 @@ class KinjarAPI {
   private token: string | null = null;
 
   constructor() {
-    // Initialize token from localStorage in browser
+    // Try to get token from localStorage
     if (typeof window !== 'undefined') {
       this.token = localStorage.getItem('kinjar_token');
     }
@@ -78,13 +78,15 @@ class KinjarAPI {
       ...(options.headers as Record<string, string>),
     };
 
+    // Add Authorization header if we have a token
     if (this.token) {
       headers['Authorization'] = `Bearer ${this.token}`;
     }
-
+    
     const response = await fetch(url, {
       ...options,
       headers: headers as HeadersInit,
+      credentials: 'include', // Include cookies as fallback
     });
 
     if (!response.ok) {
@@ -97,17 +99,23 @@ class KinjarAPI {
 
   // Authentication
   async login(username: string, password: string): Promise<AuthResponse> {
-    const result: AuthResponse = await this.request('/login', {
+    const result: any = await this.request('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ email: username, password }),
     });
 
-    this.token = result.token;
-    if (typeof window !== 'undefined' && this.token) {
-      localStorage.setItem('kinjar_token', this.token);
+    // Store token if provided in response
+    if (result.token) {
+      this.token = result.token;
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('kinjar_token', result.token);
+      }
     }
 
-    return result;
+    return {
+      token: result.token || '',
+      user: result.user
+    };
   }
 
   async register(userData: {
@@ -116,21 +124,21 @@ class KinjarAPI {
     password: string;
     family_name: string;
   }): Promise<AuthResponse> {
-    const result: AuthResponse = await this.request('/register', {
+    const result: any = await this.request('/auth/register', {
       method: 'POST',
       body: JSON.stringify(userData),
     });
 
-    this.token = result.token;
-    if (typeof window !== 'undefined' && this.token) {
-      localStorage.setItem('kinjar_token', this.token);
-    }
-
-    return result;
+    // Backend uses HTTP-only cookies, so no token in response
+    // Return the response with user data
+    return {
+      token: '', // Empty token since we use cookies
+      user: result.user
+    };
   }
 
   async getCurrentUser(): Promise<User> {
-    return this.request('/user/me');
+    return this.request('/auth/me');
   }
 
   logout(): void {

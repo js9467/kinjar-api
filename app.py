@@ -701,7 +701,13 @@ def auth_login():
 
     now = int(datetime.datetime.utcnow().timestamp())
     token = sign_jwt({"uid": str(row["id"]), "iat": now, "exp": now + JWT_TTL_MIN * 60})
-    resp = make_response(jsonify({"ok": True, "user": {k: row[k] for k in ("id", "email", "global_role", "created_at")}}))
+    
+    # Return token in both cookie and response body for maximum compatibility
+    resp = make_response(jsonify({
+        "ok": True, 
+        "token": token,  # Include token in response
+        "user": {k: row[k] for k in ("id", "email", "global_role", "created_at")}
+    }))
     set_session_cookie(resp, token)
     return corsify(resp, origin)
 

@@ -26,18 +26,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // Check if user is already logged in
+    // Check if user is already logged in via cookies
     const checkAuth = async () => {
       try {
-        const token = localStorage.getItem('kinjar_token');
-        if (token) {
-          const currentUser = await api.getCurrentUser();
-          setUser(currentUser);
-        }
+        // Try to get current user - this will work if valid session cookie exists
+        const currentUser = await api.getCurrentUser();
+        setUser(currentUser);
       } catch (error) {
         console.error('Auth check failed:', error);
-        // Clear invalid token
-        localStorage.removeItem('kinjar_token');
+        // User not logged in or session expired
+        setUser(null);
       } finally {
         setLoading(false);
       }
