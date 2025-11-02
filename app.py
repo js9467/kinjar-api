@@ -565,7 +565,7 @@ def set_session_cookie(resp, token: str):
         token,
         httponly=True,
         secure=True,
-        samesite="Lax",
+        samesite="None",  # Allow cross-origin cookie sharing
         domain=COOKIE_DOMAIN if COOKIE_DOMAIN else None,
         max_age=JWT_TTL_MIN * 60,
         path="/",
@@ -578,7 +578,7 @@ def clear_session_cookie(resp):
         expires=0,
         httponly=True,
         secure=True,
-        samesite="Lax",
+        samesite="None",  # Allow cross-origin cookie clearing
         domain=COOKIE_DOMAIN if COOKIE_DOMAIN else None,
         path="/",
     )
