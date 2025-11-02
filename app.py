@@ -75,6 +75,11 @@ JWT_SECRET = os.getenv("JWT_SECRET", "temp-dev-secret-change-in-production")  # 
 JWT_ALG = "HS256"
 JWT_TTL_MIN = 60 * 24 * 14  # 14 days
 COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN", None)
+_cookie_secure_env = os.getenv("COOKIE_SECURE")
+if _cookie_secure_env is None:
+    COOKIE_SECURE = None  # auto-detect based on request context
+else:
+    COOKIE_SECURE = _cookie_secure_env.strip().lower() not in {"false", "0", "no"}
 ROOT_EMAILS = set(env_list("ROOT_EMAILS"))
 
 ph = PasswordHasher()
@@ -559,28 +564,52 @@ def verify_jwt(token: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
+def _should_use_secure_cookies() -> bool:
+    """Determine whether the session cookie must be marked secure."""
+    if COOKIE_SECURE is not None:
+        return COOKIE_SECURE
+
+    # Honor proxy headers commonly set by Fly.io / other proxies.
+    proto = (request.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+    if proto:
+        return proto == "https"
+
+    if request.is_secure:
+        return True
+
+    host = (request.host or "").split(":")[0]
+    return host not in {"localhost", "127.0.0.1"}
+
+def _session_cookie_kwargs() -> Dict[str, Any]:
+    secure = _should_use_secure_cookies()
+    # Browsers require SameSite=None cookies to also be Secure. When falling
+    # back to non-secure cookies (e.g. local development over http), use Lax
+    # so the cookie is accepted and still sent on top-level navigations.
+    samesite = "None" if secure else "Lax"
+    return {
+        "httponly": True,
+        "secure": secure,
+        "samesite": samesite,
+        "domain": COOKIE_DOMAIN if COOKIE_DOMAIN else None,
+        "path": "/",
+    }
+
 def set_session_cookie(resp, token: str):
+    kwargs = _session_cookie_kwargs()
     resp.set_cookie(
         "kinjar_session",
         token,
-        httponly=True,
-        secure=True,
-        samesite="None",  # Allow cross-origin cookie sharing
-        domain=COOKIE_DOMAIN if COOKIE_DOMAIN else None,
         max_age=JWT_TTL_MIN * 60,
-        path="/",
+        **kwargs,
     )
 
 def clear_session_cookie(resp):
+    kwargs = _session_cookie_kwargs()
     resp.set_cookie(
         "kinjar_session",
         "",
         expires=0,
-        httponly=True,
-        secure=True,
-        samesite="None",  # Allow cross-origin cookie clearing
-        domain=COOKIE_DOMAIN if COOKIE_DOMAIN else None,
-        path="/",
+        **kwargs,
     )
 
 def current_user_row() -> Optional[Dict[str, Any]]:
