@@ -49,14 +49,17 @@ def env_list(name: str) -> List[str]:
     raw = os.getenv(name, "")
     return [x.strip() for x in raw.split(",") if x.strip()]
 
-# Required (R2) - make optional for development
-S3_BUCKET = os.getenv("S3_BUCKET", "kinjar-dev-bucket")
-R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
-R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
-R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+# Required (Vercel Blob) - make optional for development
+VERCEL_BLOB_TOKEN = os.getenv("BLOB_READ_WRITE_TOKEN", "")
 
 # Required (Neon) - make optional for development
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/kinjar_dev")
+
+# R2 Configuration - for media storage
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+S3_BUCKET = os.getenv("R2_BUCKET", "kinjar-media")
 
 # Optional
 PUBLIC_MEDIA_BASE = os.getenv("PUBLIC_MEDIA_BASE", "")
@@ -330,6 +333,61 @@ def db_connect_once():
                   ON activity_feed (tenant_id, created_at DESC);
             """)
 
+            # Family connections - allows families to connect and share content
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS family_connections (
+                  id             uuid PRIMARY KEY,
+                  requesting_tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                  target_tenant_id     uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                  status         text NOT NULL DEFAULT 'pending', -- pending, accepted, declined, blocked
+                  requested_by   uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  responded_by   uuid REFERENCES users(id) ON DELETE SET NULL,
+                  request_message text,
+                  response_message text,
+                  created_at     timestamptz NOT NULL DEFAULT now(),
+                  responded_at   timestamptz,
+                  UNIQUE(requesting_tenant_id, target_tenant_id)
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_family_connections_target_status
+                  ON family_connections (target_tenant_id, status);
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_family_connections_requesting_status
+                  ON family_connections (requesting_tenant_id, status);
+            """)
+
+            # Family settings for customization
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS family_settings (
+                  tenant_id       uuid PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
+                  family_photo    text,                    -- URL to family photo
+                  theme_color     text DEFAULT '#2563eb',  -- Primary color
+                  banner_image    text,                    -- Banner/header image
+                  description     text,                    -- Family description
+                  is_public       boolean DEFAULT false,   -- Whether family can be discovered
+                  allow_connections boolean DEFAULT true,  -- Whether other families can request connections
+                  updated_at      timestamptz NOT NULL DEFAULT now(),
+                  updated_by      uuid REFERENCES users(id)
+                );
+            """)
+
+            # Content visibility - tracks which families can see which posts
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS content_visibility (
+                  post_id      uuid NOT NULL REFERENCES content_posts(id) ON DELETE CASCADE,
+                  tenant_id    uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                  granted_by   uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  granted_at   timestamptz NOT NULL DEFAULT now(),
+                  PRIMARY KEY (post_id, tenant_id)
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_content_visibility_tenant_granted
+                  ON content_visibility (tenant_id, granted_at DESC);
+            """)
+
         DB_READY = True
         DB_ERR = None
     except Exception as e:
@@ -400,8 +458,10 @@ def is_authorized(req) -> bool:
 
 def corsify(resp, origin: Optional[str]):
     if origin:
-        # Allow specific origins from ALLOWED_ORIGINS OR any kinjar.com subdomain
-        if (ALLOWED_ORIGINS and origin in ALLOWED_ORIGINS) or origin.endswith('.kinjar.com') or origin == 'https://kinjar.com':
+        # Allow specific origins from ALLOWED_ORIGINS OR any kinjar.com subdomain OR Vercel deployments
+        if (ALLOWED_ORIGINS and origin in ALLOWED_ORIGINS) or \
+           origin.endswith('.kinjar.com') or origin == 'https://kinjar.com' or \
+           origin.endswith('.vercel.app'):
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS,PUT,PATCH"
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
@@ -428,8 +488,21 @@ def corsify(resp, origin: Optional[str]):
 def add_common_headers(resp):
     origin = request.headers.get("Origin")
     if origin:
-        # Allow specific origins from ALLOWED_ORIGINS OR any kinjar.com subdomain
-        if (ALLOWED_ORIGINS and origin in ALLOWED_ORIGINS) or origin.endswith('.kinjar.com') or origin == 'https://kinjar.com':
+        # Allow specific origins from ALLOWED_ORIGINS OR any kinjar.com subdomain OR Vercel deployments
+        if (ALLOWED_ORIGINS and origin in ALLOWED_ORIGINS) or \
+           origin.endswith('.kinjar.com') or origin == 'https://kinjar.com' or \
+           origin.endswith('.vercel.app'):
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS,PUT,PATCH"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Vary"] = "Origin"
+            # Prevent caching of CORS responses
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
+        # Allow if ALLOWED_ORIGINS is empty (for testing)
+        elif not ALLOWED_ORIGINS:
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS,PUT,PATCH"
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type,x-api-key,x-tenant-slug,Authorization"
@@ -1134,6 +1207,481 @@ def admin_delete_setting(key: str):
     audit("setting_deleted", key=key, admin=str(admin["id"]))
     return corsify(jsonify({"ok": True}), origin)
 
+# ---------------- Enhanced Root Admin Endpoints ----------------
+
+@app.get("/admin/dashboard")
+def admin_dashboard():
+    """Get system-wide statistics for root admin dashboard"""
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                stats = {}
+                
+                # Family statistics
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total_families,
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days') as new_families_30d,
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days') as new_families_7d
+                    FROM tenants
+                """)
+                family_stats = cur.fetchone()
+                stats.update(dict(family_stats))
+                
+                # User statistics
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total_users,
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days') as new_users_30d,
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days') as new_users_7d,
+                        COUNT(*) FILTER (WHERE global_role = 'ROOT') as root_users
+                    FROM users
+                """)
+                user_stats = cur.fetchone()
+                stats.update(dict(user_stats))
+                
+                # Content statistics
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total_posts,
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days') as new_posts_30d,
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days') as new_posts_7d,
+                        SUM(view_count) as total_views
+                    FROM content_posts WHERE status = 'published'
+                """)
+                content_stats = cur.fetchone()
+                stats.update(dict(content_stats))
+                
+                # Media statistics  
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total_media,
+                        SUM(size_bytes) as total_storage_bytes,
+                        COUNT(*) FILTER (WHERE content_type LIKE 'image/%') as total_images,
+                        COUNT(*) FILTER (WHERE content_type LIKE 'video/%') as total_videos,
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days') as new_media_30d
+                    FROM media_objects WHERE status = 'uploaded'
+                """)
+                media_stats = cur.fetchone()
+                stats.update(dict(media_stats))
+                
+                # Family connections
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total_connections,
+                        COUNT(*) FILTER (WHERE status = 'accepted') as active_connections,
+                        COUNT(*) FILTER (WHERE status = 'pending') as pending_connections
+                    FROM family_connections
+                """)
+                connection_stats = cur.fetchone()
+                stats.update(dict(connection_stats))
+                
+                # Signup requests
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as pending_signups,
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days') as new_signup_requests_7d
+                    FROM signup_requests WHERE status = 'pending'
+                """)
+                signup_stats = cur.fetchone()
+                stats.update(dict(signup_stats))
+
+                # Active families (posted in last 30 days)
+                cur.execute("""
+                    SELECT COUNT(DISTINCT tenant_id) as active_families_30d
+                    FROM content_posts 
+                    WHERE created_at >= NOW() - INTERVAL '30 days' AND status = 'published'
+                """)
+                activity_stats = cur.fetchone()
+                stats.update(dict(activity_stats))
+
+            return corsify(jsonify({"ok": True, "stats": stats}), origin)
+
+    except Exception as e:
+        log.exception("Failed to get admin dashboard")
+        return corsify(jsonify({"ok": False, "error": "dashboard_failed"}), origin), 500
+
+@app.get("/admin/families")
+def admin_list_all_families():
+    """List all families with detailed information"""
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    limit = min(max(int(request.args.get("limit", "50")), 1), 200)
+    offset = max(int(request.args.get("offset", "0")), 0)
+    search = request.args.get("search", "").strip()
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Build query with optional search
+                base_query = """
+                    SELECT 
+                        t.id, t.slug, t.name, t.created_at,
+                        COUNT(tu.user_id) as member_count,
+                        COUNT(cp.id) as post_count,
+                        COUNT(mo.id) as media_count,
+                        SUM(mo.size_bytes) as storage_bytes,
+                        fs.family_photo, fs.description, fs.is_public,
+                        MAX(cp.created_at) as last_post_at,
+                        MAX(af.created_at) as last_activity_at
+                    FROM tenants t
+                    LEFT JOIN tenant_users tu ON t.id = tu.tenant_id
+                    LEFT JOIN content_posts cp ON t.id = cp.tenant_id AND cp.status = 'published'
+                    LEFT JOIN media_objects mo ON t.slug = mo.tenant AND mo.status = 'uploaded'
+                    LEFT JOIN family_settings fs ON t.id = fs.tenant_id
+                    LEFT JOIN activity_feed af ON t.id = af.tenant_id
+                """
+                
+                params = []
+                if search:
+                    base_query += " WHERE (t.name ILIKE %s OR t.slug ILIKE %s OR fs.description ILIKE %s)"
+                    search_pattern = f"%{search}%"
+                    params.extend([search_pattern, search_pattern, search_pattern])
+                
+                base_query += """
+                    GROUP BY t.id, t.slug, t.name, t.created_at, fs.family_photo, fs.description, fs.is_public
+                    ORDER BY t.created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([limit, offset])
+                
+                cur.execute(base_query, params)
+                families = [dict(row) for row in cur.fetchall()]
+                
+                # Get total count
+                count_query = "SELECT COUNT(*) as total FROM tenants t"
+                count_params = []
+                if search:
+                    count_query += """
+                        LEFT JOIN family_settings fs ON t.id = fs.tenant_id
+                        WHERE (t.name ILIKE %s OR t.slug ILIKE %s OR fs.description ILIKE %s)
+                    """
+                    count_params.extend([search_pattern, search_pattern, search_pattern])
+                
+                cur.execute(count_query, count_params)
+                total = cur.fetchone()["total"]
+
+            return corsify(jsonify({
+                "ok": True, 
+                "families": families, 
+                "total": total,
+                "limit": limit,
+                "offset": offset
+            }), origin)
+
+    except Exception as e:
+        log.exception("Failed to list families")
+        return corsify(jsonify({"ok": False, "error": "list_families_failed"}), origin), 500
+
+@app.get("/admin/families/<family_slug>/details")
+def admin_get_family_details(family_slug: str):
+    """Get detailed information about a specific family"""
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get family basic info
+                cur.execute("SELECT * FROM tenants WHERE slug = %s", (family_slug,))
+                family = cur.fetchone()
+                if not family:
+                    return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+
+                # Get family settings
+                cur.execute("SELECT * FROM family_settings WHERE tenant_id = %s", (family["id"],))
+                settings = cur.fetchone()
+
+                # Get members with roles
+                cur.execute("""
+                    SELECT 
+                        u.id, u.email, u.created_at, u.global_role,
+                        tu.role as family_role,
+                        up.display_name, up.avatar_url, up.bio
+                    FROM tenant_users tu
+                    JOIN users u ON tu.user_id = u.id
+                    LEFT JOIN user_profiles up ON u.id = up.user_id
+                    WHERE tu.tenant_id = %s
+                    ORDER BY 
+                        CASE tu.role 
+                            WHEN 'OWNER' THEN 1 
+                            WHEN 'ADMIN' THEN 2 
+                            WHEN 'MEMBER' THEN 3 
+                            ELSE 4 
+                        END
+                """, (family["id"],))
+                members = [dict(row) for row in cur.fetchall()]
+
+                # Get recent posts
+                cur.execute("""
+                    SELECT 
+                        cp.id, cp.title, cp.created_at, cp.view_count, cp.content_type,
+                        u.email as author_email,
+                        up.display_name as author_name
+                    FROM content_posts cp
+                    JOIN users u ON cp.author_id = u.id
+                    LEFT JOIN user_profiles up ON u.id = up.user_id
+                    WHERE cp.tenant_id = %s AND cp.status = 'published'
+                    ORDER BY cp.created_at DESC
+                    LIMIT 10
+                """, (family["id"],))
+                recent_posts = [dict(row) for row in cur.fetchall()]
+
+                # Get connected families
+                connected_families = get_connected_families(con, family["id"])
+
+                # Get statistics
+                cur.execute("""
+                    SELECT 
+                        COUNT(DISTINCT tu.user_id) as member_count,
+                        COUNT(DISTINCT cp.id) as post_count,
+                        COUNT(DISTINCT mo.id) as media_count,
+                        SUM(mo.size_bytes) as storage_bytes,
+                        SUM(cp.view_count) as total_views
+                    FROM tenants t
+                    LEFT JOIN tenant_users tu ON t.id = tu.tenant_id
+                    LEFT JOIN content_posts cp ON t.id = cp.tenant_id AND cp.status = 'published'
+                    LEFT JOIN media_objects mo ON t.slug = mo.tenant AND mo.status = 'uploaded'
+                    WHERE t.id = %s
+                    GROUP BY t.id
+                """, (family["id"],))
+                stats = cur.fetchone()
+
+            return corsify(jsonify({
+                "ok": True,
+                "family": dict(family),
+                "settings": dict(settings) if settings else None,
+                "members": members,
+                "recent_posts": recent_posts,
+                "connected_families": connected_families,
+                "stats": dict(stats) if stats else {}
+            }), origin)
+
+    except Exception as e:
+        log.exception("Failed to get family details")
+        return corsify(jsonify({"ok": False, "error": "family_details_failed"}), origin), 500
+
+@app.post("/admin/families/<family_slug>/suspend")
+def admin_suspend_family(family_slug: str):
+    """Suspend a family (disable posting/activity)"""
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    body = request.get_json(silent=True) or {}
+    reason = body.get("reason", "").strip()
+    duration_days = body.get("duration_days")  # None for indefinite
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Verify family exists
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (family_slug,))
+                family = cur.fetchone()
+                if not family:
+                    return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+
+                # Add suspension to tenant settings
+                suspension_data = {
+                    "suspended": True,
+                    "suspended_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "suspended_by": admin["email"],
+                    "suspension_reason": reason,
+                    "suspension_duration_days": duration_days
+                }
+
+                cur.execute("""
+                    INSERT INTO tenant_settings (tenant_id, key, value)
+                    VALUES (%s, 'suspension', %s::jsonb)
+                    ON CONFLICT (tenant_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+                """, (family["id"], json.dumps(suspension_data)))
+
+        audit("family_suspended", family=family_slug, reason=reason, admin=admin["email"])
+        return corsify(jsonify({"ok": True, "family": family_slug, "suspended": True}), origin)
+
+    except Exception as e:
+        log.exception("Failed to suspend family")
+        return corsify(jsonify({"ok": False, "error": "suspension_failed"}), origin), 500
+
+@app.delete("/admin/families/<family_slug>/suspend")
+def admin_unsuspend_family(family_slug: str):
+    """Remove suspension from a family"""
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Verify family exists
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (family_slug,))
+                family = cur.fetchone()
+                if not family:
+                    return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+
+                # Remove suspension
+                cur.execute("""
+                    DELETE FROM tenant_settings 
+                    WHERE tenant_id = %s AND key = 'suspension'
+                """, (family["id"],))
+
+        audit("family_unsuspended", family=family_slug, admin=admin["email"])
+        return corsify(jsonify({"ok": True, "family": family_slug, "suspended": False}), origin)
+
+    except Exception as e:
+        log.exception("Failed to unsuspend family")
+        return corsify(jsonify({"ok": False, "error": "unsuspension_failed"}), origin), 500
+
+@app.get("/admin/users")
+def admin_list_users():
+    """List all users with their family memberships"""
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    limit = min(max(int(request.args.get("limit", "50")), 1), 200)
+    offset = max(int(request.args.get("offset", "0")), 0)
+    search = request.args.get("search", "").strip()
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Build query with optional search
+                base_query = """
+                    SELECT 
+                        u.id, u.email, u.created_at, u.global_role,
+                        up.display_name, up.avatar_url,
+                        COUNT(tu.tenant_id) as family_count,
+                        COUNT(cp.id) as post_count,
+                        COUNT(cc.id) as comment_count,
+                        MAX(af.created_at) as last_activity
+                    FROM users u
+                    LEFT JOIN user_profiles up ON u.id = up.user_id
+                    LEFT JOIN tenant_users tu ON u.id = tu.user_id
+                    LEFT JOIN content_posts cp ON u.id = cp.author_id AND cp.status = 'published'
+                    LEFT JOIN content_comments cc ON u.id = cc.author_id AND cc.status = 'published'
+                    LEFT JOIN activity_feed af ON u.id = af.user_id
+                """
+                
+                params = []
+                if search:
+                    base_query += " WHERE (u.email ILIKE %s OR up.display_name ILIKE %s)"
+                    search_pattern = f"%{search}%"
+                    params.extend([search_pattern, search_pattern])
+                
+                base_query += """
+                    GROUP BY u.id, u.email, u.created_at, u.global_role, up.display_name, up.avatar_url
+                    ORDER BY u.created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([limit, offset])
+                
+                cur.execute(base_query, params)
+                users = [dict(row) for row in cur.fetchall()]
+                
+                # Get family memberships for each user
+                for user in users:
+                    cur.execute("""
+                        SELECT t.slug, t.name, tu.role 
+                        FROM tenant_users tu
+                        JOIN tenants t ON tu.tenant_id = t.id
+                        WHERE tu.user_id = %s
+                        ORDER BY t.name
+                    """, (user["id"],))
+                    user["families"] = [dict(row) for row in cur.fetchall()]
+
+                # Get total count
+                count_query = "SELECT COUNT(*) as total FROM users u"
+                count_params = []
+                if search:
+                    count_query += """
+                        LEFT JOIN user_profiles up ON u.id = up.user_id
+                        WHERE (u.email ILIKE %s OR up.display_name ILIKE %s)
+                    """
+                    count_params.extend([search_pattern, search_pattern])
+                
+                cur.execute(count_query, count_params)
+                total = cur.fetchone()["total"]
+
+            return corsify(jsonify({
+                "ok": True, 
+                "users": users, 
+                "total": total,
+                "limit": limit,
+                "offset": offset
+            }), origin)
+
+    except Exception as e:
+        log.exception("Failed to list users")
+        return corsify(jsonify({"ok": False, "error": "list_users_failed"}), origin), 500
+
+@app.get("/admin/audit")
+def admin_get_audit_log():
+    """Get recent audit log entries"""
+    origin = request.headers.get("Origin")
+    admin, err = require_root()
+    if err:
+        return corsify(err, origin)
+
+    limit = min(max(int(request.args.get("limit", "100")), 1), 1000)
+    event_filter = request.args.get("event", "").strip()
+
+    try:
+        # Read audit log file
+        if not os.path.exists(AUDIT_FILE):
+            return corsify(jsonify({"ok": True, "entries": [], "total": 0}), origin)
+
+        entries = []
+        with open(AUDIT_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line.strip())
+                    if not event_filter or entry.get("event", "").startswith(event_filter):
+                        entries.append(entry)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+        # Sort by timestamp descending and limit
+        entries.sort(key=lambda x: x.get("ts", 0), reverse=True)
+        entries = entries[:limit]
+
+        # Convert timestamps to readable format
+        for entry in entries:
+            if "ts" in entry:
+                entry["timestamp"] = datetime.datetime.fromtimestamp(
+                    entry["ts"], tz=datetime.timezone.utc
+                ).isoformat()
+
+        return corsify(jsonify({
+            "ok": True, 
+            "entries": entries,
+            "total": len(entries),
+            "audit_file": AUDIT_FILE
+        }), origin)
+
+    except Exception as e:
+        log.exception("Failed to get audit log")
+        return corsify(jsonify({"ok": False, "error": "audit_failed"}), origin), 500
+
 # ---------------- Health ----------------
 @app.get("/")
 def root():
@@ -1242,6 +1790,270 @@ def presign():
 
     audit("presign", tenant=tenant, id=mid, key=key, ctype=ctype)
     return corsify(jsonify(resp), origin)
+
+# ---------------- Enhanced Mobile Upload API ----------------
+
+@app.post("/api/media/upload/prepare")
+def prepare_media_upload():
+    """Enhanced upload preparation with metadata support for mobile"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    body = request.get_json(silent=True) or {}
+    filename = sanitize_filename(body.get("filename", "file.bin"))
+    if not filename:
+        return corsify(jsonify({"ok": False, "error": "invalid_filename"}), origin), 400
+
+    ctype = (body.get("contentType") or "application/octet-stream").strip()
+    if ALLOWED_CONTENT_TYPES and ctype not in ALLOWED_CONTENT_TYPES:
+        return corsify(jsonify({"ok": False, "error": "unsupported_content_type"}), origin), 415
+
+    # Enhanced metadata capture
+    metadata = {
+        "title": body.get("title", "").strip(),
+        "description": body.get("description", "").strip(), 
+        "location": body.get("location"),  # GPS coordinates
+        "device_info": body.get("device_info"),  # Device/camera info
+        "dimensions": body.get("dimensions"),  # Width/height for images/videos
+        "duration": body.get("duration"),  # For videos
+        "file_size": body.get("file_size"),  # Expected file size
+    }
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Verify tenant exists and user is member
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (tenant_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (user["id"], tenant["id"]))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+
+        mid = str(uuid4())
+        key = f"t/{tenant_slug}/uploads/{mid}/{filename}"
+
+        try:
+            s3 = s3_client()
+        except StorageNotConfigured as e:
+            log.warning("media upload prepare requested but storage is not configured: %s", e)
+            return corsify(jsonify({"ok": False, "error": "storage_not_configured"}), origin), 503
+
+        # Generate presigned URLs for upload and POST-complete
+        put_url = s3.generate_presigned_url(
+            ClientMethod="put_object",
+            Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": ctype},
+            ExpiresIn=900,  # 15 minutes for mobile uploads
+            HttpMethod="PUT",
+        )
+
+        # Enhanced database record with metadata
+        with_db()
+        with pool.connection() as con, con.cursor() as cur:
+            cur.execute("""
+                INSERT INTO media_objects 
+                (id, tenant, r2_key, filename, content_type, status, uploaded_by, title, description,
+                 width, height, duration_seconds, size_bytes)
+                VALUES (%s, %s, %s, %s, %s, 'presigned', %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                mid, tenant_slug, key, filename, ctype, user["id"],
+                metadata["title"], metadata["description"],
+                metadata["dimensions"].get("width") if metadata["dimensions"] else None,
+                metadata["dimensions"].get("height") if metadata["dimensions"] else None,
+                metadata["duration"], metadata["file_size"]
+            ))
+
+        response = {
+            "ok": True,
+            "upload_id": mid,
+            "key": key,
+            "upload_url": put_url,
+            "expires_in": 900,
+            "max_size_mb": 150,
+            "content_type": ctype,
+            "complete_url": f"/api/media/upload/{mid}/complete"
+        }
+
+        audit("media_upload_prepared", 
+              tenant=tenant_slug, 
+              upload_id=mid, 
+              filename=filename,
+              content_type=ctype,
+              user_email=user["email"])
+
+        return corsify(jsonify(response), origin)
+
+    except Exception as e:
+        log.exception("Failed to prepare media upload")
+        return corsify(jsonify({"ok": False, "error": "prepare_failed"}), origin), 500
+
+@app.post("/api/media/upload/<upload_id>/complete")
+def complete_media_upload(upload_id: str):
+    """Mark upload as complete and optionally create a post"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    body = request.get_json(silent=True) or {}
+    create_post = body.get("create_post", False)
+    post_title = body.get("post_title", "").strip()
+    post_content = body.get("post_content", "").strip()
+    share_with_families = body.get("share_with_families", [])
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get media object
+                cur.execute("""
+                    SELECT mo.*, t.id as tenant_id, t.slug as tenant_slug 
+                    FROM media_objects mo
+                    JOIN tenants t ON mo.tenant = t.slug
+                    WHERE mo.id = %s AND mo.uploaded_by = %s AND mo.status = 'presigned'
+                """, (upload_id, user["id"]))
+                media_obj = cur.fetchone()
+                
+                if not media_obj:
+                    return corsify(jsonify({"ok": False, "error": "upload_not_found"}), origin), 404
+
+                # Verify upload was successful by checking object in storage
+                try:
+                    s3 = s3_client()
+                    head_response = s3.head_object(Bucket=S3_BUCKET, Key=media_obj["r2_key"])
+                    actual_size = head_response.get("ContentLength", 0)
+                    actual_content_type = head_response.get("ContentType", media_obj["content_type"])
+                except Exception as e:
+                    log.warning(f"Could not verify upload for {upload_id}: {e}")
+                    return corsify(jsonify({"ok": False, "error": "upload_verification_failed"}), origin), 400
+
+                # Mark as uploaded
+                cur.execute("""
+                    UPDATE media_objects 
+                    SET status = 'uploaded', size_bytes = %s, content_type = %s, updated_at = now()
+                    WHERE id = %s
+                    RETURNING *
+                """, (actual_size, actual_content_type, upload_id))
+                
+                updated_media = cur.fetchone()
+                
+                result = {
+                    "ok": True,
+                    "media": dict(updated_media),
+                    "post_created": False
+                }
+
+                # Optionally create a post
+                if create_post and post_title:
+                    post = create_content_post(
+                        con, media_obj["tenant_id"], user["id"], 
+                        post_title, post_content, upload_id, 
+                        "photo" if actual_content_type.startswith("image/") else "video"
+                    )
+                    result["post_created"] = True
+                    result["post"] = dict(post)
+                    
+                    # Share with connected families if requested
+                    if share_with_families:
+                        shared_with = []
+                        for family_slug in share_with_families:
+                            cur.execute("SELECT id FROM tenants WHERE slug = %s", (family_slug,))
+                            target_tenant = cur.fetchone()
+                            if target_tenant and share_post_with_family(con, post["id"], target_tenant["id"], user["id"]):
+                                shared_with.append(family_slug)
+                        result["shared_with"] = shared_with
+
+        audit("media_upload_completed", 
+              tenant=media_obj["tenant_slug"],
+              upload_id=upload_id, 
+              size_bytes=actual_size,
+              post_created=create_post,
+              user_email=user["email"])
+
+        return corsify(jsonify(result), origin)
+
+    except Exception as e:
+        log.exception("Failed to complete media upload")
+        return corsify(jsonify({"ok": False, "error": "completion_failed"}), origin), 500
+
+@app.get("/api/media/<media_id>")
+def get_media_info(media_id: str):
+    """Get media object info with signed URL"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get media with tenant info
+                cur.execute("""
+                    SELECT mo.*, t.id as tenant_id, t.slug as tenant_slug 
+                    FROM media_objects mo
+                    JOIN tenants t ON mo.tenant = t.slug
+                    WHERE mo.id = %s AND mo.status = 'uploaded'
+                """, (media_id,))
+                media_obj = cur.fetchone()
+                
+                if not media_obj:
+                    return corsify(jsonify({"ok": False, "error": "media_not_found"}), origin), 404
+
+                # Check user has access (member of tenant or connected family)
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (user["id"], media_obj["tenant_id"]))
+                membership = cur.fetchone()
+                
+                if not membership:
+                    # Check if user's family is connected
+                    cur.execute("""
+                        SELECT DISTINCT tu.tenant_id FROM tenant_users tu
+                        JOIN family_connections fc ON (
+                            (fc.requesting_tenant_id = tu.tenant_id AND fc.target_tenant_id = %s)
+                            OR (fc.target_tenant_id = tu.tenant_id AND fc.requesting_tenant_id = %s)
+                        )
+                        WHERE tu.user_id = %s AND fc.status = 'accepted'
+                    """, (media_obj["tenant_id"], media_obj["tenant_id"], user["id"]))
+                    
+                    if not cur.fetchone():
+                        return corsify(jsonify({"ok": False, "error": "access_denied"}), origin), 403
+
+                # Generate signed URL
+                try:
+                    s3 = s3_client()
+                    signed_url = s3.generate_presigned_url(
+                        ClientMethod="get_object",
+                        Params={"Bucket": S3_BUCKET, "Key": media_obj["r2_key"]},
+                        ExpiresIn=3600,
+                    )
+                    media_dict = dict(media_obj)
+                    media_dict["url"] = signed_url
+                    
+                    return corsify(jsonify({"ok": True, "media": media_dict}), origin)
+                    
+                except StorageNotConfigured as e:
+                    log.warning("get_media_info requested but storage is not configured: %s", e)
+                    return corsify(jsonify({"ok": False, "error": "storage_not_configured"}), origin), 503
+
+    except Exception as e:
+        log.exception("Failed to get media info")
+        return corsify(jsonify({"ok": False, "error": "get_media_failed"}), origin), 500
 
 @app.get("/r2/head")
 def head_meta():
@@ -1628,6 +2440,103 @@ def add_comment(con, post_id: str, author_id: str, content: str, parent_id: str 
         
     return comment
 
+def get_connected_families(con, tenant_id: str) -> List[Dict[str, Any]]:
+    """Get all families connected to this tenant (accepted connections only)"""
+    with con.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            SELECT 
+                fc.id as connection_id,
+                fc.created_at as connected_at,
+                CASE 
+                    WHEN fc.requesting_tenant_id = %s THEN target_t.id
+                    ELSE requesting_t.id
+                END as family_id,
+                CASE 
+                    WHEN fc.requesting_tenant_id = %s THEN target_t.slug
+                    ELSE requesting_t.slug
+                END as family_slug,
+                CASE 
+                    WHEN fc.requesting_tenant_id = %s THEN target_t.name
+                    ELSE requesting_t.name
+                END as family_name,
+                fs.family_photo,
+                fs.description
+            FROM family_connections fc
+            JOIN tenants requesting_t ON fc.requesting_tenant_id = requesting_t.id
+            JOIN tenants target_t ON fc.target_tenant_id = target_t.id
+            LEFT JOIN family_settings fs ON (
+                CASE 
+                    WHEN fc.requesting_tenant_id = %s THEN target_t.id
+                    ELSE requesting_t.id
+                END = fs.tenant_id
+            )
+            WHERE (fc.requesting_tenant_id = %s OR fc.target_tenant_id = %s) 
+              AND fc.status = 'accepted'
+            ORDER BY fc.created_at DESC
+        """, (tenant_id, tenant_id, tenant_id, tenant_id, tenant_id, tenant_id))
+        return cur.fetchall()
+
+def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+    """Get posts visible to this family from connected families"""
+    with con.cursor(row_factory=dict_row) as cur:
+        # Get posts from own tenant and connected families
+        cur.execute("""
+            SELECT DISTINCT
+                p.*,
+                u.email as author_email,
+                up.display_name as author_name,
+                up.avatar_url as author_avatar,
+                m.filename as media_filename,
+                m.content_type as media_content_type,
+                m.r2_key as media_r2_key,
+                m.thumbnail_url as media_thumbnail,
+                m.duration_seconds as media_duration,
+                t.slug as family_slug,
+                t.name as family_name,
+                fs.family_photo as family_photo
+            FROM content_posts p
+            JOIN users u ON p.author_id = u.id
+            JOIN tenants t ON p.tenant_id = t.id
+            LEFT JOIN user_profiles up ON u.id = up.user_id
+            LEFT JOIN media_objects m ON p.media_id = m.id
+            LEFT JOIN family_settings fs ON t.id = fs.tenant_id
+            WHERE p.status = 'published' AND (
+                -- Own family posts
+                p.tenant_id = %s
+                OR
+                -- Connected family posts that are shared
+                (p.tenant_id IN (
+                    SELECT CASE 
+                        WHEN fc.requesting_tenant_id = %s THEN fc.target_tenant_id
+                        ELSE fc.requesting_tenant_id
+                    END
+                    FROM family_connections fc
+                    WHERE (fc.requesting_tenant_id = %s OR fc.target_tenant_id = %s)
+                      AND fc.status = 'accepted'
+                ) AND EXISTS (
+                    SELECT 1 FROM content_visibility cv 
+                    WHERE cv.post_id = p.id AND cv.tenant_id = %s
+                ))
+            )
+            ORDER BY p.published_at DESC
+            LIMIT %s OFFSET %s
+        """, (viewing_tenant_id, viewing_tenant_id, viewing_tenant_id, viewing_tenant_id, 
+              viewing_tenant_id, limit, offset))
+        return cur.fetchall()
+
+def share_post_with_family(con, post_id: str, target_tenant_id: str, granted_by: str) -> bool:
+    """Share a post with a connected family"""
+    with con.cursor() as cur:
+        try:
+            cur.execute("""
+                INSERT INTO content_visibility (post_id, tenant_id, granted_by)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (post_id, tenant_id) DO NOTHING
+            """, (post_id, target_tenant_id, granted_by))
+            return True
+        except Exception:
+            return False
+
 # API Routes
 @app.post("/api/posts")
 def create_post():
@@ -1682,10 +2591,12 @@ def create_post():
 
 @app.get("/api/posts")
 def list_posts():
-    """List posts for a tenant"""
+    """List posts for a tenant (including cross-family shared content)"""
     origin = request.headers.get("Origin")
     
     tenant_slug = request.args.get("tenant", "")
+    include_connected = request.args.get("include_connected", "false").lower() == "true"
+    
     if not tenant_slug:
         return corsify(jsonify({"ok": False, "error": "missing_tenant"}), origin), 400
 
@@ -1701,7 +2612,10 @@ def list_posts():
                 if not tenant:
                     return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
 
-            posts = get_tenant_posts(con, tenant["id"], limit, offset)
+            if include_connected:
+                posts = get_cross_family_posts(con, tenant["id"], limit, offset)
+            else:
+                posts = get_tenant_posts(con, tenant["id"], limit, offset)
             
             # Add signed URLs for media
             try:
@@ -1726,6 +2640,127 @@ def list_posts():
 
     except Exception as e:
         log.exception("Failed to list posts")
+        return corsify(jsonify({"ok": False, "error": "list_failed"}), origin), 500
+
+@app.post("/api/posts/<post_id>/share")
+def share_post(post_id: str):
+    """Share a post with connected families"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    body = request.get_json(silent=True) or {}
+    target_families = body.get("target_families", [])  # List of family slugs
+
+    if not target_families:
+        return corsify(jsonify({"ok": False, "error": "target_families_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Verify post exists and user can share it
+                cur.execute("""
+                    SELECT p.*, t.slug as family_slug FROM content_posts p
+                    JOIN tenants t ON p.tenant_id = t.id
+                    WHERE p.id = %s AND p.status = 'published'
+                """, (post_id,))
+                post = cur.fetchone()
+                
+                if not post:
+                    return corsify(jsonify({"ok": False, "error": "post_not_found"}), origin), 404
+
+                # Check user is member of post's tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (user["id"], post["tenant_id"]))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "not_post_owner"}), origin), 403
+
+                # Get target tenant IDs and verify connections
+                cur.execute("SELECT id, slug FROM tenants WHERE slug = ANY(%s)", (target_families,))
+                target_tenants = {row["slug"]: row["id"] for row in cur.fetchall()}
+                
+                shared_with = []
+                failed_shares = []
+
+                for family_slug in target_families:
+                    if family_slug not in target_tenants:
+                        failed_shares.append({"family": family_slug, "reason": "family_not_found"})
+                        continue
+                    
+                    target_tenant_id = target_tenants[family_slug]
+                    
+                    # Check if families are connected
+                    cur.execute("""
+                        SELECT 1 FROM family_connections 
+                        WHERE ((requesting_tenant_id = %s AND target_tenant_id = %s)
+                               OR (requesting_tenant_id = %s AND target_tenant_id = %s))
+                          AND status = 'accepted'
+                    """, (post["tenant_id"], target_tenant_id, target_tenant_id, post["tenant_id"]))
+                    
+                    if not cur.fetchone():
+                        failed_shares.append({"family": family_slug, "reason": "not_connected"})
+                        continue
+
+                    # Share the post
+                    if share_post_with_family(con, post_id, target_tenant_id, user["id"]):
+                        shared_with.append(family_slug)
+                    else:
+                        failed_shares.append({"family": family_slug, "reason": "already_shared"})
+
+            audit("post_shared", post_id=post_id, shared_with=shared_with, 
+                  shared_by=user["email"], family=post["family_slug"])
+            
+            return corsify(jsonify({
+                "ok": True, 
+                "shared_with": shared_with,
+                "failed_shares": failed_shares
+            }), origin)
+
+    except Exception as e:
+        log.exception("Failed to share post")
+        return corsify(jsonify({"ok": False, "error": "share_failed"}), origin), 500
+
+@app.get("/api/families/connected")
+def list_connected_families():
+    """List families connected to current tenant"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get tenant ID
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (tenant_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+
+                # Check user is member of tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (user["id"], tenant["id"]))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+
+            connected_families = get_connected_families(con, tenant["id"])
+            return corsify(jsonify({"ok": True, "families": connected_families}), origin)
+
+    except Exception as e:
+        log.exception("Failed to list connected families")
         return corsify(jsonify({"ok": False, "error": "list_failed"}), origin), 500
 
 @app.get("/api/posts/<post_id>")
@@ -1840,6 +2875,689 @@ def add_post_comment(post_id: str):
         log.exception("Failed to add comment")
         return corsify(jsonify({"ok": False, "error": "comment_failed"}), origin), 500
 
+# ---------------- Family Connection Endpoints ----------------
+
+@app.post("/api/families/connect")
+def request_family_connection():
+    """Request to connect with another family"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    body = request.get_json(silent=True) or {}
+    target_family_slug = body.get("target_family", "").strip()
+    request_message = body.get("message", "").strip()
+
+    if not target_family_slug:
+        return corsify(jsonify({"ok": False, "error": "target_family_required"}), origin), 400
+
+    # Get requesting tenant from user's current context
+    requesting_tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not requesting_tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get both tenant IDs
+                cur.execute("SELECT id, slug, name FROM tenants WHERE slug IN (%s, %s)", 
+                          (requesting_tenant_slug, target_family_slug))
+                tenants = {row["slug"]: row for row in cur.fetchall()}
+                
+                if requesting_tenant_slug not in tenants:
+                    return corsify(jsonify({"ok": False, "error": "requesting_family_not_found"}), origin), 404
+                if target_family_slug not in tenants:
+                    return corsify(jsonify({"ok": False, "error": "target_family_not_found"}), origin), 404
+
+                requesting_tenant = tenants[requesting_tenant_slug]
+                target_tenant = tenants[target_family_slug]
+
+                # Check user is admin/owner of requesting tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s AND role IN ('ADMIN', 'OWNER')
+                """, (user["id"], requesting_tenant["id"]))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                # Check if connection already exists
+                cur.execute("""
+                    SELECT * FROM family_connections 
+                    WHERE (requesting_tenant_id = %s AND target_tenant_id = %s)
+                       OR (requesting_tenant_id = %s AND target_tenant_id = %s)
+                """, (requesting_tenant["id"], target_tenant["id"], target_tenant["id"], requesting_tenant["id"]))
+                existing = cur.fetchone()
+                
+                if existing:
+                    return corsify(jsonify({"ok": False, "error": "connection_already_exists", 
+                                          "status": existing["status"]}), origin), 409
+
+                # Check target family allows connections
+                cur.execute("SELECT allow_connections FROM family_settings WHERE tenant_id = %s", 
+                          (target_tenant["id"],))
+                settings = cur.fetchone()
+                if settings and not settings["allow_connections"]:
+                    return corsify(jsonify({"ok": False, "error": "family_not_accepting_connections"}), origin), 403
+
+                # Create connection request
+                connection_id = str(uuid4())
+                cur.execute("""
+                    INSERT INTO family_connections 
+                    (id, requesting_tenant_id, target_tenant_id, requested_by, request_message)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING *
+                """, (connection_id, requesting_tenant["id"], target_tenant["id"], 
+                     user["id"], request_message))
+                connection = cur.fetchone()
+
+            audit("family_connection_requested", 
+                  requesting_family=requesting_tenant_slug, 
+                  target_family=target_family_slug,
+                  requested_by=user["email"])
+            
+            return corsify(jsonify({
+                "ok": True, 
+                "connection": dict(connection),
+                "requesting_family": dict(requesting_tenant),
+                "target_family": dict(target_tenant)
+            }), origin)
+
+    except Exception as e:
+        log.exception("Failed to request family connection")
+        return corsify(jsonify({"ok": False, "error": "connection_request_failed"}), origin), 500
+
+@app.get("/api/families/connections")
+def list_family_connections():
+    """List family connections for current tenant"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get tenant ID
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (tenant_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+
+                # Check user is member of tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (user["id"], tenant["id"]))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+
+                # Get all connections (incoming and outgoing)
+                cur.execute("""
+                    SELECT 
+                        fc.*,
+                        CASE 
+                            WHEN fc.requesting_tenant_id = %s THEN 'outgoing'
+                            ELSE 'incoming'
+                        END as direction,
+                        CASE 
+                            WHEN fc.requesting_tenant_id = %s THEN target_t.slug
+                            ELSE requesting_t.slug
+                        END as other_family_slug,
+                        CASE 
+                            WHEN fc.requesting_tenant_id = %s THEN target_t.name
+                            ELSE requesting_t.name
+                        END as other_family_name,
+                        requester.email as requester_email,
+                        requester_profile.display_name as requester_name,
+                        responder.email as responder_email,
+                        responder_profile.display_name as responder_name
+                    FROM family_connections fc
+                    JOIN tenants requesting_t ON fc.requesting_tenant_id = requesting_t.id
+                    JOIN tenants target_t ON fc.target_tenant_id = target_t.id
+                    JOIN users requester ON fc.requested_by = requester.id
+                    LEFT JOIN users responder ON fc.responded_by = responder.id
+                    LEFT JOIN user_profiles requester_profile ON requester.id = requester_profile.user_id
+                    LEFT JOIN user_profiles responder_profile ON responder.id = responder_profile.user_id
+                    WHERE fc.requesting_tenant_id = %s OR fc.target_tenant_id = %s
+                    ORDER BY fc.created_at DESC
+                """, (tenant["id"], tenant["id"], tenant["id"], tenant["id"], tenant["id"], tenant["id"]))
+                
+                connections = [dict(row) for row in cur.fetchall()]
+
+            return corsify(jsonify({"ok": True, "connections": connections}), origin)
+
+    except Exception as e:
+        log.exception("Failed to list family connections")
+        return corsify(jsonify({"ok": False, "error": "list_connections_failed"}), origin), 500
+
+@app.post("/api/families/connections/<connection_id>/respond")
+def respond_to_family_connection(connection_id: str):
+    """Accept or decline a family connection request"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    body = request.get_json(silent=True) or {}
+    action = body.get("action", "").strip()  # 'accept' or 'decline'
+    response_message = body.get("message", "").strip()
+
+    if action not in ["accept", "decline"]:
+        return corsify(jsonify({"ok": False, "error": "invalid_action"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get connection request
+                cur.execute("""
+                    SELECT fc.*, requesting_t.slug as requesting_family, target_t.slug as target_family
+                    FROM family_connections fc
+                    JOIN tenants requesting_t ON fc.requesting_tenant_id = requesting_t.id
+                    JOIN tenants target_t ON fc.target_tenant_id = target_t.id
+                    WHERE fc.id = %s AND fc.status = 'pending'
+                """, (connection_id,))
+                connection = cur.fetchone()
+                
+                if not connection:
+                    return corsify(jsonify({"ok": False, "error": "connection_not_found"}), origin), 404
+
+                # Check user is admin/owner of target tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s AND role IN ('ADMIN', 'OWNER')
+                """, (user["id"], connection["target_tenant_id"]))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                # Update connection status
+                new_status = "accepted" if action == "accept" else "declined"
+                cur.execute("""
+                    UPDATE family_connections 
+                    SET status = %s, responded_by = %s, responded_at = now(), response_message = %s
+                    WHERE id = %s
+                    RETURNING *
+                """, (new_status, user["id"], response_message, connection_id))
+                updated_connection = cur.fetchone()
+
+            audit("family_connection_responded", 
+                  connection_id=connection_id,
+                  action=action,
+                  requesting_family=connection["requesting_family"],
+                  target_family=connection["target_family"],
+                  responded_by=user["email"])
+            
+            return corsify(jsonify({"ok": True, "connection": dict(updated_connection)}), origin)
+
+    except Exception as e:
+        log.exception("Failed to respond to family connection")
+        return corsify(jsonify({"ok": False, "error": "response_failed"}), origin), 500
+
+@app.get("/api/families/settings")
+def get_family_settings():
+    """Get family settings for current tenant"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get tenant ID
+                cur.execute("SELECT id, name FROM tenants WHERE slug = %s", (tenant_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+
+                # Check user is member of tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (user["id"], tenant["id"]))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+
+                # Get family settings
+                cur.execute("SELECT * FROM family_settings WHERE tenant_id = %s", (tenant["id"],))
+                settings = cur.fetchone()
+                
+                if not settings:
+                    # Create default settings
+                    cur.execute("""
+                        INSERT INTO family_settings (tenant_id) VALUES (%s) RETURNING *
+                    """, (tenant["id"],))
+                    settings = cur.fetchone()
+
+            return corsify(jsonify({
+                "ok": True, 
+                "settings": dict(settings),
+                "family": {"id": tenant["id"], "name": tenant["name"], "slug": tenant_slug}
+            }), origin)
+
+    except Exception as e:
+        log.exception("Failed to get family settings")
+        return corsify(jsonify({"ok": False, "error": "settings_failed"}), origin), 500
+
+@app.put("/api/families/settings")
+def update_family_settings():
+    """Update family settings (admin/owner only)"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    body = request.get_json(silent=True) or {}
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get tenant ID
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (tenant_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+
+                # Check user is admin/owner of tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s AND role IN ('ADMIN', 'OWNER')
+                """, (user["id"], tenant["id"]))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                # Update settings (only provided fields)
+                update_fields = []
+                update_values = []
+                
+                if "family_photo" in body:
+                    update_fields.append("family_photo = %s")
+                    update_values.append(body["family_photo"])
+                if "theme_color" in body:
+                    update_fields.append("theme_color = %s")
+                    update_values.append(body["theme_color"])
+                if "banner_image" in body:
+                    update_fields.append("banner_image = %s")
+                    update_values.append(body["banner_image"])
+                if "description" in body:
+                    update_fields.append("description = %s")
+                    update_values.append(body["description"])
+                if "is_public" in body:
+                    update_fields.append("is_public = %s")
+                    update_values.append(body["is_public"])
+                if "allow_connections" in body:
+                    update_fields.append("allow_connections = %s")
+                    update_values.append(body["allow_connections"])
+
+                if not update_fields:
+                    return corsify(jsonify({"ok": False, "error": "no_fields_to_update"}), origin), 400
+
+                update_fields.append("updated_at = now()")
+                update_fields.append("updated_by = %s")
+                update_values.extend([user["id"], tenant["id"]])
+
+                # Upsert settings
+                cur.execute(f"""
+                    INSERT INTO family_settings (tenant_id, updated_by) VALUES (%s, %s)
+                    ON CONFLICT (tenant_id) DO UPDATE SET {', '.join(update_fields)}
+                    RETURNING *
+                """, [tenant["id"], user["id"]] + update_values)
+                
+                settings = cur.fetchone()
+
+            audit("family_settings_updated", tenant=tenant_slug, updated_by=user["email"])
+            return corsify(jsonify({"ok": True, "settings": dict(settings)}), origin)
+
+    except Exception as e:
+        log.exception("Failed to update family settings")
+        return corsify(jsonify({"ok": False, "error": "update_failed"}), origin), 500
+
+@app.get("/api/families/members")
+def list_family_members():
+    """List family members with roles and profiles"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get tenant ID
+                cur.execute("SELECT id, name FROM tenants WHERE slug = %s", (tenant_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+
+                # Check user is member of tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (user["id"], tenant["id"]))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+
+                # Get all family members with profiles
+                cur.execute("""
+                    SELECT 
+                        u.id, u.email, u.created_at,
+                        tu.role,
+                        up.display_name, up.avatar_url, up.bio, up.phone
+                    FROM tenant_users tu
+                    JOIN users u ON tu.user_id = u.id
+                    LEFT JOIN user_profiles up ON u.id = up.user_id
+                    WHERE tu.tenant_id = %s
+                    ORDER BY 
+                        CASE tu.role 
+                            WHEN 'OWNER' THEN 1 
+                            WHEN 'ADMIN' THEN 2 
+                            WHEN 'MEMBER' THEN 3 
+                            ELSE 4 
+                        END,
+                        up.display_name, u.email
+                """, (tenant["id"],))
+                
+                members = [dict(row) for row in cur.fetchall()]
+
+            return corsify(jsonify({
+                "ok": True, 
+                "members": members,
+                "family": {"id": tenant["id"], "name": tenant["name"], "slug": tenant_slug}
+            }), origin)
+
+    except Exception as e:
+        log.exception("Failed to list family members")
+        return corsify(jsonify({"ok": False, "error": "list_members_failed"}), origin), 500
+
+@app.put("/api/families/members/<member_id>/role")
+def update_member_role(member_id: str):
+    """Update a family member's role (admin/owner only)"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    body = request.get_json(silent=True) or {}
+    new_role = body.get("role", "").strip()
+
+    if new_role not in TENANT_ROLES:
+        return corsify(jsonify({"ok": False, "error": "invalid_role"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get tenant ID
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (tenant_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+
+                # Check requesting user is admin/owner of tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s AND role IN ('ADMIN', 'OWNER')
+                """, (user["id"], tenant["id"]))
+                requester_membership = cur.fetchone()
+                if not requester_membership:
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                # Get target member info
+                cur.execute("""
+                    SELECT tu.role, u.email FROM tenant_users tu
+                    JOIN users u ON tu.user_id = u.id
+                    WHERE tu.user_id = %s AND tu.tenant_id = %s
+                """, (member_id, tenant["id"]))
+                target_member = cur.fetchone()
+                
+                if not target_member:
+                    return corsify(jsonify({"ok": False, "error": "member_not_found"}), origin), 404
+
+                # Prevent non-owners from changing owner roles
+                if (target_member["role"] == "OWNER" or new_role == "OWNER") and requester_membership["role"] != "OWNER":
+                    return corsify(jsonify({"ok": False, "error": "cannot_modify_owner"}), origin), 403
+
+                # Update role
+                cur.execute("""
+                    UPDATE tenant_users SET role = %s 
+                    WHERE user_id = %s AND tenant_id = %s
+                    RETURNING role
+                """, (new_role, member_id, tenant["id"]))
+                
+                updated_role = cur.fetchone()
+
+            audit("member_role_updated", 
+                  tenant=tenant_slug, 
+                  member_email=target_member["email"],
+                  old_role=target_member["role"],
+                  new_role=new_role,
+                  updated_by=user["email"])
+            
+            return corsify(jsonify({
+                "ok": True, 
+                "member_id": member_id,
+                "new_role": updated_role["role"]
+            }), origin)
+
+    except Exception as e:
+        log.exception("Failed to update member role")
+        return corsify(jsonify({"ok": False, "error": "update_role_failed"}), origin), 500
+
+@app.delete("/api/families/members/<member_id>")
+def remove_family_member(member_id: str):
+    """Remove a member from the family (admin/owner only)"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get tenant ID
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (tenant_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+
+                # Check requesting user is admin/owner of tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s AND role IN ('ADMIN', 'OWNER')
+                """, (user["id"], tenant["id"]))
+                requester_membership = cur.fetchone()
+                if not requester_membership:
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                # Get target member info
+                cur.execute("""
+                    SELECT tu.role, u.email FROM tenant_users tu
+                    JOIN users u ON tu.user_id = u.id
+                    WHERE tu.user_id = %s AND tu.tenant_id = %s
+                """, (member_id, tenant["id"]))
+                target_member = cur.fetchone()
+                
+                if not target_member:
+                    return corsify(jsonify({"ok": False, "error": "member_not_found"}), origin), 404
+
+                # Prevent non-owners from removing owners
+                if target_member["role"] == "OWNER" and requester_membership["role"] != "OWNER":
+                    return corsify(jsonify({"ok": False, "error": "cannot_remove_owner"}), origin), 403
+
+                # Prevent removing yourself if you're the only owner
+                if member_id == user["id"] and target_member["role"] == "OWNER":
+                    cur.execute("""
+                        SELECT COUNT(*) as owner_count FROM tenant_users 
+                        WHERE tenant_id = %s AND role = 'OWNER'
+                    """, (tenant["id"],))
+                    owner_count = cur.fetchone()["owner_count"]
+                    
+                    if owner_count <= 1:
+                        return corsify(jsonify({"ok": False, "error": "cannot_remove_last_owner"}), origin), 403
+
+                # Remove member
+                cur.execute("""
+                    DELETE FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (member_id, tenant["id"]))
+
+            audit("member_removed", 
+                  tenant=tenant_slug, 
+                  member_email=target_member["email"],
+                  member_role=target_member["role"],
+                  removed_by=user["email"])
+            
+            return corsify(jsonify({"ok": True, "removed_member_id": member_id}), origin)
+
+    except Exception as e:
+        log.exception("Failed to remove family member")
+        return corsify(jsonify({"ok": False, "error": "remove_member_failed"}), origin), 500
+
+@app.get("/api/families/stats")
+def get_family_stats():
+    """Get family statistics and activity overview"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get tenant ID
+                cur.execute("SELECT id, name, created_at FROM tenants WHERE slug = %s", (tenant_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+
+                # Check user is member of tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (user["id"], tenant["id"]))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+
+                # Get various statistics
+                stats = {}
+                
+                # Member count by role
+                cur.execute("""
+                    SELECT role, COUNT(*) as count FROM tenant_users 
+                    WHERE tenant_id = %s GROUP BY role
+                """, (tenant["id"],))
+                stats["members_by_role"] = {row["role"]: row["count"] for row in cur.fetchall()}
+                
+                # Total member count
+                stats["total_members"] = sum(stats["members_by_role"].values())
+                
+                # Post statistics
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total_posts,
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days') as posts_last_30_days,
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days') as posts_last_7_days,
+                        SUM(view_count) as total_views
+                    FROM content_posts 
+                    WHERE tenant_id = %s AND status = 'published'
+                """, (tenant["id"],))
+                post_stats = cur.fetchone()
+                stats.update(dict(post_stats))
+                
+                # Media statistics
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total_media,
+                        SUM(size_bytes) as total_storage_bytes,
+                        COUNT(*) FILTER (WHERE content_type LIKE 'image/%') as image_count,
+                        COUNT(*) FILTER (WHERE content_type LIKE 'video/%') as video_count
+                    FROM media_objects 
+                    WHERE tenant = %s AND status = 'uploaded'
+                """, (tenant_slug,))
+                media_stats = cur.fetchone()
+                stats.update(dict(media_stats))
+                
+                # Connected families count
+                cur.execute("""
+                    SELECT COUNT(*) as connected_families FROM family_connections 
+                    WHERE (requesting_tenant_id = %s OR target_tenant_id = %s) 
+                      AND status = 'accepted'
+                """, (tenant["id"], tenant["id"]))
+                connection_stats = cur.fetchone()
+                stats.update(dict(connection_stats))
+                
+                # Recent activity (last 30 days)
+                cur.execute("""
+                    SELECT 
+                        action_type,
+                        COUNT(*) as count,
+                        MAX(created_at) as last_occurrence
+                    FROM activity_feed 
+                    WHERE tenant_id = %s AND created_at >= NOW() - INTERVAL '30 days'
+                    GROUP BY action_type
+                    ORDER BY count DESC
+                """, (tenant["id"],))
+                recent_activity = [dict(row) for row in cur.fetchall()]
+                stats["recent_activity"] = recent_activity
+
+            return corsify(jsonify({
+                "ok": True, 
+                "stats": stats,
+                "family": {
+                    "id": tenant["id"], 
+                    "name": tenant["name"], 
+                    "slug": tenant_slug,
+                    "created_at": tenant["created_at"].isoformat() if tenant["created_at"] else None
+                }
+            }), origin)
+
+    except Exception as e:
+        log.exception("Failed to get family stats")
+        return corsify(jsonify({"ok": False, "error": "stats_failed"}), origin), 500
+
 @app.post("/api/tenants/<tenant_id>/invite")
 def invite_user(tenant_id: str):
     """Invite a user to join a tenant"""
@@ -1886,6 +3604,93 @@ def invite_user(tenant_id: str):
     except Exception as e:
         log.exception("Failed to invite user")
         return corsify(jsonify({"ok": False, "error": "invite_failed"}), origin), 500
+
+@app.get("/api/families/<family_slug>")
+def get_family_info(family_slug: str):
+    """Get basic family information"""
+    origin = request.headers.get("Origin")
+    
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get family basic info
+                cur.execute("""
+                    SELECT t.id, t.slug, t.name, t.created_at,
+                           fs.family_photo, fs.description, fs.theme_color, fs.is_public
+                    FROM tenants t
+                    LEFT JOIN family_settings fs ON t.id = fs.tenant_id
+                    WHERE t.slug = %s
+                """, (family_slug,))
+                family = cur.fetchone()
+                
+                if not family:
+                    return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+
+                # Get member count
+                cur.execute("""
+                    SELECT COUNT(*) as member_count
+                    FROM tenant_users tu
+                    WHERE tu.tenant_id = %s
+                """, (family["id"],))
+                member_count = cur.fetchone()["member_count"]
+
+                family_data = dict(family)
+                family_data["member_count"] = member_count
+                
+                return corsify(jsonify({"ok": True, "family": family_data}), origin)
+
+    except Exception as e:
+        log.exception("Failed to get family info")
+        return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
+
+@app.get("/api/families/<family_slug>/posts")
+def get_family_posts(family_slug: str):
+    """Get posts for a specific family"""
+    origin = request.headers.get("Origin")
+    
+    limit = min(max(int(request.args.get("limit", "20")), 1), 100)
+    offset = max(int(request.args.get("offset", "0")), 0)
+    
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get tenant ID
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (family_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+
+                # Get posts for this family
+                posts = get_tenant_posts(con, tenant["id"], limit, offset)
+                
+                # Add signed URLs for media if storage is configured
+                try:
+                    media_s3 = s3_client()
+                except StorageNotConfigured:
+                    media_s3 = None
+                    log.warning("Skipping media URL sign because storage is not configured")
+
+                for post in posts:
+                    if post.get("media_r2_key") and media_s3:
+                        try:
+                            # Use the correct bucket variable
+                            bucket = os.getenv("R2_BUCKET", "kinjar-media")
+                            signed_url = media_s3.generate_presigned_url(
+                                ClientMethod="get_object",
+                                Params={"Bucket": bucket, "Key": post["media_r2_key"]},
+                                ExpiresIn=3600,
+                            )
+                            post["media_url"] = signed_url
+                        except Exception:
+                            log.exception(f"Failed to generate signed URL for {post['media_r2_key']}")
+
+                return corsify(jsonify({"ok": True, "posts": posts}), origin)
+
+    except Exception as e:
+        log.exception("Failed to get family posts")
+        return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
 
 @app.post("/families/<family_slug>/invite")
 def invite_family_member(family_slug: str):
@@ -1968,6 +3773,8 @@ def invite_family_member(family_slug: str):
 @app.route("/api/posts/<post_id>", methods=["OPTIONS"])
 @app.route("/api/posts/<post_id>/comments", methods=["OPTIONS"])
 @app.route("/api/tenants/<tenant_id>/invite", methods=["OPTIONS"])
+@app.route("/api/families/<family_slug>", methods=["OPTIONS"])
+@app.route("/api/families/<family_slug>/posts", methods=["OPTIONS"])
 @app.route("/families/<family_slug>/invite", methods=["OPTIONS"])
 def options():
     origin = request.headers.get("Origin")
