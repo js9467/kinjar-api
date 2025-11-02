@@ -24,12 +24,22 @@
   },
   "rewrites": [
     {
-      "source": "/((?!api|_next|_static|favicon.ico|icon-192x192.png|auth).*)",
+      "source": "/((?!api|_next|_static|favicon.ico|icon-192x192.png|auth|test-auth.html).*)",
       "destination": "/families/$1",
       "has": [
         {
           "type": "host",
           "value": "(?<family>[^.]+)\\.kinjar\\.com"
+        }
+      ]
+    },
+    {
+      "source": "/",
+      "destination": "/",
+      "has": [
+        {
+          "type": "host",
+          "value": "kinjar\\.com"
         }
       ]
     }
