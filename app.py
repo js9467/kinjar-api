@@ -4429,6 +4429,7 @@ def invite_family_member(family_slug: str):
 @app.route("/admin/users", methods=["OPTIONS"])
 @app.route("/admin/create-root", methods=["OPTIONS"])
 def options():
+    return "", 200
 
 # ---------------- Family Creation ----------------
 
