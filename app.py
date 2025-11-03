@@ -3050,6 +3050,92 @@ def get_post(post_id: str):
         log.exception("Failed to get post")
         return corsify(jsonify({"ok": False, "error": "get_failed"}), origin), 500
 
+@app.delete("/api/posts/<post_id>")
+def delete_post(post_id: str):
+    """Delete a post and associated media/comments."""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    media_record = None
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                        SELECT p.id, p.tenant_id, p.author_id, p.media_id, t.slug AS tenant_slug
+                        FROM content_posts p
+                        JOIN tenants t ON p.tenant_id = t.id
+                        WHERE p.id = %s
+                    """,
+                    (post_id,),
+                )
+                post = cur.fetchone()
+                if not post or post["tenant_slug"] != tenant_slug:
+                    return corsify(jsonify({"ok": False, "error": "post_not_found"}), origin), 404
+
+                is_author = post["author_id"] == user["id"]
+                if not is_author:
+                    cur.execute(
+                        """
+                            SELECT role FROM tenant_users
+                            WHERE user_id = %s AND tenant_id = %s
+                        """,
+                        (user["id"], post["tenant_id"]),
+                    )
+                    membership = cur.fetchone()
+                    if not membership or membership["role"] not in {"ADMIN", "OWNER"}:
+                        return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                cur.execute(
+                    "DELETE FROM content_posts WHERE id = %s RETURNING media_id",
+                    (post_id,),
+                )
+                deleted = cur.fetchone()
+                if not deleted:
+                    return corsify(jsonify({"ok": False, "error": "post_not_found"}), origin), 404
+
+                media_id = deleted.get("media_id") if isinstance(deleted, dict) else deleted[0]
+                if media_id:
+                    cur.execute(
+                        """
+                            UPDATE media_objects
+                            SET status = 'deleted', deleted_at = now(), updated_at = now()
+                            WHERE id = %s
+                            RETURNING r2_key
+                        """,
+                        (media_id,),
+                    )
+                    media_record = cur.fetchone()
+
+        media_key = None
+        if media_record:
+            media_key = media_record.get("r2_key") if isinstance(media_record, dict) else media_record[0]
+        if media_key:
+            try:
+                s3 = s3_client()
+                s3.delete_object(Bucket=S3_BUCKET, Key=media_key)
+            except StorageNotConfigured as e:
+                log.warning("post_delete skipping storage cleanup: %s", e)
+            except Exception:
+                log.exception("Failed to delete media object %s for post %s", media_key, post_id)
+
+        audit("post_deleted", tenant=tenant_slug, post_id=post_id, deleted_by=user["email"])
+        resp = make_response("", 204)
+        return corsify(resp, origin)
+
+    except Exception:
+        log.exception("Failed to delete post")
+        return corsify(jsonify({"ok": False, "error": "delete_failed"}), origin), 500
+
+
 @app.post("/api/posts/<post_id>/comments")
 def add_post_comment(post_id: str):
     """Add a comment to a post"""

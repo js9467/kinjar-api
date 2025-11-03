@@ -1,7 +1,16 @@
+"use client";
+
 import Link from 'next/link'
+import FamilyFeed from '../components/FamilyFeed'
 import { useAuth } from '../lib/auth'
 
 export default function HomePage() {
+  const { isAuthenticated } = useAuth()
+
+  if (isAuthenticated) {
+    return <FamilyFeed />
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
       {/* Navigation */}
