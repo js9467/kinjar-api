@@ -4262,6 +4262,116 @@ def admin_create_root_admin():
         log.exception("Failed to create root admin")
         return corsify(jsonify({"ok": False, "error": "creation_failed"}), origin), 500
 
+# ---------------- Posts and Media Routes ----------------
+
+@app.route("/media/upload", methods=["POST"])
+def upload_media():
+    """Upload media file (image/video) for posts"""
+    origin = request.headers.get("Origin")
+    
+    # TODO: Add authentication later
+    # user = current_user_row()
+    # if not user:
+    #     return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    try:
+        if 'file' not in request.files:
+            return corsify(jsonify({"ok": False, "error": "no_file"}), origin), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return corsify(jsonify({"ok": False, "error": "no_file"}), origin), 400
+
+        # For now, return a mock URL
+        # TODO: Implement actual S3/R2 upload
+        mock_url = f"https://kinjar-api.fly.dev/media/{uuid4()}.{file.filename.split('.')[-1]}"
+        
+        return corsify(jsonify({
+            "ok": True,
+            "url": mock_url,
+            "type": "image" if file.content_type.startswith('image/') else "video"
+        }), origin)
+
+    except Exception as e:
+        log.exception("Failed to upload media")
+        return corsify(jsonify({"ok": False, "error": "upload_failed"}), origin), 500
+
+@app.route("/posts", methods=["POST"])
+def create_post():
+    """Create a new post"""
+    origin = request.headers.get("Origin")
+    
+    # TODO: Add authentication later
+    # user = current_user_row()
+    # if not user:
+    #     return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    try:
+        data = request.get_json(silent=True) or {}
+        content = data.get("content", "").strip()
+        visibility = data.get("visibility", "family")
+        family_id = data.get("familyId")
+        media_urls = data.get("mediaUrls", [])
+
+        if not content and not media_urls:
+            return corsify(jsonify({"ok": False, "error": "content_required"}), origin), 400
+
+        # For now, return a mock post
+        # TODO: Implement actual database storage
+        mock_post = {
+            "id": str(uuid4()),
+            "content": content,
+            "visibility": visibility,
+            "familyId": family_id or "family1",
+            "authorId": "user1",
+            "authorName": "Demo User",
+            "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "mediaAttachments": [{"url": url, "type": "image"} for url in media_urls],
+            "status": "approved"
+        }
+        
+        return corsify(jsonify({
+            "ok": True,
+            "post": mock_post
+        }), origin)
+
+    except Exception as e:
+        log.exception("Failed to create post")
+        return corsify(jsonify({"ok": False, "error": "creation_failed"}), origin), 500
+
+@app.route("/posts", methods=["GET"])
+def get_posts():
+    """Get posts for a family"""
+    origin = request.headers.get("Origin")
+    
+    try:
+        # Return mock posts for now
+        # TODO: Implement actual database queries
+        mock_posts = [
+            {
+                "id": "post1",
+                "content": "Welcome to the Slaughterbeck family!",
+                "visibility": "family",
+                "familyId": "family1",
+                "authorId": "user1",
+                "authorName": "Demo User",
+                "createdAt": "2025-11-03T15:00:00Z",
+                "mediaAttachments": [],
+                "status": "approved"
+            }
+        ]
+        
+        return corsify(jsonify({
+            "ok": True,
+            "posts": mock_posts
+        }), origin)
+
+    except Exception as e:
+        log.exception("Failed to get posts")
+        return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
+
+# ---------------- End Posts and Media Routes ----------------
+
 # ---------------- End New Family Authentication Routes ----------------
 
 @app.post("/families/<family_slug>/invite")
@@ -4326,8 +4436,10 @@ def invite_family_member(family_slug: str):
 @app.route("/media/signed-get", methods=["OPTIONS"])
 @app.route("/media/list", methods=["OPTIONS"])
 @app.route("/media/delete", methods=["OPTIONS"])
+@app.route("/media/upload", methods=["OPTIONS"])
 @app.route("/upload", methods=["OPTIONS"])
 @app.route("/upload/complete", methods=["OPTIONS"])
+@app.route("/posts", methods=["OPTIONS"])
 @app.route("/auth/login", methods=["OPTIONS"])
 @app.route("/auth/register", methods=["OPTIONS"])
 @app.route("/auth/me", methods=["OPTIONS"])
