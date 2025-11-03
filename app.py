@@ -89,7 +89,7 @@ ph = PasswordHasher()
 # Security/validation knobs
 ALLOWED_CONTENT_TYPES = set((
     "image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif", "image/heic", "image/heif",
-    "video/mp4", "video/quicktime", "video/mov", "video/avi", "video/webm",
+    "video/mp4", "video/quicktime", "video/mov", "video/avi", "video/webm", "video/m4v", "video/3gp", "video/3gpp",
     "text/plain", "application/pdf"
 ))
 TENANT_RE = re.compile(r"^[a-z0-9-]{1,63}$")
