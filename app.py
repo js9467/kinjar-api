@@ -2938,7 +2938,7 @@ def share_post(post_id: str):
                   shared_by=user["email"], family=post["family_slug"])
             
             return corsify(jsonify({
-                "ok": True, 
+                "ok": True,
                 "shared_with": shared_with,
                 "failed_shares": failed_shares
             }), origin)
@@ -2946,6 +2946,98 @@ def share_post(post_id: str):
     except Exception as e:
         log.exception("Failed to share post")
         return corsify(jsonify({"ok": False, "error": "share_failed"}), origin), 500
+
+@app.delete("/api/posts/<post_id>")
+def delete_post(post_id: str):
+    """Delete a post and associated content"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT p.id, p.author_id, p.tenant_id, p.media_id,
+                           t.slug as tenant_slug,
+                           m.r2_key as media_r2_key
+                    FROM content_posts p
+                    JOIN tenants t ON p.tenant_id = t.id
+                    LEFT JOIN media_objects m ON p.media_id = m.id
+                    WHERE p.id = %s
+                    """,
+                    (post_id,),
+                )
+                post = cur.fetchone()
+
+                if not post or post["tenant_slug"] != tenant_slug:
+                    return corsify(jsonify({"ok": False, "error": "post_not_found"}), origin), 404
+
+                if post["author_id"] != user["id"]:
+                    cur.execute(
+                        """
+                        SELECT role FROM tenant_users
+                        WHERE user_id = %s AND tenant_id = %s
+                          AND role IN ('ADMIN', 'OWNER')
+                        """,
+                        (user["id"], post["tenant_id"]),
+                    )
+                    membership = cur.fetchone()
+                    if not membership:
+                        return corsify(jsonify({"ok": False, "error": "forbidden"}), origin), 403
+
+                media_id = post["media_id"]
+                media_r2_key = post["media_r2_key"]
+                other_post_count = 0
+                if media_id:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*) AS count
+                        FROM content_posts
+                        WHERE media_id = %s AND id <> %s
+                        """,
+                        (media_id, post_id),
+                    )
+                    other_post_count = cur.fetchone()["count"]
+
+                cur.execute("DELETE FROM content_posts WHERE id = %s", (post_id,))
+                cur.execute("DELETE FROM activity_feed WHERE entity_id = %s", (post_id,))
+                cur.execute(
+                    "DELETE FROM activity_feed WHERE metadata->>'post_id' = %s",
+                    (post_id,),
+                )
+
+                if media_id and other_post_count == 0:
+                    cur.execute(
+                        """
+                        UPDATE media_objects
+                        SET status = 'deleted', deleted_at = now(), updated_at = now()
+                        WHERE id = %s
+                        """,
+                        (media_id,),
+                    )
+
+        if media_r2_key and media_id and other_post_count == 0:
+            try:
+                db_soft_delete(media_r2_key)
+            except Exception:
+                log.warning("Failed to mark media %s as deleted", media_r2_key)
+
+        audit("post_deleted", tenant=tenant_slug, post_id=post_id, user_email=user["email"])
+
+        resp = make_response("", 204)
+        return corsify(resp, origin)
+
+    except Exception as e:
+        log.exception("Failed to delete post")
+        return corsify(jsonify({"ok": False, "error": "delete_failed"}), origin), 500
 
 @app.get("/api/families/connected")
 def list_connected_families():
