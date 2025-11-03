@@ -737,11 +737,11 @@ def auth_login():
         
         cur.execute("""
             SELECT t.id as family_id, t.slug as family_slug, t.name as family_name, 
-                   tu.role, tu.joined_at
+                   tu.role
             FROM tenant_users tu
             JOIN tenants t ON t.id = tu.tenant_id
             WHERE tu.user_id = %s
-            ORDER BY tu.joined_at ASC
+            ORDER BY t.name ASC
         """, (row["id"],))
         memberships = list(cur.fetchall())
 
@@ -761,7 +761,7 @@ def auth_login():
                 "familySlug": m["family_slug"],
                 "familyName": m["family_name"],
                 "role": m["role"],
-                "joinedAt": m["joined_at"].isoformat() if m["joined_at"] else None
+                "joinedAt": None
             }
             for m in memberships
         ],
@@ -797,11 +797,11 @@ def auth_me():
         # Get family memberships
         cur.execute("""
             SELECT t.id as family_id, t.slug as family_slug, t.name as family_name, 
-                   tu.role, tu.joined_at
+                   tu.role
             FROM tenant_users tu
             JOIN tenants t ON t.id = tu.tenant_id
             WHERE tu.user_id = %s
-            ORDER BY tu.joined_at ASC
+            ORDER BY t.name ASC
         """, (user["id"],))
         memberships = list(cur.fetchall())
 
@@ -818,7 +818,7 @@ def auth_me():
                 "familySlug": m["family_slug"],
                 "familyName": m["family_name"],
                 "role": m["role"],
-                "joinedAt": m["joined_at"].isoformat() if m["joined_at"] else None
+                "joinedAt": None
             }
             for m in memberships
         ],
@@ -3992,12 +3992,12 @@ def get_family_by_slug(family_slug: str):
                     # User is a member, include private details
                     cur.execute("""
                         SELECT u.id, up.display_name as name, u.email, tu.role,
-                               tu.joined_at, up.avatar_url
+                               up.avatar_url
                         FROM tenant_users tu
                         JOIN users u ON tu.user_id = u.id
                         LEFT JOIN user_profiles up ON u.id = up.user_id
                         WHERE tu.tenant_id = %s
-                        ORDER BY tu.role DESC, tu.joined_at ASC
+                        ORDER BY tu.role DESC, u.email ASC
                     """, (family["id"],))
                     members = list(cur.fetchall())
                     
@@ -4007,7 +4007,7 @@ def get_family_by_slug(family_slug: str):
                             "name": m["name"] or m["email"].split("@")[0],
                             "email": m["email"],
                             "role": m["role"],
-                            "joinedAt": m["joined_at"].isoformat() if m["joined_at"] else None,
+                            "joinedAt": None,
                             "avatarUrl": m["avatar_url"]
                         }
                         for m in members
