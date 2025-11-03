@@ -4477,15 +4477,6 @@ def invite_family_member(family_slug: str):
 @app.route("/upload/complete", methods=["OPTIONS"])
 @app.route("/posts", methods=["OPTIONS"])
 @app.route("/auth/login", methods=["OPTIONS"])
-@app.route("/debug/env", methods=["GET"])
-def debug_env():
-    """Debug endpoint to check environment variables (temporary)"""
-    return jsonify({
-        "blob_token_configured": bool(VERCEL_BLOB_TOKEN),
-        "blob_token_length": len(VERCEL_BLOB_TOKEN) if VERCEL_BLOB_TOKEN else 0,
-        "blob_token_prefix": VERCEL_BLOB_TOKEN[:20] if VERCEL_BLOB_TOKEN else "None"
-    })
-
 @app.route("/auth/register", methods=["OPTIONS"])
 @app.route("/auth/me", methods=["OPTIONS"])
 @app.route("/auth/logout", methods=["OPTIONS"])
