@@ -106,33 +106,28 @@ def upload_to_vercel_blob(file_data, filename, content_type):
     file_extension = filename.split('.')[-1] if '.' in filename else 'bin'
     unique_filename = f"{uuid4()}.{file_extension}"
     
-    # Vercel Blob upload endpoint - correct API endpoint
-    upload_url = f"https://blob.vercel-storage.com/upload"
-    
-    # Prepare the form data for multipart upload
-    files = {
-        'file': (unique_filename, file_data, content_type)
-    }
-    
-    data = {
-        'filename': unique_filename
-    }
+    # Correct Vercel Blob upload endpoint - PUT to specific filename
+    upload_url = f"https://blob.vercel-storage.com/{unique_filename}"
     
     headers = {
         'Authorization': f'Bearer {VERCEL_BLOB_TOKEN}',
+        'X-Content-Type': content_type,
     }
     
     try:
-        # Upload the file using multipart form data
-        response = requests.post(upload_url, files=files, data=data, headers=headers)
+        # Upload the file using PUT request
+        response = requests.put(upload_url, data=file_data, headers=headers)
         response.raise_for_status()
         
-        # Parse the response
+        # Parse the response to get the actual public URL
         result = response.json()
+        public_url = result.get('url', upload_url)
+        
+        log.info(f"Successfully uploaded to Vercel Blob: {public_url}")
         
         # Return the public URL from Vercel Blob response
         return {
-            'url': result.get('url', ''),
+            'url': public_url,
             'filename': unique_filename,
             'size': len(file_data),
             'content_type': content_type
