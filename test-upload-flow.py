@@ -5,6 +5,7 @@ Tests both API upload endpoint and post creation
 """
 import requests
 import json
+import time
 import sys
 import os
 
@@ -43,11 +44,11 @@ def test_upload_and_post():
     print("\n2. Testing family creation endpoint...")
     
     family_data = {
-        "familyName": "Test Upload Family",
-        "subdomain": "testupload",
+        "familyName": f"Test Upload Family {int(time.time())}",
+        "subdomain": f"testupload{int(time.time())}",
         "description": "Test family for upload verification",
         "adminName": "Test Admin",
-        "adminEmail": "test@testupload.family", 
+        "adminEmail": f"test{int(time.time())}@testupload.family", 
         "password": "TestPass123!",
         "isPublic": True
     }
