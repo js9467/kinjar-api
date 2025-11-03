@@ -728,14 +728,52 @@ def auth_login():
     except Exception:
         return corsify(jsonify({"ok": False, "error": "Invalid credentials"}), origin), 401
 
+    # Get user profile and memberships
+    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            SELECT display_name, avatar_url FROM user_profiles WHERE user_id = %s
+        """, (row["id"],))
+        profile = cur.fetchone()
+        
+        cur.execute("""
+            SELECT t.id as family_id, t.slug as family_slug, t.name as family_name, 
+                   tu.role, tu.joined_at
+            FROM tenant_users tu
+            JOIN tenants t ON t.id = tu.tenant_id
+            WHERE tu.user_id = %s
+            ORDER BY tu.joined_at ASC
+        """, (row["id"],))
+        memberships = list(cur.fetchall())
+
     now = int(datetime.datetime.utcnow().timestamp())
     token = sign_jwt({"uid": str(row["id"]), "iat": now, "exp": now + JWT_TTL_MIN * 60})
+    
+    # Format user data
+    user_data = {
+        "id": str(row["id"]),
+        "name": profile["display_name"] if profile else email.split("@")[0],
+        "email": email,
+        "avatarColor": "#3B82F6",
+        "globalRole": "ROOT_ADMIN" if row["global_role"] == "ROOT" else "FAMILY_ADMIN" if memberships else "MEMBER",
+        "memberships": [
+            {
+                "familyId": m["family_id"],
+                "familySlug": m["family_slug"],
+                "familyName": m["family_name"],
+                "role": m["role"],
+                "joinedAt": m["joined_at"].isoformat() if m["joined_at"] else None
+            }
+            for m in memberships
+        ],
+        "createdAt": row["created_at"].isoformat() if row["created_at"] else None,
+        "lastLoginAt": datetime.datetime.utcnow().isoformat()
+    }
     
     # Return token in both cookie and response body for maximum compatibility
     resp = make_response(jsonify({
         "ok": True, 
-        "token": token,  # Include token in response
-        "user": {k: row[k] for k in ("id", "email", "global_role", "created_at")}
+        "token": token,
+        "user": user_data
     }))
     set_session_cookie(resp, token)
     return corsify(resp, origin)
@@ -746,18 +784,49 @@ def auth_me():
     user, err = require_auth()
     if err:
         return corsify(err, origin)
-    # include tenants memberships
+    
     with_db()
     with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        # Get user profile
         cur.execute("""
-          SELECT t.id, t.slug, t.name, tu.role
-          FROM tenant_users tu
-          JOIN tenants t ON t.id = tu.tenant_id
-          WHERE tu.user_id = %s
-          ORDER BY t.created_at DESC
+            SELECT display_name, avatar_url, bio, phone
+            FROM user_profiles WHERE user_id = %s
         """, (user["id"],))
-        tenants = list(cur.fetchall())
-    return corsify(jsonify({"ok": True, "user": user, "tenants": tenants}), origin)
+        profile = cur.fetchone()
+        
+        # Get family memberships
+        cur.execute("""
+            SELECT t.id as family_id, t.slug as family_slug, t.name as family_name, 
+                   tu.role, tu.joined_at
+            FROM tenant_users tu
+            JOIN tenants t ON t.id = tu.tenant_id
+            WHERE tu.user_id = %s
+            ORDER BY tu.joined_at ASC
+        """, (user["id"],))
+        memberships = list(cur.fetchall())
+
+    # Format user data to match frontend expectations
+    user_data = {
+        "id": user["id"],
+        "name": profile["display_name"] if profile else user["email"].split("@")[0],
+        "email": user["email"],
+        "avatarColor": "#3B82F6",  # Default color, could be stored in profile later
+        "globalRole": "ROOT_ADMIN" if user["global_role"] == "ROOT" else "FAMILY_ADMIN" if memberships else "MEMBER",
+        "memberships": [
+            {
+                "familyId": m["family_id"],
+                "familySlug": m["family_slug"],
+                "familyName": m["family_name"],
+                "role": m["role"],
+                "joinedAt": m["joined_at"].isoformat() if m["joined_at"] else None
+            }
+            for m in memberships
+        ],
+        "createdAt": user["created_at"].isoformat() if user.get("created_at") else None,
+        "lastLoginAt": datetime.datetime.utcnow().isoformat()
+    }
+    
+    return corsify(jsonify({"ok": True, "user": user_data}), origin)
 
 @app.post("/auth/logout")
 def auth_logout():
@@ -3727,6 +3796,474 @@ def get_family_posts(family_slug: str):
         log.exception("Failed to get family posts")
         return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
 
+# ---------------- New Family Authentication & Management Routes ----------------
+
+@app.post("/families/create")
+def create_family():
+    """Create a new family with subdomain and admin user"""
+    origin = request.headers.get("Origin")
+    data = request.get_json(silent=True) or {}
+    
+    family_name = data.get("familyName", "").strip()
+    subdomain = data.get("subdomain", "").strip().lower()
+    description = data.get("description", "").strip()
+    admin_name = data.get("adminName", "").strip()
+    admin_email = data.get("adminEmail", "").strip().lower()
+    password = data.get("password", "")
+    is_public = data.get("isPublic", False)
+
+    # Validation
+    if not all([family_name, subdomain, admin_name, admin_email, password]):
+        return corsify(jsonify({"ok": False, "error": "Missing required fields"}), origin), 400
+    
+    if len(password) < 8:
+        return corsify(jsonify({"ok": False, "error": "Password must be at least 8 characters"}), origin), 400
+    
+    if not re.match(r'^[a-z0-9-]+$', subdomain) or len(subdomain) < 3 or len(subdomain) > 20:
+        return corsify(jsonify({"ok": False, "error": "Invalid subdomain format"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Check if subdomain/email already exists
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (subdomain,))
+                if cur.fetchone():
+                    return corsify(jsonify({"ok": False, "error": "Subdomain already taken"}), origin), 400
+                
+                cur.execute("SELECT id FROM users WHERE email = %s", (admin_email,))
+                if cur.fetchone():
+                    return corsify(jsonify({"ok": False, "error": "Email already registered"}), origin), 400
+                
+                # Create user
+                user_id = str(uuid4())
+                password_hash = ph.hash(password)
+                cur.execute("""
+                    INSERT INTO users (id, email, password_hash, global_role)
+                    VALUES (%s, %s, %s, 'USER') RETURNING *
+                """, (user_id, admin_email, password_hash))
+                user = cur.fetchone()
+                
+                # Create user profile
+                cur.execute("""
+                    INSERT INTO user_profiles (user_id, display_name)
+                    VALUES (%s, %s)
+                """, (user_id, admin_name))
+                
+                # Create family (tenant)
+                family_id = str(uuid4())
+                cur.execute("""
+                    INSERT INTO tenants (id, slug, name)
+                    VALUES (%s, %s, %s) RETURNING *
+                """, (family_id, subdomain, family_name))
+                family = cur.fetchone()
+                
+                # Add user as family admin
+                cur.execute("""
+                    INSERT INTO tenant_users (user_id, tenant_id, role)
+                    VALUES (%s, %s, 'ADMIN')
+                """, (user_id, family_id))
+                
+                # Create family settings
+                cur.execute("""
+                    INSERT INTO family_settings (tenant_id, description, is_public, updated_by)
+                    VALUES (%s, %s, %s, %s)
+                """, (family_id, description, is_public, user_id))
+
+        # Generate JWT token
+        now = int(datetime.datetime.utcnow().timestamp())
+        token = sign_jwt({"uid": user_id, "iat": now, "exp": now + JWT_TTL_MIN * 60})
+        
+        # Prepare response data
+        user_data = {
+            "id": user_id,
+            "name": admin_name,
+            "email": admin_email,
+            "globalRole": "FAMILY_ADMIN",
+            "memberships": [{
+                "familyId": family_id,
+                "familySlug": subdomain,
+                "familyName": family_name,
+                "role": "ADMIN",
+                "joinedAt": datetime.datetime.utcnow().isoformat()
+            }],
+            "createdAt": datetime.datetime.utcnow().isoformat()
+        }
+        
+        family_data = {
+            "id": family_id,
+            "slug": subdomain,
+            "name": family_name,
+            "description": description,
+            "isPublic": is_public,
+            "subdomain": subdomain,
+            "ownerId": user_id,
+            "createdAt": datetime.datetime.utcnow().isoformat()
+        }
+
+        audit("family_created", family_id=family_id, family_slug=subdomain, admin_email=admin_email)
+        
+        resp = make_response(jsonify({
+            "ok": True,
+            "token": token,
+            "user": user_data,
+            "family": family_data
+        }))
+        set_session_cookie(resp, token)
+        return corsify(resp, origin)
+
+    except Exception as e:
+        log.exception("Failed to create family")
+        return corsify(jsonify({"ok": False, "error": "creation_failed"}), origin), 500
+
+@app.get("/families/check-subdomain/<subdomain>")
+def check_subdomain_availability(subdomain: str):
+    """Check if a subdomain is available"""
+    origin = request.headers.get("Origin")
+    
+    subdomain = subdomain.strip().lower()
+    if not re.match(r'^[a-z0-9-]+$', subdomain) or len(subdomain) < 3 or len(subdomain) > 20:
+        return corsify(jsonify({"ok": False, "available": False, "error": "Invalid subdomain format"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor() as cur:
+            cur.execute("SELECT id FROM tenants WHERE slug = %s", (subdomain,))
+            exists = cur.fetchone() is not None
+            
+        return corsify(jsonify({"ok": True, "available": not exists}), origin)
+
+    except Exception as e:
+        log.exception("Failed to check subdomain availability")
+        return corsify(jsonify({"ok": False, "error": "check_failed"}), origin), 500
+
+@app.get("/families/<family_slug>")
+def get_family_by_slug(family_slug: str):
+    """Get family information by slug (supports both public and authenticated access)"""
+    origin = request.headers.get("Origin")
+    
+    family_slug = sanitize_tenant(family_slug)
+    if not family_slug:
+        return corsify(jsonify({"ok": False, "error": "invalid_family_slug"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Get family with settings
+            cur.execute("""
+                SELECT t.id, t.slug, t.name, t.created_at,
+                       fs.description, fs.is_public, fs.theme_color, fs.banner_image, fs.family_photo
+                FROM tenants t
+                LEFT JOIN family_settings fs ON t.id = fs.tenant_id
+                WHERE t.slug = %s
+            """, (family_slug,))
+            family = cur.fetchone()
+            
+            if not family:
+                return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+            
+            # Get member count (for public info)
+            cur.execute("SELECT COUNT(*) as member_count FROM tenant_users WHERE tenant_id = %s", (family["id"],))
+            member_count = cur.fetchone()["member_count"]
+            
+            family_data = {
+                "id": family["id"],
+                "slug": family["slug"],
+                "name": family["name"],
+                "description": family["description"],
+                "isPublic": family["is_public"],
+                "themeColor": family["theme_color"] or "#2563eb",
+                "bannerImage": family["banner_image"],
+                "familyPhoto": family["family_photo"],
+                "memberCount": member_count,
+                "createdAt": family["created_at"].isoformat() if family["created_at"] else None
+            }
+            
+            # Add more details if user is authenticated and is a member
+            user = current_user_row()
+            if user:
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (user["id"], family["id"]))
+                membership = cur.fetchone()
+                
+                if membership:
+                    # User is a member, include private details
+                    cur.execute("""
+                        SELECT u.id, up.display_name as name, u.email, tu.role,
+                               tu.joined_at, up.avatar_url
+                        FROM tenant_users tu
+                        JOIN users u ON tu.user_id = u.id
+                        LEFT JOIN user_profiles up ON u.id = up.user_id
+                        WHERE tu.tenant_id = %s
+                        ORDER BY tu.role DESC, tu.joined_at ASC
+                    """, (family["id"],))
+                    members = list(cur.fetchall())
+                    
+                    family_data["members"] = [
+                        {
+                            "id": m["id"],
+                            "name": m["name"] or m["email"].split("@")[0],
+                            "email": m["email"],
+                            "role": m["role"],
+                            "joinedAt": m["joined_at"].isoformat() if m["joined_at"] else None,
+                            "avatarUrl": m["avatar_url"]
+                        }
+                        for m in members
+                    ]
+                    family_data["userRole"] = membership["role"]
+
+        return corsify(jsonify({"ok": True, "family": family_data}), origin)
+
+    except Exception as e:
+        log.exception(f"Failed to get family {family_slug}")
+        return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
+
+@app.post("/families/invite")
+def invite_family_member_new():
+    """Invite a member to join a family with specific role"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+
+    data = request.get_json(silent=True) or {}
+    family_id = data.get("familyId", "").strip()
+    email = data.get("email", "").strip().lower()
+    name = data.get("name", "").strip()
+    role = data.get("role", "ADULT").strip()
+
+    # Validate role
+    valid_roles = ["ADMIN", "ADULT", "CHILD_0_5", "CHILD_5_10", "CHILD_10_14", "CHILD_14_16", "CHILD_16_ADULT"]
+    if role not in valid_roles:
+        return corsify(jsonify({"ok": False, "error": "Invalid role"}), origin), 400
+
+    if not all([family_id, email, name]):
+        return corsify(jsonify({"ok": False, "error": "Missing required fields"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Check if user has admin permissions for this family
+            cur.execute("""
+                SELECT role FROM tenant_users 
+                WHERE user_id = %s AND tenant_id = %s AND role = 'ADMIN'
+            """, (user["id"], family_id))
+            
+            if not cur.fetchone() and user["global_role"] != "ROOT":
+                return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
+
+            # Get family info
+            cur.execute("SELECT slug, name FROM tenants WHERE id = %s", (family_id,))
+            family = cur.fetchone()
+            if not family:
+                return corsify(jsonify({"ok": False, "error": "Family not found"}), origin), 404
+
+            # Create invitation
+            invite_id = str(uuid4())
+            invite_token = str(uuid4())
+            expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)
+            
+            cur.execute("""
+                INSERT INTO tenant_invitations (id, tenant_id, invited_by, email, role, invite_token, expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """, (invite_id, family_id, user["id"], email, role, invite_token, expires_at))
+            invitation = cur.fetchone()
+
+        audit("family_member_invited", 
+              family_id=family_id, 
+              family_slug=family["slug"], 
+              invited_email=email,
+              invited_by=user["email"],
+              role=role)
+
+        return corsify(jsonify({
+            "ok": True,
+            "invitation": dict(invitation),
+            "message": f"Invitation sent to {email} to join {family['name']}"
+        }), origin)
+
+    except Exception as e:
+        log.exception("Failed to invite family member")
+        return corsify(jsonify({"ok": False, "error": "invitation_failed"}), origin), 500
+
+@app.patch("/families/<family_id>/members/<member_id>/role")
+def update_member_role(family_id: str, member_id: str):
+    """Update a family member's role"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+
+    data = request.get_json(silent=True) or {}
+    new_role = data.get("role", "").strip()
+
+    valid_roles = ["ADMIN", "ADULT", "CHILD_0_5", "CHILD_5_10", "CHILD_10_14", "CHILD_14_16", "CHILD_16_ADULT"]
+    if new_role not in valid_roles:
+        return corsify(jsonify({"ok": False, "error": "Invalid role"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Check permissions
+            cur.execute("""
+                SELECT role FROM tenant_users 
+                WHERE user_id = %s AND tenant_id = %s AND role = 'ADMIN'
+            """, (user["id"], family_id))
+            
+            if not cur.fetchone() and user["global_role"] != "ROOT":
+                return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
+
+            # Update role
+            cur.execute("""
+                UPDATE tenant_users 
+                SET role = %s 
+                WHERE user_id = %s AND tenant_id = %s
+                RETURNING *
+            """, (new_role, member_id, family_id))
+            
+            updated = cur.fetchone()
+            if not updated:
+                return corsify(jsonify({"ok": False, "error": "Member not found"}), origin), 404
+
+        audit("member_role_updated",
+              family_id=family_id,
+              member_id=member_id,
+              new_role=new_role,
+              updated_by=user["email"])
+
+        return corsify(jsonify({"ok": True, "message": "Role updated successfully"}), origin)
+
+    except Exception as e:
+        log.exception("Failed to update member role")
+        return corsify(jsonify({"ok": False, "error": "update_failed"}), origin), 500
+
+@app.get("/admin/families")
+def admin_get_all_families():
+    """Get all families (root admin only)"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+    
+    if user["global_role"] != "ROOT":
+        return corsify(jsonify({"ok": False, "error": "Root admin access required"}), origin), 403
+
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT t.id, t.slug, t.name, t.created_at,
+                       fs.description, fs.is_public,
+                       COUNT(tu.user_id) as member_count
+                FROM tenants t
+                LEFT JOIN family_settings fs ON t.id = fs.tenant_id
+                LEFT JOIN tenant_users tu ON t.id = tu.tenant_id
+                GROUP BY t.id, t.slug, t.name, t.created_at, fs.description, fs.is_public
+                ORDER BY t.created_at DESC
+            """)
+            families = list(cur.fetchall())
+
+        return corsify(jsonify({"ok": True, "families": families}), origin)
+
+    except Exception as e:
+        log.exception("Failed to get all families")
+        return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
+
+@app.get("/admin/users")
+def admin_get_all_users():
+    """Get all users (root admin only)"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+    
+    if user["global_role"] != "ROOT":
+        return corsify(jsonify({"ok": False, "error": "Root admin access required"}), origin), 403
+
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT u.id, u.email, u.global_role, u.created_at,
+                       up.display_name as name,
+                       COUNT(tu.tenant_id) as family_count
+                FROM users u
+                LEFT JOIN user_profiles up ON u.id = up.user_id
+                LEFT JOIN tenant_users tu ON u.id = tu.user_id
+                GROUP BY u.id, u.email, u.global_role, u.created_at, up.display_name
+                ORDER BY u.created_at DESC
+            """)
+            users = list(cur.fetchall())
+
+        return corsify(jsonify({"ok": True, "users": users}), origin)
+
+    except Exception as e:
+        log.exception("Failed to get all users")
+        return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
+
+@app.post("/admin/create-root")
+def admin_create_root_admin():
+    """Create root admin user (only if no root admin exists)"""
+    origin = request.headers.get("Origin")
+    data = request.get_json(silent=True) or {}
+    
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+    name = data.get("name", "").strip()
+
+    if not all([email, password, name]):
+        return corsify(jsonify({"ok": False, "error": "Missing required fields"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Check if any root admin already exists
+            cur.execute("SELECT id FROM users WHERE global_role = 'ROOT' LIMIT 1")
+            if cur.fetchone():
+                return corsify(jsonify({"ok": False, "error": "Root admin already exists"}), origin), 400
+
+            # Check if email already exists
+            cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+            if cur.fetchone():
+                return corsify(jsonify({"ok": False, "error": "Email already registered"}), origin), 400
+
+            # Create root admin
+            user_id = str(uuid4())
+            password_hash = ph.hash(password)
+            
+            cur.execute("""
+                INSERT INTO users (id, email, password_hash, global_role)
+                VALUES (%s, %s, %s, 'ROOT') RETURNING *
+            """, (user_id, email, password_hash))
+            user = cur.fetchone()
+            
+            # Create user profile
+            cur.execute("""
+                INSERT INTO user_profiles (user_id, display_name)
+                VALUES (%s, %s)
+            """, (user_id, name))
+
+        audit("root_admin_created", admin_email=email)
+        
+        return corsify(jsonify({
+            "ok": True,
+            "user": {
+                "id": user_id,
+                "email": email,
+                "name": name,
+                "globalRole": "ROOT_ADMIN"
+            }
+        }), origin)
+
+    except Exception as e:
+        log.exception("Failed to create root admin")
+        return corsify(jsonify({"ok": False, "error": "creation_failed"}), origin), 500
+
+# ---------------- End New Family Authentication Routes ----------------
+
 @app.post("/families/<family_slug>/invite")
 def invite_family_member(family_slug: str):
     """Invite a user to join a family (by slug)"""
@@ -3811,6 +4348,14 @@ def invite_family_member(family_slug: str):
 @app.route("/api/families/<family_slug>", methods=["OPTIONS"])
 @app.route("/api/families/<family_slug>/posts", methods=["OPTIONS"])
 @app.route("/families/<family_slug>/invite", methods=["OPTIONS"])
+@app.route("/families/create", methods=["OPTIONS"])
+@app.route("/families/check-subdomain/<subdomain>", methods=["OPTIONS"])
+@app.route("/families/<family_slug>", methods=["OPTIONS"])
+@app.route("/families/invite", methods=["OPTIONS"])
+@app.route("/families/<family_id>/members/<member_id>/role", methods=["OPTIONS"])
+@app.route("/admin/families", methods=["OPTIONS"])
+@app.route("/admin/users", methods=["OPTIONS"])
+@app.route("/admin/create-root", methods=["OPTIONS"])
 def options():
     origin = request.headers.get("Origin")
     response = make_response(("", 204))
