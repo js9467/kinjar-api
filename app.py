@@ -2528,6 +2528,8 @@ def create_content_post(con, tenant_id: str, author_id: str, title: str, content
     post_id = str(uuid4())
     published_at = datetime.datetime.now(datetime.timezone.utc)
     
+    log.info(f"[DEBUG] Creating post with media_id={media_id}, media_url={media_url}")
+    
     with con.cursor(row_factory=dict_row) as cur:
         # If we have a media_url (e.g., from Vercel Blob) but no media_id, create a media object
         actual_media_id = media_id
@@ -2740,6 +2742,9 @@ def create_post():
 
     body = request.get_json(silent=True) or {}
     
+    # Debug: log the received request body
+    log.info(f"[DEBUG] Received post data: {json.dumps(body, indent=2)}")
+    
     # Support both old and new API formats
     title = body.get("title", "").strip()
     content = body.get("content", "").strip()
@@ -2756,6 +2761,13 @@ def create_post():
         media_id = media.get("id")
         media_url = media.get("url")
         # If we have a URL but no ID, we'll create the media object in create_content_post
+    
+    # Also check for direct media_url in body for backward compatibility
+    if not media_url and body.get("media_url"):
+        media_url = body.get("media_url")
+    
+    # Debug: log media processing
+    log.info(f"[DEBUG] Media processing: media_id={media_id}, media_url={media_url}, media_object={media}")
     
     content_type = body.get("content_type", "video_blog")
     is_public = body.get("is_public", True)
