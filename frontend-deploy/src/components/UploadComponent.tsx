@@ -1,11 +1,11 @@
 'use client';
 
 import React, { useState, useRef } from 'react';
-import { api, MediaUpload } from '../lib/api';
+import { api, UploadResponse, Post } from '../lib/api';
 
 interface UploadComponentProps {
-  familyId: number;
-  onUploadSuccess?: (post: any) => void;
+  familyId?: number | null;
+  onUploadSuccess?: (post: Post) => void;
   onUploadError?: (error: string) => void;
   className?: string;
 }
@@ -19,42 +19,97 @@ export default function UploadComponent({
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [debugInfo, setDebugInfo] = useState<string>('');
   const [postContent, setPostContent] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const isFamilyReady = typeof familyId === 'number';
+
+  const ensureFamilyId = (): number | null => {
+    if (typeof familyId !== 'number') {
+      onUploadError?.('Your family space is still loading. Please try again in a moment.');
+      return null;
+    }
+
+    return familyId;
+  };
+
   const handleFileSelect = (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    
+
     const file = files[0];
     validateAndUpload(file);
   };
 
   const validateAndUpload = async (file: File) => {
-    // TEMPORARY: Very permissive validation for iPhone videos
-    console.log('[Upload] File info:', {
-      name: file.name,
-      type: file.type,
-      size: file.size
-    });
+    const resolvedFamilyId = ensureFamilyId();
+    if (resolvedFamilyId === null) return;
 
-    // For iPhone compatibility, allow any file with media extension
+    // Debug: log file information for troubleshooting
+    const fileInfo = {
+      name: file.name,
+      type: file.type || 'empty',
+      size: file.size
+    };
+    
+    setDebugInfo(`File: ${fileInfo.name}, Type: ${fileInfo.type}, Size: ${fileInfo.size}`);
+    
+    console.log('[Upload] File info:', fileInfo);
+
+    // TEMPORARY: Very permissive validation for debugging iPhone video issues
     const fileName = file.name.toLowerCase();
     const hasVideoExtension = fileName.match(/\.(mp4|mov|m4v|3gp|3gpp|avi|webm|mkv|flv|wmv)$/i);
     const hasImageExtension = fileName.match(/\.(jpg|jpeg|png|gif|webp|heic|heif|bmp|tiff)$/i);
+    const hasMediaExtension = hasVideoExtension || hasImageExtension;
     
-    // Block obviously non-media files
-    const isObviouslyNotMedia = fileName.match(/\.(txt|doc|docx|pdf|zip|rar|js|html|css)$/i);
+    const extDebugInfo = `Video ext: ${!!hasVideoExtension}, Image ext: ${!!hasImageExtension}`;
+    setDebugInfo(prev => `${prev} | ${extDebugInfo}`);
+    
+    console.log('[Upload] Extension check:', {
+      hasVideoExtension: !!hasVideoExtension,
+      hasImageExtension: !!hasImageExtension,
+      hasMediaExtension
+    });
+    
+    // Also allow if MIME type suggests it's media
+    const isVideoMimeType = file.type.startsWith('video/');
+    const isImageMimeType = file.type.startsWith('image/');
+    const isMediaMimeType = isVideoMimeType || isImageMimeType;
+    
+    // Check for obviously non-media files
+    const isTextFile = fileName.match(/\.(txt|doc|docx|pdf|rtf)$/i);
+    const isArchiveFile = fileName.match(/\.(zip|rar|7z|tar|gz)$/i);
+    const isCodeFile = fileName.match(/\.(js|ts|html|css|py|java|c|cpp)$/i);
+    const isObviouslyNotMedia = isTextFile || isArchiveFile || isCodeFile;
     
     if (isObviouslyNotMedia) {
-      onUploadError?.(`File "${file.name}" is not a media file. Please select an image or video.`);
+      setDebugInfo(prev => `${prev} | BLOCKED: Obviously not media`);
+      onUploadError?.(`File type not supported: "${file.name}". Please select an image or video file. [DEBUG: Obviously not media]`);
       return;
     }
-
-    // Allow media files or files with media extensions
-    if (!hasVideoExtension && !hasImageExtension && file.type && !file.type.startsWith('image/') && !file.type.startsWith('video/')) {
-      onUploadError?.(`[UPDATED] iPhone videos supported! Detected: "${file.type}" for "${file.name}". Try selecting from Photos app.`);
-      return;
+    
+    // TEMPORARY: Allow ANY file with video extension regardless of MIME type
+    if (hasVideoExtension) {
+      setDebugInfo(prev => `${prev} | ALLOWED: Has video extension`);
+      console.log('[Upload] File validation passed - has video extension');
+      // Skip all other validation for video files
+    } else if (hasImageExtension) {
+      setDebugInfo(prev => `${prev} | ALLOWED: Has image extension`);
+      console.log('[Upload] File validation passed - has image extension');
+      // Skip all other validation for image files
+    } else {
+      // Allow if it has media extension OR media MIME type OR if we can't determine (be very permissive)
+      if (!hasMediaExtension && !isMediaMimeType && file.type && file.type !== '' && file.type !== 'application/octet-stream') {
+        setDebugInfo(prev => `${prev} | BLOCKED: No media ext/type`);
+        console.log('[Upload] File rejected - no media extension and non-media MIME type:', file.type);
+        onUploadError?.(`[NEW VALIDATION] Detected: "${file.type}" for "${file.name}". Please try selecting from your camera roll or gallery instead of files app.`);
+        return;
+      } else {
+        setDebugInfo(prev => `${prev} | ALLOWED: Permissive rule`);
+      }
     }
+    
+    console.log('[Upload] File validation passed');
 
     // Validate file size (150MB limit)
     const maxSize = 150 * 1024 * 1024; // 150MB in bytes
@@ -68,21 +123,24 @@ export default function UploadComponent({
 
     try {
       // Upload media to Vercel Blob
-      const mediaUpload: MediaUpload = await api.uploadMedia(file);
+      const uploadResponse: UploadResponse = await api.uploadMedia(file);
       setUploadProgress(100);
 
       // Create post with media
       const mediaType = file.type.startsWith('image/') ? 'image' : 'video';
-      const post = await api.createPost({
-        content: postContent || `Shared a ${mediaType}`,
-        family_id: familyId,
-        media_url: mediaUpload.url,
-        media_type: mediaType
+      const createdPost = await api.createPost({
+        content: postContent.trim() || `Shared a ${mediaType}`,
+        familyId: resolvedFamilyId.toString(),
+        media: {
+          type: mediaType,
+          url: uploadResponse.url,
+          alt: `${mediaType} upload`
+        }
       });
 
-      onUploadSuccess?.(post);
+      onUploadSuccess?.(createdPost);
       setPostContent('');
-      
+
     } catch (error) {
       console.error('Upload failed:', error);
       onUploadError?.(error instanceof Error ? error.message : 'Upload failed');
@@ -109,6 +167,10 @@ export default function UploadComponent({
   };
 
   const triggerFileSelect = () => {
+    if (!isFamilyReady) {
+      return;
+    }
+
     fileInputRef.current?.click();
   };
 
@@ -133,11 +195,18 @@ export default function UploadComponent({
         />
       </div>
 
+      {/* Debug info display for iPhone testing */}
+      {debugInfo && (
+        <div className="mt-2 p-2 bg-gray-100 text-xs text-gray-600 rounded">
+          <strong>Debug:</strong> {debugInfo}
+        </div>
+      )}
+
       {/* Upload area */}
       <div
         className={`upload-dropzone p-6 text-center cursor-pointer transition-colors ${
           dragOver ? 'dragover' : ''
-        } ${uploading ? 'pointer-events-none opacity-50' : ''}`}
+        } ${uploading || !isFamilyReady ? 'pointer-events-none opacity-50' : ''}`}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
@@ -146,7 +215,7 @@ export default function UploadComponent({
         <input
           ref={fileInputRef}
           type="file"
-          accept="image/*,video/*"
+          accept="image/*,video/*,.heic,.heif"
           onChange={(e) => handleFileSelect(e.target.files)}
           className="hidden"
         />
@@ -181,7 +250,7 @@ export default function UploadComponent({
       <div className="flex gap-3 mt-4 md:hidden">
         <button
           onClick={handleCameraCapture}
-          disabled={uploading}
+          disabled={uploading || !isFamilyReady}
           className="flex-1 bg-blue-600 text-white py-3 px-4 rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 flex items-center justify-center gap-2"
         >
           <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -192,7 +261,7 @@ export default function UploadComponent({
         </button>
         <button
           onClick={triggerFileSelect}
-          disabled={uploading}
+          disabled={uploading || !isFamilyReady}
           className="flex-1 bg-gray-600 text-white py-3 px-4 rounded-lg font-medium hover:bg-gray-700 disabled:opacity-50 flex items-center justify-center gap-2"
         >
           <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -208,14 +277,17 @@ export default function UploadComponent({
           <button
             onClick={async () => {
               if (!postContent.trim()) return;
-              
+
+              const resolvedFamilyId = ensureFamilyId();
+              if (resolvedFamilyId === null) return;
+
               setUploading(true);
               try {
-                const post = await api.createPost({
-                  content: postContent,
-                  family_id: familyId
+                const createdPost = await api.createPost({
+                  content: postContent.trim(),
+                  familyId: resolvedFamilyId.toString(),
                 });
-                onUploadSuccess?.(post);
+                onUploadSuccess?.(createdPost);
                 setPostContent('');
               } catch (error) {
                 onUploadError?.(error instanceof Error ? error.message : 'Failed to create post');
@@ -229,6 +301,12 @@ export default function UploadComponent({
             Post
           </button>
         </div>
+      )}
+
+      {!isFamilyReady && (
+        <p className="mt-4 text-sm text-gray-500">
+          Preparing your family space&hellip; uploads will be available shortly.
+        </p>
       )}
     </div>
   );
