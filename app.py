@@ -4404,23 +4404,36 @@ def upload_media():
         if file.filename == '':
             return corsify(jsonify({"ok": False, "error": "no_file"}), origin), 400
 
-        # Validate file type - be more permissive for mobile uploads
+        # TEMPORARY: Very permissive validation for debugging iPhone video issues
         content_type = file.content_type or mimetypes.guess_type(file.filename)[0] or 'application/octet-stream'
         
-        # Check if it's an allowed type
+        log.info(f"[DEBUG] Upload attempt: filename={file.filename}, content_type={content_type}")
+        
+        # Check if it's definitely allowed
         is_allowed_type = content_type in ALLOWED_CONTENT_TYPES
         
-        # For mobile uploads, also check by file extension if MIME type is generic
+        # For mobile uploads, be very permissive with media file extensions
         if not is_allowed_type and file.filename:
             filename_lower = file.filename.lower()
             is_media_by_extension = (
                 filename_lower.endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif', '.bmp', '.tiff')) or
-                filename_lower.endswith(('.mp4', '.mov', '.m4v', '.avi', '.webm', '.3gp', '.3gpp'))
+                filename_lower.endswith(('.mp4', '.mov', '.m4v', '.avi', '.webm', '.3gp', '.3gpp', '.mkv', '.flv', '.wmv'))
             )
-            # Allow if it's likely a media file even with generic MIME type
-            if is_media_by_extension and content_type.startswith(('application/', 'binary/', '')):
+            # Allow any file with media extension, regardless of MIME type
+            if is_media_by_extension:
                 is_allowed_type = True
-                log.info(f"Allowing file {file.filename} with generic MIME type {content_type} based on extension")
+                log.info(f"Allowing file {file.filename} with MIME type {content_type} based on media extension")
+        
+        # Block obviously non-media files
+        if file.filename:
+            filename_lower = file.filename.lower()
+            is_obviously_not_media = (
+                filename_lower.endswith(('.txt', '.doc', '.docx', '.pdf', '.zip', '.rar', '.js', '.html', '.css')) or
+                not filename_lower.split('.')[-1].isalpha()  # No extension or weird extension
+            )
+            if is_obviously_not_media:
+                log.warning(f"Blocked obviously non-media file: {file.filename}")
+                return corsify(jsonify({"ok": False, "error": "invalid_file_type", "detected_type": content_type}), origin), 400
         
         if not is_allowed_type:
             log.warning(f"Rejected file: {file.filename}, MIME type: {content_type}")
