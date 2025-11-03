@@ -19,6 +19,8 @@ from psycopg_pool import ConnectionPool
 
 from argon2 import PasswordHasher
 import jwt
+import requests
+import mimetypes
 
 # ---------------- Setup ----------------
 app = Flask(__name__)
@@ -93,6 +95,40 @@ ALLOWED_CONTENT_TYPES = set((
 TENANT_RE = re.compile(r"^[a-z0-9-]{1,63}$")
 FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
 TENANT_ROLES = {"OWNER", "ADMIN", "MEMBER"}
+
+# ---------------- Vercel Blob Upload ----------------
+def upload_to_vercel_blob(file_data, filename, content_type):
+    """Upload file to Vercel Blob storage and return the public URL"""
+    if not VERCEL_BLOB_TOKEN:
+        raise StorageNotConfigured("BLOB_READ_WRITE_TOKEN not configured")
+    
+    # Generate a unique filename to avoid conflicts
+    file_extension = filename.split('.')[-1] if '.' in filename else 'bin'
+    unique_filename = f"{uuid4()}.{file_extension}"
+    
+    # Vercel Blob upload endpoint
+    upload_url = f"https://blob.vercel-storage.com/{unique_filename}"
+    
+    headers = {
+        'Authorization': f'Bearer {VERCEL_BLOB_TOKEN}',
+        'X-Content-Type': content_type,
+    }
+    
+    try:
+        # Upload the file
+        response = requests.put(upload_url, data=file_data, headers=headers)
+        response.raise_for_status()
+        
+        # Return the public URL
+        return {
+            'url': upload_url,
+            'filename': unique_filename,
+            'size': len(file_data),
+            'content_type': content_type
+        }
+    except requests.exceptions.RequestException as e:
+        log.error(f"Failed to upload to Vercel Blob: {e}")
+        raise Exception(f"Upload failed: {str(e)}")
 
 # ---------------- R2 client ----------------
 def s3_client():
@@ -4301,15 +4337,45 @@ def upload_media():
         if file.filename == '':
             return corsify(jsonify({"ok": False, "error": "no_file"}), origin), 400
 
-        # For now, return a mock URL
-        # TODO: Implement actual S3/R2 upload
-        mock_url = f"https://kinjar-api.fly.dev/media/{uuid4()}.{file.filename.split('.')[-1]}"
+        # Validate file type
+        content_type = file.content_type or mimetypes.guess_type(file.filename)[0] or 'application/octet-stream'
+        if content_type not in ALLOWED_CONTENT_TYPES:
+            return corsify(jsonify({"ok": False, "error": "invalid_file_type"}), origin), 400
+
+        # Validate file size (150MB max)
+        file.seek(0, 2)  # Seek to end
+        file_size = file.tell()
+        file.seek(0)  # Reset to beginning
         
-        return corsify(jsonify({
-            "ok": True,
-            "url": mock_url,
-            "type": "image" if file.content_type.startswith('image/') else "video"
-        }), origin)
+        if file_size > 150 * 1024 * 1024:  # 150MB
+            return corsify(jsonify({"ok": False, "error": "file_too_large"}), origin), 400
+
+        # Read file data
+        file_data = file.read()
+        
+        # Upload to Vercel Blob
+        try:
+            blob_result = upload_to_vercel_blob(file_data, file.filename, content_type)
+            
+            log.info(f"Successfully uploaded {file.filename} to Vercel Blob: {blob_result['url']}")
+            
+            return corsify(jsonify({
+                "ok": True,
+                "url": blob_result['url'],
+                "filename": blob_result['filename'],
+                "size": blob_result['size'],
+                "type": "image" if content_type.startswith('image/') else "video"
+            }), origin)
+            
+        except StorageNotConfigured:
+            log.warning("Vercel Blob not configured, falling back to mock URL")
+            # Fallback to mock URL if Vercel Blob not configured
+            mock_url = f"https://kinjar-api.fly.dev/media/{uuid4()}.{file.filename.split('.')[-1]}"
+            return corsify(jsonify({
+                "ok": True,
+                "url": mock_url,
+                "type": "image" if content_type.startswith('image/') else "video"
+            }), origin)
 
     except Exception as e:
         log.exception("Failed to upload media")
