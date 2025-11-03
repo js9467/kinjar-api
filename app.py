@@ -4429,6 +4429,148 @@ def invite_family_member(family_slug: str):
 @app.route("/admin/users", methods=["OPTIONS"])
 @app.route("/admin/create-root", methods=["OPTIONS"])
 def options():
+
+# ---------------- Family Creation ----------------
+
+@app.post("/families/create")
+def create_family():
+    """Create a new family with admin user"""
+    origin = request.headers.get("Origin")
+    data = request.get_json(silent=True) or {}
+    
+    # Extract family data
+    family_name = (data.get("familyName") or "").strip()
+    subdomain = (data.get("subdomain") or "").strip().lower()
+    description = (data.get("description") or "").strip()
+    is_public = data.get("isPublic", True)
+    
+    # Extract admin user data
+    admin_name = (data.get("adminName") or "").strip()
+    admin_email = (data.get("adminEmail") or "").strip().lower()
+    password = data.get("password") or ""
+    
+    # Validation
+    if not family_name or not subdomain or not admin_name or not admin_email or not password:
+        return corsify(jsonify({"ok": False, "error": "Missing required fields"}), origin), 400
+    
+    if len(password) < 8:
+        return corsify(jsonify({"ok": False, "error": "Password must be at least 8 characters"}), origin), 400
+    
+    if not re.match(r'^[a-z0-9-]+$', subdomain):
+        return corsify(jsonify({"ok": False, "error": "Subdomain can only contain lowercase letters, numbers, and hyphens"}), origin), 400
+    
+    if len(subdomain) < 3 or len(subdomain) > 20:
+        return corsify(jsonify({"ok": False, "error": "Subdomain must be 3-20 characters"}), origin), 400
+    
+    # Generate slug from family name  
+    family_slug = slugify_base(family_name)
+    
+    pw_hash = ph.hash(password)
+    
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Start transaction
+                con.autocommit = False
+                
+                try:
+                    # Check if subdomain/slug already exists
+                    cur.execute("SELECT id FROM tenants WHERE slug = %s", (subdomain,))
+                    if cur.fetchone():
+                        return corsify(jsonify({"ok": False, "error": "Subdomain already taken"}), origin), 409
+                    
+                    # Create tenant (family)
+                    tenant_id = str(uuid4())
+                    cur.execute("""
+                        INSERT INTO tenants (id, name, slug)
+                        VALUES (%s, %s, %s)
+                        RETURNING *
+                    """, (tenant_id, family_name, subdomain))
+                    tenant = cur.fetchone()
+                    
+                    # Create family settings
+                    cur.execute("""
+                        INSERT INTO family_settings (tenant_id, description, is_public)
+                        VALUES (%s, %s, %s)
+                    """, (tenant_id, description, is_public))
+                    
+                    # Create admin user
+                    user_id = str(uuid4())
+                    cur.execute("""
+                        INSERT INTO users (id, email, password_hash, global_role)
+                        VALUES (%s, %s, %s, %s)
+                        RETURNING *
+                    """, (user_id, admin_email, pw_hash, "USER"))
+                    user = cur.fetchone()
+                    
+                    # Create user profile
+                    cur.execute("""
+                        INSERT INTO user_profiles (user_id, display_name)
+                        VALUES (%s, %s)
+                    """, (user_id, admin_name))
+                    
+                    # Add user as family admin/owner
+                    cur.execute("""
+                        INSERT INTO tenant_users (user_id, tenant_id, role)
+                        VALUES (%s, %s, %s)
+                    """, (user_id, tenant_id, "ADMIN"))
+                    
+                    # Commit transaction
+                    con.commit()
+                    
+                    # Generate JWT token
+                    now = int(datetime.datetime.utcnow().timestamp())
+                    token = sign_jwt({"uid": str(user["id"]), "iat": now, "exp": now + JWT_TTL_MIN * 60})
+                    
+                    # Return success with user and family data
+                    user_data = {
+                        "id": user["id"],
+                        "name": admin_name,
+                        "email": user["email"],
+                        "avatarColor": "#3B82F6",
+                        "globalRole": "FAMILY_ADMIN",
+                        "memberships": [
+                            {
+                                "familyId": tenant["id"],
+                                "familySlug": tenant["slug"],
+                                "familyName": tenant["name"],
+                                "role": "ADMIN"
+                            }
+                        ]
+                    }
+                    
+                    family_data = {
+                        "id": tenant["id"],
+                        "name": tenant["name"],
+                        "slug": tenant["slug"],
+                        "description": description,
+                        "isPublic": is_public
+                    }
+                    
+                    audit("family_created", family_slug=subdomain, admin_email=admin_email)
+                    
+                    resp = make_response(jsonify({
+                        "ok": True,
+                        "family": family_data,
+                        "user": user_data,
+                        "token": token
+                    }))
+                    set_session_cookie(resp, token)
+                    return corsify(resp, origin)
+                    
+                except Exception as e:
+                    # Rollback on error
+                    con.rollback()
+                    raise e
+                    
+    except psycopg.errors.UniqueViolation:
+        return corsify(jsonify({"ok": False, "error": "Email already registered"}), origin), 409
+    except Exception as e:
+        log.exception("Failed to create family")
+        return corsify(jsonify({"ok": False, "error": "Family creation failed"}), origin), 500
+
+def options():
     origin = request.headers.get("Origin")
     response = make_response(("", 204))
     return corsify(response, origin)
