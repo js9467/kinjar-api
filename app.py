@@ -3402,8 +3402,8 @@ def list_family_members():
         return corsify(jsonify({"ok": False, "error": "list_members_failed"}), origin), 500
 
 @app.put("/api/families/members/<member_id>/role")
-def update_member_role(member_id: str):
-    """Update a family member's role (admin/owner only)"""
+def update_member_role_legacy(member_id: str):
+    """Update a family member's role (admin/owner only) - Legacy endpoint"""
     origin = request.headers.get("Origin")
     user = current_user_row()
     if not user:
