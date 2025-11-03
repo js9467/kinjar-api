@@ -2,6 +2,8 @@
 
 import { AuthUser, CreateFamilyRequest, FamilyProfile, InviteMemberRequest, SubdomainInfo, FamilyPost, MediaAttachment } from './types';
 
+export type { User } from './types';
+
 // Export types that components might need
 export type Post = FamilyPost;
 export interface MediaUpload {
@@ -165,20 +167,38 @@ class KinjarAPI {
     });
 
     if (!response.ok) {
-      if (response.status === 401) {
-        this.removeToken();
-        // Don't automatically redirect - let the auth context handle it
-        // This prevents redirect loops
-      }
-      
-      // Enhanced error logging for debugging
-      const errorData = await response.json().catch(() => ({ message: 'Request failed' }));
-      console.error(`[API Error] ${response.status} ${response.statusText}:`, errorData);
-      
-      throw new Error(errorData.message || `HTTP ${response.status}`);
+        if (response.status === 401) {
+          this.removeToken();
+          // Don't automatically redirect - let the auth context handle it
+          // This prevents redirect loops
+        }
+
+        // Enhanced error logging for debugging
+        const errorData = await response.json().catch(() => ({ message: 'Request failed' }));
+        console.error(`[API Error] ${response.status} ${response.statusText}:`, errorData);
+
+        throw new Error(errorData.message || `HTTP ${response.status}`);
     }
 
-    return response.json();
+    if (response.status === 204 || response.status === 205) {
+      return null;
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      return response.json();
+    }
+
+    const text = await response.text();
+    if (!text) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
   }
 
   // Authentication
@@ -210,7 +230,11 @@ class KinjarAPI {
   }
 
   async getCurrentUser(): Promise<AuthUser> {
-    return this.request('/auth/me');
+    const response = await this.request('/auth/me');
+    if (response?.user) {
+      return response.user as AuthUser;
+    }
+    throw new Error('Unable to load current user');
   }
 
   // Family Management
@@ -376,6 +400,17 @@ class KinjarAPI {
 
     console.log(`[API] Transformed ${frontendPosts.length} posts from backend`);
     return frontendPosts;
+  }
+
+  async deletePost(postId: string, tenantSlug?: string): Promise<void> {
+    const headers: Record<string, string> | undefined = tenantSlug
+      ? { 'x-tenant-slug': tenantSlug }
+      : undefined;
+
+    await this.request(`/api/posts/${postId}`, {
+      method: 'DELETE',
+      headers,
+    });
   }
 
   async addComment(postId: string, content: string): Promise<{ id: string; authorName: string; authorAvatarColor: string; content: string; createdAt: string }> {
