@@ -4404,10 +4404,27 @@ def upload_media():
         if file.filename == '':
             return corsify(jsonify({"ok": False, "error": "no_file"}), origin), 400
 
-        # Validate file type
+        # Validate file type - be more permissive for mobile uploads
         content_type = file.content_type or mimetypes.guess_type(file.filename)[0] or 'application/octet-stream'
-        if content_type not in ALLOWED_CONTENT_TYPES:
-            return corsify(jsonify({"ok": False, "error": "invalid_file_type"}), origin), 400
+        
+        # Check if it's an allowed type
+        is_allowed_type = content_type in ALLOWED_CONTENT_TYPES
+        
+        # For mobile uploads, also check by file extension if MIME type is generic
+        if not is_allowed_type and file.filename:
+            filename_lower = file.filename.lower()
+            is_media_by_extension = (
+                filename_lower.endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif', '.bmp', '.tiff')) or
+                filename_lower.endswith(('.mp4', '.mov', '.m4v', '.avi', '.webm', '.3gp', '.3gpp'))
+            )
+            # Allow if it's likely a media file even with generic MIME type
+            if is_media_by_extension and content_type.startswith(('application/', 'binary/', '')):
+                is_allowed_type = True
+                log.info(f"Allowing file {file.filename} with generic MIME type {content_type} based on extension")
+        
+        if not is_allowed_type:
+            log.warning(f"Rejected file: {file.filename}, MIME type: {content_type}")
+            return corsify(jsonify({"ok": False, "error": "invalid_file_type", "detected_type": content_type}), origin), 400
 
         # Validate file size (150MB max)
         file.seek(0, 2)  # Seek to end
