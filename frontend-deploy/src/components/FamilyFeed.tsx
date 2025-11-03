@@ -183,29 +183,32 @@ export default function FamilyFeed() {
           </div>
         )}
 
-        {!showLoading && posts.map((post) => (
-          <article key={post.id} className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <h2 className="text-lg font-semibold text-gray-900">{post.authorName}</h2>
-                <p className="text-sm text-gray-500">{formatTimestamp(post.createdAt)}</p>
-              </div>
-              {canManagePosts(post) && (
+        {!showLoading && posts.map((post) => {
+          const canDelete = canManagePosts(post);
+
+          return (
+            <article key={post.id} className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h2 className="text-lg font-semibold text-gray-900">{post.authorName}</h2>
+                  <p className="text-sm text-gray-500">{formatTimestamp(post.createdAt)}</p>
+                </div>
                 <button
                   onClick={() => handleDelete(post.id)}
-                  disabled={deletingPostId === post.id}
+                  disabled={deletingPostId === post.id || !canDelete}
                   className="rounded-md border border-red-200 bg-red-50 px-3 py-1 text-sm font-medium text-red-600 transition hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-60"
+                  title={canDelete ? 'Delete this post' : 'You do not have permission to delete this post'}
                 >
                   {deletingPostId === post.id ? 'Deleting...' : 'Delete'}
                 </button>
-              )}
-            </div>
+              </div>
 
-            <p className="mt-4 whitespace-pre-line text-gray-700">{post.content}</p>
+              <p className="mt-4 whitespace-pre-line text-gray-700">{post.content}</p>
 
-            <MediaPreview media={post.media} />
-          </article>
-        ))}
+              <MediaPreview media={post.media} />
+            </article>
+          );
+        })}
       </div>
     </div>
   );
