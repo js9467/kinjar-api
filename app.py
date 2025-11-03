@@ -106,28 +106,43 @@ def upload_to_vercel_blob(file_data, filename, content_type):
     file_extension = filename.split('.')[-1] if '.' in filename else 'bin'
     unique_filename = f"{uuid4()}.{file_extension}"
     
-    # Vercel Blob upload endpoint
-    upload_url = f"https://blob.vercel-storage.com/{unique_filename}"
+    # Vercel Blob upload endpoint - correct API endpoint
+    upload_url = f"https://blob.vercel-storage.com/upload"
+    
+    # Prepare the form data for multipart upload
+    files = {
+        'file': (unique_filename, file_data, content_type)
+    }
+    
+    data = {
+        'filename': unique_filename
+    }
     
     headers = {
         'Authorization': f'Bearer {VERCEL_BLOB_TOKEN}',
-        'X-Content-Type': content_type,
     }
     
     try:
-        # Upload the file
-        response = requests.put(upload_url, data=file_data, headers=headers)
+        # Upload the file using multipart form data
+        response = requests.post(upload_url, files=files, data=data, headers=headers)
         response.raise_for_status()
         
-        # Return the public URL
+        # Parse the response
+        result = response.json()
+        
+        # Return the public URL from Vercel Blob response
         return {
-            'url': upload_url,
+            'url': result.get('url', ''),
             'filename': unique_filename,
             'size': len(file_data),
             'content_type': content_type
         }
     except requests.exceptions.RequestException as e:
         log.error(f"Failed to upload to Vercel Blob: {e}")
+        # Log response details for debugging
+        if hasattr(e, 'response') and e.response is not None:
+            log.error(f"Response status: {e.response.status_code}")
+            log.error(f"Response text: {e.response.text}")
         raise Exception(f"Upload failed: {str(e)}")
 
 # ---------------- R2 client ----------------
