@@ -7,7 +7,7 @@ import datetime
 from uuid import uuid4
 from typing import Optional, List, Dict, Any
 
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify, make_response, redirect
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -2655,14 +2655,33 @@ def create_post():
         return corsify(jsonify({"ok": False, "error": "missing_tenant"}), origin), 400
 
     body = request.get_json(silent=True) or {}
+    
+    # Support both old and new API formats
     title = body.get("title", "").strip()
     content = body.get("content", "").strip()
     media_id = body.get("media_id")
+    
+    # New format support
+    if not title and content:
+        title = content[:50] + ("..." if len(content) > 50 else "")  # Auto-generate title from content
+    
+    # Handle media from new format
+    media = body.get("media")
+    if media and not media_id:
+        media_id = media.get("id") or media.get("url")
+    
     content_type = body.get("content_type", "video_blog")
     is_public = body.get("is_public", True)
+    
+    # Map visibility to is_public for new format
+    visibility = body.get("visibility", "family")
+    if visibility == "public":
+        is_public = True
+    elif visibility == "family":
+        is_public = False
 
-    if not title:
-        return corsify(jsonify({"ok": False, "error": "title_required"}), origin), 400
+    if not title and not content:
+        return corsify(jsonify({"ok": False, "error": "content_required"}), origin), 400
 
     try:
         with_db()
@@ -4295,6 +4314,21 @@ def upload_media():
     except Exception as e:
         log.exception("Failed to upload media")
         return corsify(jsonify({"ok": False, "error": "upload_failed"}), origin), 500
+
+@app.route("/media/<filename>", methods=["GET"])
+def serve_media(filename):
+    """Serve uploaded media files (mock endpoint for demo)"""
+    origin = request.headers.get("Origin")
+    
+    # For now, return a placeholder image for demo purposes
+    # TODO: Implement actual file serving from S3/R2
+    if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.gif')):
+        # Return a placeholder image URL
+        placeholder_url = "https://images.unsplash.com/photo-1542744173-8e7e53415bb0?w=800&h=600&fit=crop"
+        return redirect(placeholder_url)
+    else:
+        # For videos, return a 404 for now
+        return corsify(jsonify({"ok": False, "error": "file_not_found"}), origin), 404
 
 # ---------------- End Posts and Media Routes ----------------
 
