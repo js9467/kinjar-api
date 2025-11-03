@@ -88,8 +88,8 @@ ph = PasswordHasher()
 
 # Security/validation knobs
 ALLOWED_CONTENT_TYPES = set((
-    "image/jpeg", "image/png", "image/webp", "image/gif",
-    "video/mp4", "video/quicktime",
+    "image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif", "image/heic", "image/heif",
+    "video/mp4", "video/quicktime", "video/mov", "video/avi", "video/webm",
     "text/plain", "application/pdf"
 ))
 TENANT_RE = re.compile(r"^[a-z0-9-]{1,63}$")
@@ -194,11 +194,12 @@ def db_connect_once():
                 CREATE TABLE IF NOT EXISTS media_objects (
                   id            uuid PRIMARY KEY,
                   tenant        text NOT NULL,
-                  r2_key        text NOT NULL UNIQUE,
+                  r2_key        text UNIQUE,
                   filename      text NOT NULL,
                   content_type  text NOT NULL,
                   size_bytes    bigint,
                   status        text NOT NULL,           -- presigned | uploaded | deleted
+                  external_url  text,                    -- for externally hosted media (e.g., Vercel Blob)
                   created_at    timestamptz NOT NULL DEFAULT now(),
                   updated_at    timestamptz NOT NULL DEFAULT now(),
                   deleted_at    timestamptz
@@ -209,7 +210,19 @@ def db_connect_once():
                   ON media_objects (tenant, created_at DESC);
             """)
 
-            # --- NEW: users / tenants / memberships / signup_requests ---
+            # Add external_url column if it doesn't exist (for backward compatibility)
+            try:
+                cur.execute("""
+                    ALTER TABLE media_objects 
+                    ADD COLUMN IF NOT EXISTS external_url text;
+                """)
+                cur.execute("""
+                    ALTER TABLE media_objects 
+                    ALTER COLUMN r2_key DROP NOT NULL;
+                """)
+            except Exception as e:
+                # Column might already exist or constraint might not exist
+                log.warning(f"Schema migration warning (can be ignored): {e}")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                   id            uuid PRIMARY KEY,
@@ -2510,18 +2523,34 @@ def upload_complete():
 
 # Helper functions for video blog features
 def create_content_post(con, tenant_id: str, author_id: str, title: str, content: str = "", 
-                       media_id: str = None, content_type: str = "video_blog", is_public: bool = True) -> Dict[str, Any]:
+                       media_id: str = None, media_url: str = None, content_type: str = "video_blog", is_public: bool = True) -> Dict[str, Any]:
     """Create a new content post (video blog entry)"""
     post_id = str(uuid4())
     published_at = datetime.datetime.now(datetime.timezone.utc)
     
     with con.cursor(row_factory=dict_row) as cur:
+        # If we have a media_url (e.g., from Vercel Blob) but no media_id, create a media object
+        actual_media_id = media_id
+        if media_url and not media_id:
+            # Create a media object entry for the external URL
+            media_object_id = str(uuid4())
+            # Extract filename from URL or generate one
+            filename = media_url.split('/')[-1] if media_url else f"upload_{int(time.time())}"
+            
+            cur.execute("""
+                INSERT INTO media_objects (id, tenant, filename, content_type, 
+                                         external_url, status, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (media_object_id, tenant_id, filename, 'image/jpeg', media_url, 'completed', published_at))
+            actual_media_id = media_object_id
+        
         cur.execute("""
             INSERT INTO content_posts (id, tenant_id, author_id, media_id, title, content, 
                                      content_type, is_public, published_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
-        """, (post_id, tenant_id, author_id, media_id, title, content, content_type, is_public, published_at))
+        """, (post_id, tenant_id, author_id, actual_media_id, title, content, content_type, is_public, published_at))
         post = cur.fetchone()
         
         # Add to activity feed
@@ -2545,6 +2574,7 @@ def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> L
                 m.filename as media_filename,
                 m.content_type as media_content_type,
                 m.r2_key as media_r2_key,
+                m.external_url as media_external_url,
                 m.thumbnail_url as media_thumbnail,
                 m.duration_seconds as media_duration
             FROM content_posts p
@@ -2721,8 +2751,11 @@ def create_post():
     
     # Handle media from new format
     media = body.get("media")
+    media_url = None
     if media and not media_id:
-        media_id = media.get("id") or media.get("url")
+        media_id = media.get("id")
+        media_url = media.get("url")
+        # If we have a URL but no ID, we'll create the media object in create_content_post
     
     content_type = body.get("content_type", "video_blog")
     is_public = body.get("is_public", True)
@@ -2757,7 +2790,7 @@ def create_post():
                 #     return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
 
             post = create_content_post(con, tenant["id"], user["id"], title, content, 
-                                     media_id, content_type, is_public)
+                                     media_id, media_url, content_type, is_public)
             
             audit("post_created", tenant=tenant_slug, post_id=post["id"], title=title)
             return corsify(jsonify({"ok": True, "post": post}), origin)
@@ -3850,7 +3883,11 @@ def get_family_posts(family_slug: str):
                     log.warning("Skipping media URL sign because storage is not configured")
 
                 for post in posts:
-                    if post.get("media_r2_key") and media_s3:
+                    # Handle external URLs (e.g., Vercel Blob) first
+                    if post.get("media_external_url"):
+                        post["media_url"] = post["media_external_url"]
+                    elif post.get("media_r2_key") and media_s3:
+                        # For R2 storage, generate signed URLs
                         try:
                             # Use the correct bucket variable
                             bucket = os.getenv("R2_BUCKET", "kinjar-media")
