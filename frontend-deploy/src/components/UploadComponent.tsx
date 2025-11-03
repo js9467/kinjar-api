@@ -30,10 +30,29 @@ export default function UploadComponent({
   };
 
   const validateAndUpload = async (file: File) => {
-    // Validate file type
-    const validTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'video/webm', 'video/mov'];
-    if (!validTypes.includes(file.type)) {
-      onUploadError?.('Please select a valid image or video file (JPEG, PNG, GIF, WebP, MP4, WebM, MOV)');
+    // TEMPORARY: Very permissive validation for iPhone videos
+    console.log('[Upload] File info:', {
+      name: file.name,
+      type: file.type,
+      size: file.size
+    });
+
+    // For iPhone compatibility, allow any file with media extension
+    const fileName = file.name.toLowerCase();
+    const hasVideoExtension = fileName.match(/\.(mp4|mov|m4v|3gp|3gpp|avi|webm|mkv|flv|wmv)$/i);
+    const hasImageExtension = fileName.match(/\.(jpg|jpeg|png|gif|webp|heic|heif|bmp|tiff)$/i);
+    
+    // Block obviously non-media files
+    const isObviouslyNotMedia = fileName.match(/\.(txt|doc|docx|pdf|zip|rar|js|html|css)$/i);
+    
+    if (isObviouslyNotMedia) {
+      onUploadError?.(`File "${file.name}" is not a media file. Please select an image or video.`);
+      return;
+    }
+
+    // Allow media files or files with media extensions
+    if (!hasVideoExtension && !hasImageExtension && file.type && !file.type.startsWith('image/') && !file.type.startsWith('video/')) {
+      onUploadError?.(`[UPDATED] iPhone videos supported! Detected: "${file.type}" for "${file.name}". Try selecting from Photos app.`);
       return;
     }
 
