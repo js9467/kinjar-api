@@ -6290,6 +6290,143 @@ def options():
     response = make_response(("", 204))
     return corsify(response, origin)
 
+@app.post("/auth/forgot-password")
+def forgot_password():
+    """Send password reset email"""
+    origin = request.headers.get("Origin")
+    data = request.get_json(silent=True) or {}
+    
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return corsify(jsonify({"ok": False, "error": "Email required"}), origin), 400
+    
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Check if user exists
+            cur.execute("SELECT id, email FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+            
+            if not user:
+                # Don't reveal if email exists or not for security
+                return corsify(jsonify({"ok": True, "message": "If that email exists, a reset link has been sent"}), origin)
+            
+            # Generate reset token
+            reset_token = str(uuid4()).replace('-', '')
+            from datetime import datetime, timedelta
+            expires_at = datetime.now() + timedelta(hours=1)  # 1 hour expiry
+            
+            # Store reset token (we'll use tenant_invitations table temporarily)
+            cur.execute("""
+                INSERT INTO tenant_invitations (
+                    id, tenant_id, invited_by, email, role, 
+                    invite_token, expires_at, status
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'reset_password')
+                ON CONFLICT (invite_token) DO UPDATE SET
+                expires_at = EXCLUDED.expires_at, status = 'reset_password'
+            """, (str(uuid4()), str(uuid4()), user["id"], email, "RESET", reset_token, expires_at))
+            
+            con.commit()
+            
+            # TODO: Send reset email with link containing reset_token
+            # For now, just return success
+            log.info(f"Password reset requested for {email}, token: {reset_token}")
+            
+            return corsify(jsonify({
+                "ok": True, 
+                "message": "If that email exists, a reset link has been sent",
+                "reset_token": reset_token  # Remove this in production!
+            }), origin)
+            
+    except Exception as e:
+        log.error(f"Forgot password failed: {e}")
+        return corsify(jsonify({"ok": False, "error": "Request failed"}), origin), 500
+
+@app.post("/auth/reset-password")
+def reset_password():
+    """Reset password using token"""
+    origin = request.headers.get("Origin")
+    data = request.get_json(silent=True) or {}
+    
+    token = data.get("token", "")
+    new_password = data.get("password", "")
+    
+    if not token or not new_password or len(new_password) < 8:
+        return corsify(jsonify({"ok": False, "error": "Token and password (8+ chars) required"}), origin), 400
+    
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Find valid reset token
+            cur.execute("""
+                SELECT email, expires_at FROM tenant_invitations
+                WHERE invite_token = %s AND status = 'reset_password' AND expires_at > now()
+            """, (token,))
+            reset_request = cur.fetchone()
+            
+            if not reset_request:
+                return corsify(jsonify({"ok": False, "error": "Invalid or expired reset token"}), origin), 400
+            
+            # Update password
+            pw_hash = ph.hash(new_password)
+            cur.execute("UPDATE users SET password_hash = %s WHERE email = %s", (pw_hash, reset_request["email"]))
+            
+            # Mark token as used
+            cur.execute("UPDATE tenant_invitations SET status = 'used' WHERE invite_token = %s", (token,))
+            
+            con.commit()
+            log.info(f"Password reset completed for {reset_request['email']}")
+            
+            return corsify(jsonify({"ok": True, "message": "Password reset successfully"}), origin)
+            
+    except Exception as e:
+        log.error(f"Password reset failed: {e}")
+        return corsify(jsonify({"ok": False, "error": "Reset failed"}), origin), 500
+
+@app.post("/auth/change-password")
+def change_password():
+    """Change password for authenticated user"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+    
+    data = request.get_json(silent=True) or {}
+    current_password = data.get("currentPassword", "")
+    new_password = data.get("newPassword", "")
+    
+    if not current_password or not new_password or len(new_password) < 8:
+        return corsify(jsonify({"ok": False, "error": "Current and new password (8+ chars) required"}), origin), 400
+    
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Get current user data
+            cur.execute("SELECT password_hash FROM users WHERE id = %s", (user["id"],))
+            user_data = cur.fetchone()
+            
+            if not user_data:
+                return corsify(jsonify({"ok": False, "error": "User not found"}), origin), 404
+            
+            # Verify current password
+            try:
+                ph.verify(user_data["password_hash"], current_password)
+            except:
+                return corsify(jsonify({"ok": False, "error": "Current password incorrect"}), origin), 400
+            
+            # Update to new password
+            new_pw_hash = ph.hash(new_password)
+            cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", (new_pw_hash, user["id"]))
+            
+            con.commit()
+            log.info(f"Password changed for user {user['email']}")
+            
+            return corsify(jsonify({"ok": True, "message": "Password changed successfully"}), origin)
+            
+    except Exception as e:
+        log.error(f"Change password failed: {e}")
+        return corsify(jsonify({"ok": False, "error": "Change failed"}), origin), 500
+
 @app.post("/emergency/reset-password")
 def emergency_reset_password():
     """Emergency password reset - temporary endpoint"""
