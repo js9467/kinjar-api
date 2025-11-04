@@ -1818,116 +1818,126 @@ def invite_family_member():
         if role not in TENANT_ROLES:
             log.error(f"[INVITE] Invalid role: {role}, valid roles: {TENANT_ROLES}")
             return corsify(jsonify({"ok": False, "error": "Invalid role"}), origin), 400
-    
-    with_db()
-    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
-        # Check if user has permission to invite members to this family
-        cur.execute("""
-            SELECT role FROM tenant_users 
-            WHERE user_id = %s AND tenant_id = %s
-        """, (user["id"], family_id))
-        membership = cur.fetchone()
         
-        if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
-            return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
-        
-        # Get family info for the invitation
-        cur.execute("""
-            SELECT name, slug FROM tenants WHERE id = %s
-        """, (family_id,))
-        family = cur.fetchone()
-        if not family:
-            return corsify(jsonify({"ok": False, "error": "Family not found"}), origin), 404
-        
-        # For children under 16, create them directly without sending an email
-        if is_child_under_16:
-            # Check if child already exists by name (since no email)
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Check if user has permission to invite members to this family
             cur.execute("""
-                SELECT up.user_id FROM user_profiles up
-                JOIN tenant_users tu ON up.user_id = tu.user_id
-                WHERE up.display_name = %s AND tu.tenant_id = %s
-            """, (name, family_id))
+                SELECT role FROM tenant_users 
+                WHERE user_id = %s AND tenant_id = %s
+            """, (user["id"], family_id))
+            membership = cur.fetchone()
+            
+            if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
+                return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
+            
+            # Get family info for the invitation
+            cur.execute("""
+                SELECT name, slug FROM tenants WHERE id = %s
+            """, (family_id,))
+            family = cur.fetchone()
+            if not family:
+                return corsify(jsonify({"ok": False, "error": "Family not found"}), origin), 404
+            
+            # For children under 16, create them directly without sending an email
+            if is_child_under_16:
+                # Check if child already exists by name (since no email)
+                cur.execute("""
+                    SELECT up.user_id FROM user_profiles up
+                    JOIN tenant_users tu ON up.user_id = tu.user_id
+                    WHERE up.display_name = %s AND tu.tenant_id = %s
+                """, (name, family_id))
+                if cur.fetchone():
+                    return corsify(jsonify({"ok": False, "error": "Child with this name already exists in family"}), origin), 409
+                
+                # Create user without email (for kids under 16)
+                new_user_id = str(uuid4())
+                child_email = f"child.{new_user_id}@kinjar.internal"
+                cur.execute("""
+                    INSERT INTO users (id, email, global_role)
+                    VALUES (%s, %s, 'USER')
+                """, (new_user_id, child_email))
+                
+                # Create profile
+                cur.execute("""
+                    INSERT INTO user_profiles (user_id, display_name, birthdate)
+                    VALUES (%s, %s, %s)
+                """, (new_user_id, name, birth_date if birthdate else None))
+                
+                # Add to family
+                cur.execute("""
+                    INSERT INTO tenant_users (user_id, tenant_id, role)
+                    VALUES (%s, %s, %s)
+                """, (new_user_id, family_id, role))
+                
+                con.commit()
+                
+                return corsify(jsonify({
+                    "ok": True, 
+                    "message": f"Child {name} added to family successfully",
+                    "userId": new_user_id,
+                    "assignedRole": role,
+                    "emailSent": False
+                }), origin)
+            
+            # For adults and teens (16+), send an invitation email
+            if not email:
+                return corsify(jsonify({"ok": False, "error": "Email is required for members 16 and older"}), origin), 400
+            
+            # Check if email is already a member
+            cur.execute("""
+                SELECT u.id FROM users u
+                JOIN tenant_users tu ON u.id = tu.user_id
+                WHERE u.email = %s AND tu.tenant_id = %s
+            """, (email, family_id))
             if cur.fetchone():
-                return corsify(jsonify({"ok": False, "error": "Child with this name already exists in family"}), origin), 409
+                return corsify(jsonify({"ok": False, "error": "User is already a member"}), origin), 409
             
-            # Create user without email (for kids under 16)
-            new_user_id = str(uuid4())
-            child_email = f"child.{new_user_id}@kinjar.internal"
+            # Check if there's already a pending invitation for this email
             cur.execute("""
-                INSERT INTO users (id, email, global_role)
-                VALUES (%s, %s, 'USER')
-            """, (new_user_id, child_email))
+                SELECT id FROM tenant_invitations 
+                WHERE email = %s AND tenant_id = %s AND status = 'pending'
+            """, (email, family_id))
+            existing_invitation = cur.fetchone()
             
-            # Create profile
-            cur.execute("""
-                INSERT INTO user_profiles (user_id, display_name, birthdate)
-                VALUES (%s, %s, %s)
-            """, (new_user_id, name, birth_date if birthdate else None))
+            if existing_invitation:
+                return corsify(jsonify({"ok": False, "error": "Invitation already sent to this email"}), origin), 409
             
-            # Add to family
+            # Create invitation token and record
+            invite_id = str(uuid4())
+            invite_token = str(uuid4()).replace('-', '')  # Clean token for URL
+            expires_at = datetime.datetime.now() + datetime.timedelta(days=7)  # 7 day expiry
+            
             cur.execute("""
-                INSERT INTO tenant_users (user_id, tenant_id, role)
-                VALUES (%s, %s, %s)
-            """, (new_user_id, family_id, role))
+                INSERT INTO tenant_invitations (
+                    id, tenant_id, invited_by, email, role, 
+                    invite_token, expires_at, status
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
+            """, (invite_id, family_id, user["id"], email, role, invite_token, expires_at))
             
             con.commit()
             
+            # Send invitation email
+            email_sent = send_invitation_email(email, name, family["name"], invite_token, family["slug"])
+            
             return corsify(jsonify({
                 "ok": True, 
-                "message": f"Child {name} added to family successfully",
-                "userId": new_user_id,
+                "message": "Invitation sent successfully",
+                "invitationId": invite_id,
                 "assignedRole": role,
-                "emailSent": False
+                "emailSent": email_sent,
+                "expiresAt": expires_at.isoformat()
             }), origin)
-        
-        # For adults and teens (16+), send an invitation email
-        if not email:
-            return corsify(jsonify({"ok": False, "error": "Email is required for members 16 and older"}), origin), 400
-        
-        # Check if email is already a member
-        cur.execute("""
-            SELECT u.id FROM users u
-            JOIN tenant_users tu ON u.id = tu.user_id
-            WHERE u.email = %s AND tu.tenant_id = %s
-        """, (email, family_id))
-        if cur.fetchone():
-            return corsify(jsonify({"ok": False, "error": "User is already a member"}), origin), 409
-        
-        # Check if there's already a pending invitation for this email
-        cur.execute("""
-            SELECT id FROM tenant_invitations 
-            WHERE email = %s AND tenant_id = %s AND status = 'pending'
-        """, (email, family_id))
-        existing_invitation = cur.fetchone()
-        
-        if existing_invitation:
-            return corsify(jsonify({"ok": False, "error": "Invitation already sent to this email"}), origin), 409
-        
-        # Create invitation token and record
-        invite_id = str(uuid4())
-        invite_token = str(uuid4()).replace('-', '')  # Clean token for URL
-        expires_at = datetime.datetime.now() + datetime.timedelta(days=7)  # 7 day expiry
-        
-        cur.execute("""
-            INSERT INTO tenant_invitations (
-                id, tenant_id, invited_by, email, role, 
-                invite_token, expires_at, status
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
-        """, (invite_id, family_id, user["id"], email, role, invite_token, expires_at))
-        
-        con.commit()
-        
-        # Send invitation email
-        email_sent = send_invitation_email(email, name, family["name"], invite_token, family["slug"])
-        
+            
+    except Exception as e:
+        log.error(f"[INVITE] Exception in invite_family_member: {e}")
+        import traceback
+        log.error(f"[INVITE] Traceback: {traceback.format_exc()}")
         return corsify(jsonify({
-            "ok": True, 
-            "message": "Invitation sent successfully",
-            "invitationId": invite_id,
-            "assignedRole": role,
-            "emailSent": email_sent,
-            "expiresAt": expires_at.isoformat()
-        }), origin)
+            "ok": False, 
+            "error": "Internal server error",
+            "debug": str(e) if app.debug else None
+        }), origin), 500
 
 # ---------------- Signup Request (Queue) ----------------
 @app.post("/signup/request")
