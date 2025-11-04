@@ -22,5 +22,9 @@
     "express": "^5.1.0",
     "multer": "^2.0.2",
     "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.2.2"
   }
 }
