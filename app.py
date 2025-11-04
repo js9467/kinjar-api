@@ -94,7 +94,7 @@ ALLOWED_CONTENT_TYPES = set((
 ))
 TENANT_RE = re.compile(r"^[a-z0-9-]{1,63}$")
 FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
-TENANT_ROLES = {"OWNER", "ADMIN", "MEMBER"}
+TENANT_ROLES = {"OWNER", "ADMIN", "ADULT", "CHILD_0_5", "CHILD_5_10", "CHILD_10_14", "CHILD_14_16", "CHILD_16_ADULT", "MEMBER"}
 
 # ---------------- Vercel Blob Upload ----------------
 def upload_to_vercel_blob(file_data, filename, content_type):
@@ -378,6 +378,28 @@ def db_connect_once():
                   updated_at  timestamptz NOT NULL DEFAULT now()
                 );
             """)
+
+            # Add new columns for enhanced user profiles
+            try:
+                cur.execute("""
+                    ALTER TABLE user_profiles 
+                    ADD COLUMN IF NOT EXISTS birthdate DATE;
+                """)
+                cur.execute("""
+                    ALTER TABLE user_profiles 
+                    ADD COLUMN IF NOT EXISTS avatar_color text DEFAULT '#3B82F6';
+                """)
+                cur.execute("""
+                    ALTER TABLE user_profiles 
+                    ADD COLUMN IF NOT EXISTS role_override text;
+                """)
+                cur.execute("""
+                    ALTER TABLE user_profiles 
+                    ADD COLUMN IF NOT EXISTS permissions_manual boolean DEFAULT false;
+                """)
+            except Exception as e:
+                # Columns might already exist
+                log.warning(f"User profile schema migration warning (can be ignored): {e}")
 
             # Activity feed for showing recent actions
             cur.execute("""
@@ -726,6 +748,78 @@ def ensure_user_basic(con, email: str) -> Dict[str, Any]:
     email = email.strip().lower()
     if not email:
         raise ValueError("email_required")
+
+def calculate_age(birthdate) -> int:
+    """Calculate age from birthdate"""
+    if not birthdate:
+        return None
+    from datetime import date
+    today = date.today()
+    return today.year - birthdate.year - ((today.month, today.day) < (birthdate.month, birthdate.day))
+
+def determine_role_from_age(age: int, is_admin: bool = False) -> str:
+    """Determine appropriate role based on age"""
+    if is_admin:
+        return "ADMIN"
+    if age is None:
+        return "ADULT"  # Default for unknown age
+    if age < 5:
+        return "CHILD_0_5"
+    elif age < 10:
+        return "CHILD_5_10"
+    elif age < 14:
+        return "CHILD_10_14"
+    elif age < 16:
+        return "CHILD_14_16"
+    elif age < 18:
+        return "CHILD_16_ADULT"
+    else:
+        return "ADULT"
+
+def get_role_permissions(role: str) -> Dict[str, bool]:
+    """Get permissions for a given role"""
+    permissions = {
+        "can_post": True,
+        "can_post_public": True,
+        "can_comment": True,
+        "can_react": True,
+        "can_invite_members": False,
+        "can_manage_family": False,
+        "requires_approval": False,
+        "can_moderate": False
+    }
+    
+    if role in ["OWNER", "ADMIN"]:
+        permissions.update({
+            "can_invite_members": True,
+            "can_manage_family": True,
+            "can_moderate": True
+        })
+    elif role == "ADULT":
+        permissions.update({
+            "can_invite_members": False,
+            "can_manage_family": False
+        })
+    elif role.startswith("CHILD_"):
+        if role in ["CHILD_0_5", "CHILD_5_10"]:
+            permissions.update({
+                "can_post_public": False,
+                "requires_approval": True
+            })
+        elif role in ["CHILD_10_14"]:
+            permissions.update({
+                "can_post_public": False,
+                "requires_approval": True
+            })
+        elif role in ["CHILD_14_16", "CHILD_16_ADULT"]:
+            permissions.update({
+                "requires_approval": True
+            })
+    elif role == "MEMBER":
+        # Legacy role - treat as adult
+        pass
+    
+    return permissions
     with con.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT id, email, global_role FROM users WHERE email=%s", (email,))
         row = cur.fetchone()
@@ -798,7 +892,9 @@ def auth_login():
     # Get user profile and memberships
     with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
         cur.execute("""
-            SELECT display_name, avatar_url FROM user_profiles WHERE user_id = %s
+            SELECT display_name, avatar_url, avatar_color, birthdate, bio, phone, 
+                   role_override, permissions_manual 
+            FROM user_profiles WHERE user_id = %s
         """, (row["id"],))
         profile = cur.fetchone()
         
@@ -815,12 +911,22 @@ def auth_login():
     now = int(datetime.datetime.utcnow().timestamp())
     token = sign_jwt({"uid": str(row["id"]), "iat": now, "exp": now + JWT_TTL_MIN * 60})
     
+    # Calculate age if birthdate is available
+    age = None
+    if profile and profile.get("birthdate"):
+        age = calculate_age(profile["birthdate"])
+    
     # Format user data
     user_data = {
         "id": str(row["id"]),
         "name": profile["display_name"] if profile else email.split("@")[0],
         "email": email,
-        "avatarColor": "#3B82F6",
+        "avatarColor": profile["avatar_color"] if profile else "#3B82F6",
+        "avatarUrl": profile["avatar_url"] if profile else None,
+        "birthdate": profile["birthdate"].isoformat() if profile and profile["birthdate"] else None,
+        "age": age,
+        "bio": profile["bio"] if profile else None,
+        "phone": profile["phone"] if profile else None,
         "globalRole": "ROOT_ADMIN" if row["global_role"] == "ROOT" else "FAMILY_ADMIN" if memberships else "MEMBER",
         "memberships": [
             {
@@ -828,7 +934,8 @@ def auth_login():
                 "familySlug": m["family_slug"],
                 "familyName": m["family_name"],
                 "role": m["role"],
-                "joinedAt": None
+                "joinedAt": None,
+                "permissions": get_role_permissions(m["role"])
             }
             for m in memberships
         ],
@@ -856,7 +963,8 @@ def auth_me():
     with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
         # Get user profile
         cur.execute("""
-            SELECT display_name, avatar_url, bio, phone
+            SELECT display_name, avatar_url, avatar_color, birthdate, bio, phone,
+                   role_override, permissions_manual
             FROM user_profiles WHERE user_id = %s
         """, (user["id"],))
         profile = cur.fetchone()
@@ -872,12 +980,22 @@ def auth_me():
         """, (user["id"],))
         memberships = list(cur.fetchall())
 
+    # Calculate age if birthdate is available
+    age = None
+    if profile and profile.get("birthdate"):
+        age = calculate_age(profile["birthdate"])
+
     # Format user data to match frontend expectations
     user_data = {
         "id": user["id"],
         "name": profile["display_name"] if profile else user["email"].split("@")[0],
         "email": user["email"],
-        "avatarColor": "#3B82F6",  # Default color, could be stored in profile later
+        "avatarColor": profile["avatar_color"] if profile else "#3B82F6",
+        "avatarUrl": profile["avatar_url"] if profile else None,
+        "birthdate": profile["birthdate"].isoformat() if profile and profile["birthdate"] else None,
+        "age": age,
+        "bio": profile["bio"] if profile else None,
+        "phone": profile["phone"] if profile else None,
         "globalRole": "ROOT_ADMIN" if user["global_role"] == "ROOT" else "FAMILY_ADMIN" if memberships else "MEMBER",
         "memberships": [
             {
@@ -885,7 +1003,8 @@ def auth_me():
                 "familySlug": m["family_slug"],
                 "familyName": m["family_name"],
                 "role": m["role"],
-                "joinedAt": None
+                "joinedAt": None,
+                "permissions": get_role_permissions(m["role"])
             }
             for m in memberships
         ],
@@ -993,6 +1112,162 @@ def auth_register():
     resp = make_response(jsonify({"ok": True, "user": user}))
     set_session_cookie(resp, token)
     return corsify(resp, origin)
+
+# ---------------- User Profile Management ----------------
+@app.patch("/auth/profile")
+def update_profile():
+    """Update user profile information"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+    
+    data = request.get_json(silent=True) or {}
+    
+    # Validate fields
+    updates = {}
+    if "displayName" in data:
+        updates["display_name"] = data["displayName"].strip()[:100] if data["displayName"] else None
+    if "bio" in data:
+        updates["bio"] = data["bio"].strip()[:500] if data["bio"] else None
+    if "phone" in data:
+        updates["phone"] = data["phone"].strip()[:20] if data["phone"] else None
+    if "avatarColor" in data:
+        updates["avatar_color"] = data["avatarColor"] if data["avatarColor"] else "#3B82F6"
+    if "avatarUrl" in data:
+        updates["avatar_url"] = data["avatarUrl"]
+    if "birthdate" in data:
+        if data["birthdate"]:
+            try:
+                from datetime import datetime
+                birthdate = datetime.fromisoformat(data["birthdate"].replace('Z', '+00:00')).date()
+                updates["birthdate"] = birthdate
+            except ValueError:
+                return corsify(jsonify({"ok": False, "error": "Invalid birthdate format"}), origin), 400
+        else:
+            updates["birthdate"] = None
+    
+    if not updates:
+        return corsify(jsonify({"ok": False, "error": "No valid fields to update"}), origin), 400
+    
+    # Update profile
+    with_db()
+    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        # Create profile if it doesn't exist
+        cur.execute("""
+            INSERT INTO user_profiles (user_id) 
+            VALUES (%s) 
+            ON CONFLICT (user_id) DO NOTHING
+        """, (user["id"],))
+        
+        # Build update query dynamically
+        set_clauses = [f"{k} = %s" for k in updates.keys()]
+        values = list(updates.values()) + [user["id"]]
+        
+        cur.execute(f"""
+            UPDATE user_profiles 
+            SET {', '.join(set_clauses)}, updated_at = now()
+            WHERE user_id = %s
+        """, values)
+        
+        con.commit()
+    
+    return corsify(jsonify({"ok": True, "message": "Profile updated successfully"}), origin)
+
+@app.post("/auth/invite-member")
+def invite_family_member():
+    """Invite a new member to join a family"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+    
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    name = (data.get("name") or "").strip()
+    family_id = data.get("familyId")
+    birthdate = data.get("birthdate")
+    role = data.get("role", "ADULT")
+    
+    if not email or not name or not family_id:
+        return corsify(jsonify({"ok": False, "error": "Missing required fields"}), origin), 400
+    
+    if role not in TENANT_ROLES:
+        return corsify(jsonify({"ok": False, "error": "Invalid role"}), origin), 400
+    
+    with_db()
+    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        # Check if user has permission to invite members to this family
+        cur.execute("""
+            SELECT role FROM tenant_users 
+            WHERE user_id = %s AND tenant_id = %s
+        """, (user["id"], family_id))
+        membership = cur.fetchone()
+        
+        if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
+            return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
+        
+        # Check if email is already a member
+        cur.execute("""
+            SELECT u.id FROM users u
+            JOIN tenant_users tu ON u.id = tu.user_id
+            WHERE u.email = %s AND tu.tenant_id = %s
+        """, (email, family_id))
+        if cur.fetchone():
+            return corsify(jsonify({"ok": False, "error": "User is already a member"}), origin), 409
+        
+        # Create user if they don't exist
+        cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+        existing_user = cur.fetchone()
+        
+        if existing_user:
+            new_user_id = existing_user["id"]
+        else:
+            # Create new user without password (they'll need to set it)
+            new_user_id = str(uuid4())
+            cur.execute("""
+                INSERT INTO users (id, email, global_role)
+                VALUES (%s, %s, 'USER')
+            """, (new_user_id, email))
+        
+        # Create or update profile
+        age = None
+        if birthdate:
+            try:
+                from datetime import datetime
+                birth_date = datetime.fromisoformat(birthdate.replace('Z', '+00:00')).date()
+                age = calculate_age(birth_date)
+                # Auto-assign role based on age unless manually specified
+                if role == "ADULT" and age is not None:
+                    role = determine_role_from_age(age)
+            except ValueError:
+                pass
+        
+        cur.execute("""
+            INSERT INTO user_profiles (user_id, display_name, birthdate)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                birthdate = EXCLUDED.birthdate,
+                updated_at = now()
+        """, (new_user_id, name, birth_date if birthdate else None))
+        
+        # Add to family
+        cur.execute("""
+            INSERT INTO tenant_users (user_id, tenant_id, role)
+            VALUES (%s, %s, %s)
+        """, (new_user_id, family_id, role))
+        
+        con.commit()
+        
+        # TODO: Send invitation email if user doesn't have a password
+        
+    return corsify(jsonify({
+        "ok": True, 
+        "message": "Member invited successfully",
+        "userId": new_user_id,
+        "assignedRole": role
+    }), origin)
 
 # ---------------- Signup Request (Queue) ----------------
 @app.post("/signup/request")
@@ -2531,6 +2806,32 @@ def create_content_post(con, tenant_id: str, author_id: str, title: str, content
     log.info(f"[DEBUG] Creating post with media_id={media_id}, media_url={media_url}")
     
     with con.cursor(row_factory=dict_row) as cur:
+        # Get user's role and permissions in this family
+        cur.execute("""
+            SELECT tu.role, up.birthdate, up.permissions_manual
+            FROM tenant_users tu
+            LEFT JOIN user_profiles up ON tu.user_id = up.user_id
+            WHERE tu.user_id = %s AND tu.tenant_id = %s
+        """, (author_id, tenant_id))
+        user_membership = cur.fetchone()
+        
+        # Determine if post needs approval
+        status = "published"  # Default status
+        if user_membership:
+            permissions = get_role_permissions(user_membership["role"])
+            
+            # Check if user needs approval for this type of post
+            if is_public and not permissions["can_post_public"]:
+                # User cannot post publicly at all
+                raise ValueError("User is not allowed to post publicly")
+            
+            if permissions["requires_approval"]:
+                if is_public:
+                    status = "pending_approval"  # Public posts need approval
+                # Family posts might also need approval for very young children
+                elif user_membership["role"] in ["CHILD_0_5", "CHILD_5_10"]:
+                    status = "pending_approval"
+        
         # If we have a media_url (e.g., from Vercel Blob) but no media_id, create a media object
         actual_media_id = media_id
         if media_url and not media_id:
@@ -2547,20 +2848,22 @@ def create_content_post(con, tenant_id: str, author_id: str, title: str, content
             """, (media_object_id, tenant_id, filename, 'image/jpeg', media_url, 'completed', published_at))
             actual_media_id = media_object_id
         
+        # Create the post with appropriate status
         cur.execute("""
             INSERT INTO content_posts (id, tenant_id, author_id, media_id, title, content, 
-                                     content_type, is_public, published_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                     content_type, is_public, status, published_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
-        """, (post_id, tenant_id, author_id, actual_media_id, title, content, content_type, is_public, published_at))
+        """, (post_id, tenant_id, author_id, actual_media_id, title, content, content_type, is_public, status, published_at))
         post = cur.fetchone()
         
         # Add to activity feed
+        action_type = "post_created" if status == "published" else "post_submitted_for_approval"
         cur.execute("""
             INSERT INTO activity_feed (id, tenant_id, user_id, action_type, entity_type, entity_id, metadata)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (str(uuid4()), tenant_id, author_id, "post_created", "content_post", post_id, 
-              json.dumps({"title": title, "content_type": content_type})))
+        """, (str(uuid4()), tenant_id, author_id, action_type, "content_post", post_id, 
+              json.dumps({"title": title, "content_type": content_type, "status": status})))
         
     return post
 
@@ -2810,6 +3113,86 @@ def create_post():
     except Exception as e:
         log.exception("Failed to create post")
         return corsify(jsonify({"ok": False, "error": "create_failed"}), origin), 500
+
+@app.get("/api/public-feed")
+def get_public_feed():
+    """Get public posts from all families for the main kinjar.com homepage"""
+    origin = request.headers.get("Origin")
+    
+    limit = min(max(int(request.args.get("limit", "20")), 1), 50)
+    offset = int(request.args.get("offset", "0"))
+
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Get public posts from all families
+            cur.execute("""
+                SELECT 
+                    p.id, p.title, p.content, p.published_at, p.view_count,
+                    t.id as family_id, t.slug as family_slug, t.name as family_name,
+                    u.email as author_email,
+                    up.display_name as author_name,
+                    up.avatar_url as author_avatar,
+                    up.avatar_color,
+                    m.filename as media_filename,
+                    m.content_type as media_content_type,
+                    m.r2_key as media_r2_key,
+                    m.external_url as media_external_url,
+                    m.thumbnail_url as media_thumbnail,
+                    m.duration_seconds as media_duration,
+                    fs.theme_color as family_theme_color
+                FROM content_posts p
+                JOIN tenants t ON p.tenant_id = t.id
+                JOIN users u ON p.author_id = u.id
+                LEFT JOIN user_profiles up ON u.id = up.user_id
+                LEFT JOIN media_objects m ON p.media_id = m.id
+                LEFT JOIN family_settings fs ON t.id = fs.tenant_id
+                WHERE p.status = 'published' 
+                  AND p.is_public = true
+                  AND (fs.is_public = true OR fs.is_public IS NULL)
+                ORDER BY p.published_at DESC
+                LIMIT %s OFFSET %s
+            """, (limit, offset))
+            
+            posts = list(cur.fetchall())
+
+            # Format posts for frontend
+            formatted_posts = []
+            for post in posts:
+                # Create media object if media exists
+                media = None
+                if post.get("media_filename"):
+                    media = {
+                        "type": "image" if post["media_content_type"] and "image" in post["media_content_type"] else "video",
+                        "url": post["media_external_url"] or f"/media/{post['media_filename']}",
+                        "alt": post["title"]
+                    }
+
+                formatted_posts.append({
+                    "id": post["id"],
+                    "familyId": post["family_id"],
+                    "familySlug": post["family_slug"],
+                    "familyName": post["family_name"],
+                    "familyThemeColor": post["family_theme_color"] or "#2563eb",
+                    "authorId": None,  # Don't expose user IDs in public feed
+                    "authorName": post["author_name"] or post["author_email"].split("@")[0],
+                    "authorAvatarColor": post["avatar_color"] or "#3B82F6",
+                    "createdAt": post["published_at"].isoformat() if post["published_at"] else None,
+                    "content": post["content"],
+                    "title": post["title"],
+                    "media": media,
+                    "visibility": "public",
+                    "status": "approved",
+                    "reactions": 0,  # TODO: Implement reaction counts
+                    "comments": [],  # Don't load comments in feed for performance
+                    "tags": []
+                })
+
+            return corsify(jsonify({"ok": True, "posts": formatted_posts}), origin)
+
+    except Exception as e:
+        log.exception("Failed to get public feed")
+        return corsify(jsonify({"ok": False, "error": "feed_failed"}), origin), 500
 
 @app.get("/api/posts")
 def list_posts():
@@ -3239,6 +3622,7 @@ def edit_post(post_id: str):
 
     except Exception as e:
         log.exception("Failed to edit post")
+        # Updated error handling for better post edit reliability
         return corsify(jsonify({"ok": False, "error": "edit_failed"}), origin), 500
 
 
@@ -3288,6 +3672,152 @@ def add_post_comment(post_id: str):
     except Exception as e:
         log.exception("Failed to add comment")
         return corsify(jsonify({"ok": False, "error": "comment_failed"}), origin), 500
+
+# ---------------- Post Approval System ----------------
+
+@app.get("/api/posts/pending")
+def get_pending_posts():
+    """Get posts pending approval (admin only)"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+
+    tenant_slug = request.headers.get("x-tenant-slug", "")
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "missing_tenant"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Get tenant
+            cur.execute("SELECT id FROM tenants WHERE slug = %s", (tenant_slug,))
+            tenant = cur.fetchone()
+            if not tenant:
+                return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+
+            # Check if user is admin
+            cur.execute("""
+                SELECT role FROM tenant_users 
+                WHERE user_id = %s AND tenant_id = %s
+            """, (user["id"], tenant["id"]))
+            membership = cur.fetchone()
+            
+            if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
+                return corsify(jsonify({"ok": False, "error": "permission_denied"}), origin), 403
+
+            # Get pending posts
+            cur.execute("""
+                SELECT p.id, p.title, p.content, p.is_public, p.created_at,
+                       u.email as author_email,
+                       up.display_name as author_name,
+                       up.avatar_color,
+                       tu.role as author_role
+                FROM content_posts p
+                JOIN users u ON p.author_id = u.id
+                LEFT JOIN user_profiles up ON u.id = up.user_id
+                LEFT JOIN tenant_users tu ON u.id = tu.user_id AND tu.tenant_id = p.tenant_id
+                WHERE p.tenant_id = %s AND p.status = 'pending_approval'
+                ORDER BY p.created_at ASC
+            """, (tenant["id"],))
+            
+            posts = list(cur.fetchall())
+            
+            # Format response
+            formatted_posts = []
+            for post in posts:
+                formatted_posts.append({
+                    "id": post["id"],
+                    "title": post["title"],
+                    "content": post["content"],
+                    "isPublic": post["is_public"],
+                    "createdAt": post["created_at"].isoformat() if post["created_at"] else None,
+                    "author": {
+                        "email": post["author_email"],
+                        "name": post["author_name"] or post["author_email"].split("@")[0],
+                        "avatarColor": post["avatar_color"] or "#3B82F6",
+                        "role": post["author_role"]
+                    }
+                })
+
+            return corsify(jsonify({"ok": True, "posts": formatted_posts}), origin)
+
+    except Exception as e:
+        log.exception("Failed to get pending posts")
+        return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
+
+@app.patch("/api/posts/<post_id>/approve")
+def approve_post(post_id: str):
+    """Approve or reject a pending post"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+
+    data = request.get_json(silent=True) or {}
+    action = data.get("action", "approve")  # approve or reject
+    reason = data.get("reason", "")
+
+    if action not in ["approve", "reject"]:
+        return corsify(jsonify({"ok": False, "error": "invalid_action"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Get post and verify permissions
+            cur.execute("""
+                SELECT p.*, t.slug as tenant_slug
+                FROM content_posts p
+                JOIN tenants t ON p.tenant_id = t.id
+                WHERE p.id = %s AND p.status = 'pending_approval'
+            """, (post_id,))
+            post = cur.fetchone()
+            
+            if not post:
+                return corsify(jsonify({"ok": False, "error": "post_not_found"}), origin), 404
+
+            # Check if user is admin of this family
+            cur.execute("""
+                SELECT role FROM tenant_users 
+                WHERE user_id = %s AND tenant_id = %s
+            """, (user["id"], post["tenant_id"]))
+            membership = cur.fetchone()
+            
+            if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
+                return corsify(jsonify({"ok": False, "error": "permission_denied"}), origin), 403
+
+            # Update post status
+            new_status = "published" if action == "approve" else "rejected"
+            cur.execute("""
+                UPDATE content_posts 
+                SET status = %s, published_at = %s
+                WHERE id = %s
+            """, (new_status, datetime.datetime.now(datetime.timezone.utc) if action == "approve" else None, post_id))
+
+            # Add to activity feed
+            cur.execute("""
+                INSERT INTO activity_feed (id, tenant_id, user_id, action_type, entity_type, entity_id, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (str(uuid4()), post["tenant_id"], user["id"], f"post_{action}d", "content_post", post_id, 
+                  json.dumps({"reason": reason, "moderator": user["email"]})))
+
+            con.commit()
+
+            audit(f"post_{action}d", 
+                  post_id=post_id, 
+                  tenant=post["tenant_slug"],
+                  moderator=user["email"],
+                  reason=reason)
+
+            return corsify(jsonify({
+                "ok": True, 
+                "message": f"Post {action}d successfully",
+                "newStatus": new_status
+            }), origin)
+
+    except Exception as e:
+        log.exception(f"Failed to {action} post")
+        return corsify(jsonify({"ok": False, "error": f"{action}_failed"}), origin), 500
 
 # ---------------- Family Connection Endpoints ----------------
 
@@ -4413,22 +4943,70 @@ def update_member_role(family_id: str, member_id: str):
 
     data = request.get_json(silent=True) or {}
     new_role = data.get("role", "").strip()
+    manual_override = data.get("manualOverride", False)
 
-    valid_roles = ["ADMIN", "ADULT", "CHILD_0_5", "CHILD_5_10", "CHILD_10_14", "CHILD_14_16", "CHILD_16_ADULT"]
-    if new_role not in valid_roles:
+    if new_role not in TENANT_ROLES:
         return corsify(jsonify({"ok": False, "error": "Invalid role"}), origin), 400
 
     try:
         with_db()
         with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
-            # Check permissions
+            # Check permissions - must be OWNER or ADMIN
             cur.execute("""
                 SELECT role FROM tenant_users 
-                WHERE user_id = %s AND tenant_id = %s AND role = 'ADMIN'
+                WHERE user_id = %s AND tenant_id = %s
             """, (user["id"], family_id))
+            user_membership = cur.fetchone()
             
-            if not cur.fetchone() and user["global_role"] != "ROOT":
-                return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
+            if not user_membership or user_membership["role"] not in ["OWNER", "ADMIN"]:
+                if user["global_role"] != "ROOT":
+                    return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
+
+            # Get member's current info and profile
+            cur.execute("""
+                SELECT tu.role as current_role, up.birthdate, up.permissions_manual
+                FROM tenant_users tu
+                LEFT JOIN user_profiles up ON tu.user_id = up.user_id
+                WHERE tu.user_id = %s AND tu.tenant_id = %s
+            """, (member_id, family_id))
+            member_info = cur.fetchone()
+            
+            if not member_info:
+                return corsify(jsonify({"ok": False, "error": "Member not found"}), origin), 404
+
+            # Age-based validation
+            permissions = get_role_permissions(new_role)
+            age = None
+            if member_info["birthdate"]:
+                age = calculate_age(member_info["birthdate"])
+                
+                # If not manual override, suggest age-appropriate role
+                if not manual_override and age is not None:
+                    suggested_role = determine_role_from_age(age)
+                    if new_role != suggested_role and new_role not in ["OWNER", "ADMIN"]:
+                        return corsify(jsonify({
+                            "ok": False, 
+                            "error": "role_mismatch",
+                            "suggestedRole": suggested_role,
+                            "age": age,
+                            "message": f"Age {age} suggests role {suggested_role}. Use manualOverride to force this role."
+                        }), origin), 400
+
+            # Prevent demoting the last owner
+            if member_info["current_role"] == "OWNER" and new_role != "OWNER":
+                cur.execute("""
+                    SELECT COUNT(*) as owner_count 
+                    FROM tenant_users 
+                    WHERE tenant_id = %s AND role = 'OWNER'
+                """, (family_id,))
+                owner_count = cur.fetchone()["owner_count"]
+                
+                if owner_count <= 1:
+                    return corsify(jsonify({
+                        "ok": False, 
+                        "error": "cannot_remove_last_owner",
+                        "message": "Cannot remove the last owner. Assign another owner first."
+                    }), origin), 400
 
             # Update role
             cur.execute("""
@@ -4438,17 +5016,28 @@ def update_member_role(family_id: str, member_id: str):
                 RETURNING *
             """, (new_role, member_id, family_id))
             
-            updated = cur.fetchone()
-            if not updated:
-                return corsify(jsonify({"ok": False, "error": "Member not found"}), origin), 404
+            # Update permissions_manual flag if manual override
+            if manual_override:
+                cur.execute("""
+                    UPDATE user_profiles 
+                    SET permissions_manual = true, updated_at = now()
+                    WHERE user_id = %s
+                """, (member_id,))
 
         audit("member_role_updated",
               family_id=family_id,
               member_id=member_id,
+              old_role=member_info["current_role"],
               new_role=new_role,
+              manual_override=manual_override,
               updated_by=user["email"])
 
-        return corsify(jsonify({"ok": True, "message": "Role updated successfully"}), origin)
+        return corsify(jsonify({
+            "ok": True, 
+            "message": "Role updated successfully",
+            "newRole": new_role,
+            "permissions": permissions
+        }), origin)
 
     except Exception as e:
         log.exception("Failed to update member role")
