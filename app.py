@@ -4435,7 +4435,7 @@ def get_pending_posts():
 
             # Get pending posts
             cur.execute("""
-                SELECT p.id, p.title, p.content, p.is_public, p.created_at,
+                SELECT p.id, p.title, p.content, p.is_public, p.created_at, p.author_id,
                        u.email as author_email,
                        up.display_name as author_name,
                        up.avatar_color,
@@ -4455,16 +4455,19 @@ def get_pending_posts():
             for post in posts:
                 formatted_posts.append({
                     "id": post["id"],
+                    "familyId": tenant["id"],
+                    "authorId": post["author_id"] if "author_id" in post else "",
+                    "authorName": post["author_name"] or post["author_email"].split("@")[0],
+                    "authorAvatarColor": post["avatar_color"] or "#3B82F6",
                     "title": post["title"],
                     "content": post["content"],
-                    "isPublic": post["is_public"],
                     "createdAt": post["created_at"].isoformat() if post["created_at"] else None,
-                    "author": {
-                        "email": post["author_email"],
-                        "name": post["author_name"] or post["author_email"].split("@")[0],
-                        "avatarColor": post["avatar_color"] or "#3B82F6",
-                        "role": post["author_role"]
-                    }
+                    "visibility": "public" if post["is_public"] else "family",
+                    "status": "pending_approval",
+                    "reactions": 0,
+                    "comments": [],
+                    "tags": [],
+                    "media": None
                 })
 
             return corsify(jsonify({"ok": True, "posts": formatted_posts}), origin)
