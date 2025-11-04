@@ -3192,7 +3192,9 @@ def create_post():
     # Support "post as" feature - allow posting as another member (e.g., child)
     # Frontend sends author_id when user selects a different member from dropdown
     author_id = body.get("author_id", user["id"])
-    log.info(f"[DEBUG] Post author_id: {author_id} (logged-in user: {user['id']})")
+    log.info(f"[DEBUG] Post author_id from request: {author_id}")
+    log.info(f"[DEBUG] Logged-in user ID: {user['id']}")
+    log.info(f"[DEBUG] Request body author_id field: {body.get('author_id')}")
 
     if not title and not content:
         return corsify(jsonify({"ok": False, "error": "content_required"}), origin), 400
@@ -3219,6 +3221,24 @@ def create_post():
 
             post = create_content_post(con, tenant["id"], author_id, title, content, 
                                      media_id, media_url, content_type, is_public, visibility)
+            
+            # Enrich post with author details for frontend
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute("""
+                    SELECT 
+                        u.email as author_email,
+                        up.display_name as author_name,
+                        up.avatar_url as author_avatar,
+                        up.avatar_color
+                    FROM users u
+                    LEFT JOIN user_profiles up ON u.id = up.user_id
+                    WHERE u.id = %s
+                """, (author_id,))
+                author_info = cur.fetchone()
+                if author_info:
+                    post['author_name'] = author_info.get('author_name') or author_info.get('author_email', 'User')
+                    post['author_avatar'] = author_info.get('author_avatar')
+                    post['author_avatar_color'] = author_info.get('avatar_color')
             
             audit("post_created", tenant=tenant_slug, post_id=post["id"], title=title)
             return corsify(jsonify({"ok": True, "post": post}), origin)
