@@ -3816,6 +3816,32 @@ def edit_post(post_id: str):
         return corsify(jsonify({"ok": False, "error": "edit_failed", "details": str(e)}), origin), 500
 
 
+@app.get("/api/posts/<post_id>/comments")
+def get_post_comments_endpoint(post_id: str):
+    """Get comments for a post"""
+    origin = request.headers.get("Origin")
+    
+    try:
+        with_db()
+        with pool.connection() as con:
+            # Verify post exists
+            with con.cursor(row_factory=dict_row) as cur:
+                cur.execute("""
+                    SELECT p.id FROM content_posts p
+                    WHERE p.id = %s AND p.status = 'published'
+                """, (post_id,))
+                post = cur.fetchone()
+                if not post:
+                    return corsify(jsonify({"ok": False, "error": "post_not_found"}), origin), 404
+
+            # Get comments
+            comments = get_post_comments(con, post_id)
+            return corsify(jsonify({"ok": True, "comments": comments}), origin)
+
+    except Exception as e:
+        log.exception("Failed to get comments")
+        return corsify(jsonify({"ok": False, "error": "get_comments_failed"}), origin), 500
+
 @app.post("/api/posts/<post_id>/comments")
 def add_post_comment(post_id: str):
     """Add a comment to a post"""
