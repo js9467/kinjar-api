@@ -40,6 +40,46 @@ CORS(app,
      supports_credentials=True
 )
 
+# Additional CORS handling for complex cases
+@app.after_request
+def after_request(response):
+    origin = request.headers.get('Origin')
+    if origin:
+        # Allow specific Kinjar domains
+        allowed_origins = [
+            'https://slaughterbeck.kinjar.com',
+            'https://kinjar.com',
+            'https://www.kinjar.com',
+            'http://localhost:3000',
+            'https://kinjar.vercel.app'
+        ]
+        if origin in allowed_origins:
+            response.headers['Access-Control-Allow-Origin'] = origin
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-tenant-slug'
+            response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+    return response
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        origin = request.headers.get('Origin')
+        if origin:
+            allowed_origins = [
+                'https://slaughterbeck.kinjar.com',
+                'https://kinjar.com', 
+                'https://www.kinjar.com',
+                'http://localhost:3000',
+                'https://kinjar.vercel.app'
+            ]
+            if origin in allowed_origins:
+                response = make_response()
+                response.headers['Access-Control-Allow-Origin'] = origin
+                response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-tenant-slug'
+                response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
 # Configure Flask for larger file uploads. Some iOS Live Photos and newer
 # devices can easily exceed 50MB even when they appear "small" in the photo
 # picker, so allow up to 150MB to avoid spurious 413 errors while still
