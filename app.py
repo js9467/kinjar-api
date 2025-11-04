@@ -1730,8 +1730,11 @@ def test_send_email():
     origin = request.headers.get("Origin")
     data = request.get_json(silent=True) or {}
     
-    test_email = data.get("email", "test@example.com")
+    log.info(f"[TEST EMAIL] Received data: {data}")
+    test_email = data.get("to") or data.get("email", "test@example.com")
     test_name = data.get("name", "Test User")
+    test_subject = data.get("subject", "Test Email from Kinjar")
+    test_body = data.get("body", "This is a test email.")
     
     log.info(f"[TEST EMAIL] Attempting to send test email to: {test_email}")
     log.info(f"[TEST EMAIL] SMTP Config - Host: {SMTP_HOST}, Port: {SMTP_PORT}, Username: {SMTP_USERNAME}")
@@ -1906,7 +1909,7 @@ def invite_family_member():
             # Create invitation token and record
             invite_id = str(uuid4())
             invite_token = str(uuid4()).replace('-', '')  # Clean token for URL
-            expires_at = datetime.datetime.now() + datetime.timedelta(days=7)  # 7 day expiry
+            expires_at = datetime.now() + datetime.timedelta(days=7)  # 7 day expiry
             
             cur.execute("""
                 INSERT INTO tenant_invitations (
