@@ -5052,16 +5052,16 @@ def list_family_connections():
                             ELSE requesting_t.name
                         END as other_family_name,
                         requester.email as requester_email,
-                        requester_profile.display_name as requester_name,
+                        COALESCE(requester_profile.display_name, requester.email) as requester_name,
                         responder.email as responder_email,
-                        responder_profile.display_name as responder_name
+                        COALESCE(responder_profile.display_name, responder.email) as responder_name
                     FROM family_connections fc
                     JOIN tenants requesting_t ON fc.requesting_tenant_id = requesting_t.id
                     JOIN tenants target_t ON fc.target_tenant_id = target_t.id
                     JOIN users requester ON fc.requested_by = requester.id
                     LEFT JOIN users responder ON fc.responded_by = responder.id
-                    LEFT JOIN user_profiles requester_profile ON requester.id = requester_profile.user_id
-                    LEFT JOIN user_profiles responder_profile ON responder.id = responder_profile.user_id
+                    LEFT JOIN user_profiles requester_profile ON requester.id::text = requester_profile.user_id
+                    LEFT JOIN user_profiles responder_profile ON responder.id::text = responder_profile.user_id
                     WHERE fc.requesting_tenant_id = %s OR fc.target_tenant_id = %s
                     ORDER BY fc.created_at DESC
                 """, (tenant["id"], tenant["id"], tenant["id"], tenant["id"], tenant["id"], tenant["id"]))
