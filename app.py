@@ -4339,7 +4339,7 @@ def edit_post(post_id: str):
                 log.info(f"Edit permission check - Post ID: {post_id}, Post author_id: {post['author_id']}, User ID: {user['id']}, User is author: {user_is_author}")
                 
                 if not user_is_author:
-                    # Check if user has admin permissions for this tenant
+                    # Check user's role in this tenant
                     cur.execute(
                         """
                             SELECT role FROM tenant_users
@@ -4350,34 +4350,33 @@ def edit_post(post_id: str):
                     membership = cur.fetchone()
                     log.info(f"Edit permission check - Tenant ID: {post['tenant_id']}, User ID: {user['id']}, Membership: {membership}")
                     
-                    # Allow if user is ADMIN/OWNER
-                    has_admin_permission = membership and membership["role"] in {"ADMIN", "OWNER"}
+                    # Check post author's role
+                    cur.execute(
+                        """
+                            SELECT role FROM tenant_users
+                            WHERE tenant_id = %s AND user_id = %s
+                        """,
+                        (post["tenant_id"], post["author_id"]),
+                    )
+                    author_membership = cur.fetchone()
+                    log.info(f"Edit permission check - Post author membership: {author_membership}")
                     
-                    # Allow if user is ADULT and post author is NOT an adult
-                    # This covers: children, non-existent users (from "post as" feature), etc.
-                    has_adult_edit_permission = False
-                    if membership and membership["role"] == "ADULT":
-                        # Check if the post author is an adult in the same family
-                        cur.execute(
-                            """
-                                SELECT role FROM tenant_users
-                                WHERE tenant_id = %s AND user_id = %s
-                            """,
-                            (post["tenant_id"], post["author_id"]),
-                        )
-                        author_membership = cur.fetchone()
-                        log.info(f"Edit permission check - Post author membership: {author_membership}")
-                        
-                        # Allow editing if author is NOT an adult (or doesn't exist)
-                        if not author_membership or author_membership["role"] != "ADULT":
-                            has_adult_edit_permission = True
-                            author_role = author_membership["role"] if author_membership else "No membership found"
-                            log.info(f"Edit permission check - Adult can edit non-adult post. Author role: {author_role}")
+                    # Permission rules:
+                    # 1. Only original poster can edit adult/admin posts
+                    # 2. Adults/admins can edit child posts (or posts by non-existent users from "post as" feature)
+                    has_edit_permission = False
+                    
+                    if membership and membership["role"] in {"ADMIN", "OWNER", "ADULT"}:
+                        # If author doesn't exist (post as feature) or is a child, allow editing
+                        if not author_membership or author_membership["role"].startswith("CHILD"):
+                            has_edit_permission = True
+                            author_role = author_membership["role"] if author_membership else "No membership found (post as feature)"
+                            log.info(f"Edit permission check - Adult/Admin can edit child/post-as post. Author role: {author_role}")
                         else:
-                            log.info(f"Edit permission check - Cannot edit adult post. Author role: {author_membership['role']}")
+                            log.info(f"Edit permission check - Cannot edit adult/admin post. Author role: {author_membership['role']}")
                     
-                    if not (has_admin_permission or has_adult_edit_permission):
-                        log.info(f"Edit permission check - DENIED. Admin permission: {has_admin_permission}, Adult edit permission: {has_adult_edit_permission}")
+                    if not has_edit_permission:
+                        log.info(f"Edit permission check - DENIED. User role: {membership['role'] if membership else 'No membership'}")
                         return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
 
                 # Update the post content
@@ -4509,6 +4508,92 @@ def add_post_comment(post_id: str):
     except Exception as e:
         log.exception("Failed to add comment")
         return corsify(jsonify({"ok": False, "error": "comment_failed"}), origin), 500
+
+
+@app.patch("/api/comments/<comment_id>")
+def edit_comment(comment_id: str):
+    """Edit a comment's content"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    body = request.get_json(silent=True) or {}
+    content = body.get("content", "").strip()
+
+    if not content:
+        return corsify(jsonify({"ok": False, "error": "content_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get comment and post info
+                cur.execute("""
+                    SELECT c.*, p.tenant_id, t.slug as tenant_slug
+                    FROM content_comments c
+                    JOIN content_posts p ON c.post_id = p.id
+                    JOIN tenants t ON p.tenant_id = t.id
+                    WHERE c.id = %s AND c.status = 'published'
+                """, (comment_id,))
+                comment = cur.fetchone()
+                
+                if not comment:
+                    return corsify(jsonify({"ok": False, "error": "comment_not_found"}), origin), 404
+
+                # Check user's role in this tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users
+                    WHERE tenant_id = %s AND user_id = %s
+                """, (comment["tenant_id"], user["id"]))
+                membership = cur.fetchone()
+                
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+
+                # Permission check: same as posts
+                # 1. Original commenter can edit their own comment
+                # 2. Adults/admins can edit child comments
+                # 3. Adults/admins cannot edit other adults' comments
+                user_is_author = comment["author_id"] == user["id"]
+                
+                if not user_is_author:
+                    # Check comment author's role
+                    cur.execute("""
+                        SELECT role FROM tenant_users
+                        WHERE tenant_id = %s AND user_id = %s
+                    """, (comment["tenant_id"], comment["author_id"]))
+                    author_membership = cur.fetchone()
+                    
+                    # Only allow editing if user is adult/admin and comment author is child (or doesn't exist)
+                    has_edit_permission = False
+                    if membership["role"] in {"ADMIN", "OWNER", "ADULT"}:
+                        if not author_membership or author_membership["role"].startswith("CHILD"):
+                            has_edit_permission = True
+                    
+                    if not has_edit_permission:
+                        return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                # Update comment
+                cur.execute("""
+                    UPDATE content_comments
+                    SET content = %s, updated_at = now()
+                    WHERE id = %s
+                    RETURNING *
+                """, (content, comment_id))
+                updated_comment = cur.fetchone()
+                con.commit()
+
+                if not updated_comment:
+                    return corsify(jsonify({"ok": False, "error": "update_failed"}), origin), 500
+
+                audit("comment_edited", comment_id=comment_id, post_id=comment["post_id"], tenant=comment["tenant_slug"])
+                return corsify(jsonify({"ok": True, "comment": dict(updated_comment)}), origin)
+
+    except Exception as e:
+        log.exception("Failed to edit comment")
+        return corsify(jsonify({"ok": False, "error": "edit_failed"}), origin), 500
+
 
 # ---------------- Post Approval System ----------------
 
@@ -6299,6 +6384,7 @@ def invite_family_member_by_slug(family_slug: str):
 @app.route("/api/posts", methods=["OPTIONS"])
 @app.route("/api/posts/<post_id>", methods=["OPTIONS"])
 @app.route("/api/posts/<post_id>/comments", methods=["OPTIONS"])
+@app.route("/api/comments/<comment_id>", methods=["OPTIONS"])
 @app.route("/api/tenants/<tenant_id>/invite", methods=["OPTIONS"])
 @app.route("/api/families/<family_slug>", methods=["OPTIONS"])
 @app.route("/api/families/<family_slug>/posts", methods=["OPTIONS"])
