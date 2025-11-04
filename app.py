@@ -1797,7 +1797,7 @@ def invite_family_member():
         birth_date = None
         if birthdate:
             try:
-                from datetime import datetime
+                from datetime import datetime, timedelta
                 birth_date = datetime.fromisoformat(birthdate.replace('Z', '+00:00')).date()
                 age = calculate_age(birth_date)
                 # Auto-assign role based on age unless manually specified
@@ -1909,7 +1909,7 @@ def invite_family_member():
             # Create invitation token and record
             invite_id = str(uuid4())
             invite_token = str(uuid4()).replace('-', '')  # Clean token for URL
-            expires_at = datetime.now() + datetime.timedelta(days=7)  # 7 day expiry
+            expires_at = datetime.now() + timedelta(days=7)  # 7 day expiry
             
             cur.execute("""
                 INSERT INTO tenant_invitations (
