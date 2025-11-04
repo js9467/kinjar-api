@@ -39,7 +39,7 @@ CORS(app,
          'https://kinjar.vercel.app',        # Vercel deployments
      ],
      allow_headers=['Content-Type', 'Authorization', 'x-tenant-slug'],
-     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+     methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
      supports_credentials=True
 )
 
@@ -59,7 +59,7 @@ def after_request(response):
         if origin in allowed_origins:
             response.headers['Access-Control-Allow-Origin'] = origin
             response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-tenant-slug'
-            response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+            response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS'
             response.headers['Access-Control-Allow-Credentials'] = 'true'
     return response
 
@@ -79,7 +79,7 @@ def handle_preflight():
                 response = make_response()
                 response.headers['Access-Control-Allow-Origin'] = origin
                 response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-tenant-slug'
-                response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+                response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS'
                 response.headers['Access-Control-Allow-Credentials'] = 'true'
                 return response
 
