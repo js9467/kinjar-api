@@ -4349,7 +4349,28 @@ def edit_post(post_id: str):
                     )
                     membership = cur.fetchone()
                     log.info(f"Edit permission check - Tenant ID: {post['tenant_id']}, User ID: {user['id']}, Membership: {membership}")
-                    if not membership or membership["role"] not in {"ADMIN", "OWNER"}:
+                    
+                    # Allow if user is ADMIN/OWNER
+                    has_admin_permission = membership and membership["role"] in {"ADMIN", "OWNER"}
+                    
+                    # Allow if user is ADULT and post author is a child (for "post as child" feature)
+                    has_adult_child_permission = False
+                    if membership and membership["role"] == "ADULT":
+                        # Check if the post author is a child in the same family
+                        cur.execute(
+                            """
+                                SELECT role FROM tenant_users
+                                WHERE tenant_id = %s AND user_id = %s
+                            """,
+                            (post["tenant_id"], post["author_id"]),
+                        )
+                        author_membership = cur.fetchone()
+                        if author_membership and author_membership["role"].startswith("CHILD"):
+                            has_adult_child_permission = True
+                            log.info(f"Edit permission check - Adult user can edit child post. Author role: {author_membership['role']}")
+                    
+                    if not (has_admin_permission or has_adult_child_permission):
+                        log.info(f"Edit permission check - DENIED. Admin permission: {has_admin_permission}, Adult-child permission: {has_adult_child_permission}")
                         return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
 
                 # Update the post content
