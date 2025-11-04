@@ -4244,6 +4244,7 @@ def delete_post(post_id: str):
 
                 is_author = post["author_id"] == user["id"]
                 if not is_author:
+                    # Check user's role in this tenant
                     cur.execute(
                         """
                             SELECT role FROM tenant_users
@@ -4252,7 +4253,40 @@ def delete_post(post_id: str):
                         (user["id"], post["tenant_id"]),
                     )
                     membership = cur.fetchone()
-                    if not membership or membership["role"] not in {"ADMIN", "OWNER", "ADULT"}:
+                    
+                    if not membership:
+                        return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+                    
+                    # Check post author's role
+                    cur.execute(
+                        """
+                            SELECT role FROM tenant_users
+                            WHERE tenant_id = %s AND user_id = %s
+                        """,
+                        (post["tenant_id"], post["author_id"]),
+                    )
+                    author_membership = cur.fetchone()
+                    
+                    # Permission rules:
+                    # 1. ADMIN can delete any post
+                    # 2. ADULT can delete child posts (or posts by non-existent users from "post as" feature)
+                    # 3. ADULT cannot delete other adult posts
+                    has_delete_permission = False
+                    
+                    if membership["role"] in {"ADMIN", "OWNER"}:
+                        has_delete_permission = True
+                        log.info(f"Delete permission - Admin/Owner can delete any post")
+                    elif membership["role"] == "ADULT":
+                        # Adults can delete child posts or posts by non-existent users
+                        if not author_membership or author_membership["role"] != "ADULT":
+                            has_delete_permission = True
+                            author_role = author_membership["role"] if author_membership else "No membership found (post as feature)"
+                            log.info(f"Delete permission - Adult can delete child/post-as post. Author role: {author_role}")
+                        else:
+                            log.info(f"Delete permission - Adult cannot delete other adult post. Author role: {author_membership['role']}")
+                    
+                    if not has_delete_permission:
+                        log.info(f"Delete permission - DENIED. User role: {membership['role']}")
                         return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
 
                 cur.execute(
@@ -4593,6 +4627,108 @@ def edit_comment(comment_id: str):
     except Exception as e:
         log.exception("Failed to edit comment")
         return corsify(jsonify({"ok": False, "error": "edit_failed"}), origin), 500
+
+
+@app.delete("/api/comments/<int:comment_id>")
+@app.options("/api/comments/<int:comment_id>")
+def delete_comment(comment_id):
+    origin = request.headers.get('Origin')
+    
+    if request.method == 'OPTIONS':
+        return corsify('', origin)
+    
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    try:
+        with_db()
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # Get comment details with tenant info
+                cur.execute("""
+                    SELECT c.*, p.tenant_id, t.slug as tenant_slug
+                    FROM content_comments c
+                    JOIN content_posts p ON c.post_id = p.id
+                    JOIN tenants t ON p.tenant_id = t.id
+                    WHERE c.id = %s
+                """, (comment_id,))
+                comment = cur.fetchone()
+                
+                if not comment:
+                    return corsify(jsonify({"ok": False, "error": "comment_not_found"}), origin), 404
+                
+                # Check user's role in this tenant
+                cur.execute("""
+                    SELECT role, family_id FROM tenant_users
+                    WHERE tenant_id = %s AND user_id = %s
+                """, (comment["tenant_id"], user["id"]))
+                membership = cur.fetchone()
+                
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "not_member"}), origin), 403
+                
+                current_role = membership['role']
+                current_family = membership['family_id']
+                
+                # Get comment author info
+                if comment['posted_as_child']:
+                    # Comment was posted as a child - check if child exists in current family
+                    cur.execute("""
+                        SELECT family_id FROM tenant_users 
+                        WHERE tenant_id = %s AND id = %s
+                    """, (comment["tenant_id"], comment['user_id']))
+                    child_result = cur.fetchone()
+                    comment_author_family = child_result['family_id'] if child_result else None
+                    comment_author_role = 'CHILD'
+                else:
+                    # Regular user comment
+                    cur.execute("""
+                        SELECT role, family_id FROM tenant_users 
+                        WHERE tenant_id = %s AND user_id = %s
+                    """, (comment["tenant_id"], comment['user_id']))
+                    author_result = cur.fetchone()
+                    comment_author_family = author_result['family_id'] if author_result else None
+                    comment_author_role = author_result['role'] if author_result else 'MEMBER'
+                
+                # Permission logic:
+                # 1. ADMINs can delete any comment
+                # 2. Adults can delete their own comments or child comments from their family
+                # 3. Children cannot delete any comments (handled by frontend)
+                
+                can_delete = False
+                
+                if current_role == 'ADMIN':
+                    can_delete = True
+                    log.info(f"Admin {user['id']} can delete comment {comment_id}")
+                elif current_role in ['ADULT', 'OWNER']:
+                    # Can delete own comments
+                    if comment['user_id'] == user['id']:
+                        can_delete = True
+                        log.info(f"User {user['id']} can delete their own comment {comment_id}")
+                    # Can delete child comments from same family
+                    elif comment_author_role == 'CHILD' and comment_author_family == current_family:
+                        can_delete = True
+                        log.info(f"Adult {user['id']} can delete child comment {comment_id} from their family")
+                
+                if not can_delete:
+                    log.warning(f"User {user['id']} (role: {current_role}, family: {current_family}) "
+                              f"cannot delete comment {comment_id} (author: {comment['user_id']}, "
+                              f"author_role: {comment_author_role}, author_family: {comment_author_family})")
+                    return corsify(jsonify({"ok": False, "error": "permission_denied"}), origin), 403
+                
+                # Delete the comment
+                cur.execute("DELETE FROM content_comments WHERE id = %s", (comment_id,))
+                
+                if cur.rowcount == 0:
+                    return corsify(jsonify({"ok": False, "error": "comment_not_found"}), origin), 404
+                
+                log.info(f"Comment {comment_id} deleted by user {user['id']}")
+                return corsify(jsonify({"ok": True}), origin)
+
+    except Exception as e:
+        log.exception("Failed to delete comment")
+        return corsify(jsonify({"ok": False, "error": "delete_failed"}), origin), 500
 
 
 # ---------------- Post Approval System ----------------
