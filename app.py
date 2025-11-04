@@ -1724,6 +1724,51 @@ def remove_family_member(family_id: str, member_id: str):
     
     return corsify(jsonify({"ok": True, "message": "Member removed successfully"}), origin)
 
+@app.post("/test/send-email")
+def test_send_email():
+    """Test endpoint to verify SMTP configuration"""
+    origin = request.headers.get("Origin")
+    data = request.get_json(silent=True) or {}
+    
+    test_email = data.get("email", "test@example.com")
+    test_name = data.get("name", "Test User")
+    
+    log.info(f"[TEST EMAIL] Attempting to send test email to: {test_email}")
+    log.info(f"[TEST EMAIL] SMTP Config - Host: {SMTP_HOST}, Port: {SMTP_PORT}, Username: {SMTP_USERNAME}")
+    log.info(f"[TEST EMAIL] SMTP Username set: {'Yes' if SMTP_USERNAME else 'No'}")
+    log.info(f"[TEST EMAIL] SMTP Password set: {'Yes' if SMTP_PASSWORD else 'No'}")
+    
+    try:
+        # Test email sending
+        success = send_invitation_email(
+            email=test_email,
+            name=test_name,
+            family_name="Test Family",
+            invitation_token="test-token-123",
+            family_slug="testfamily"
+        )
+        
+        if success:
+            return corsify(jsonify({
+                "ok": True, 
+                "message": f"Test email sent successfully to {test_email}",
+                "smtp_configured": True
+            }), origin)
+        else:
+            return corsify(jsonify({
+                "ok": False, 
+                "error": "Failed to send test email - check SMTP configuration",
+                "smtp_configured": bool(SMTP_USERNAME and SMTP_PASSWORD)
+            }), origin), 500
+            
+    except Exception as e:
+        log.error(f"[TEST EMAIL] Exception: {str(e)}")
+        return corsify(jsonify({
+            "ok": False, 
+            "error": f"Email test failed: {str(e)}",
+            "smtp_configured": bool(SMTP_USERNAME and SMTP_PASSWORD)
+        }), origin), 500
+
 @app.post("/auth/invite-member")
 def invite_family_member():
     """Invite a new member to join a family"""
@@ -1732,41 +1777,47 @@ def invite_family_member():
     if err:
         return corsify(err, origin)
     
-    data = request.get_json(silent=True) or {}
-    log.info(f"[INVITE] Received data: {data}")
-    
-    email = (data.get("email") or "").strip().lower()
-    name = (data.get("name") or "").strip()
-    family_id = data.get("familyId")
-    birthdate = data.get("birthdate")
-    role = data.get("role", "ADULT")
-    
-    log.info(f"[INVITE] Parsed - name: '{name}', familyId: '{family_id}', email: '{email}', role: '{role}'")
-    
-    # Calculate age if birthdate is provided
-    age = None
-    if birthdate:
-        try:
-            from datetime import datetime
-            birth_date = datetime.fromisoformat(birthdate.replace('Z', '+00:00')).date()
-            age = calculate_age(birth_date)
-            # Auto-assign role based on age unless manually specified
-            if role == "ADULT" and age is not None:
-                role = determine_role_from_age(age)
-        except ValueError:
-            pass
-    
-    # Email is optional for kids under 16
-    is_child_under_16 = age is not None and age < 16
-    if not is_child_under_16 and not email:
-        return corsify(jsonify({"ok": False, "error": "Email is required for users 16 and older"}), origin), 400
-    
-    if not name or not family_id:
-        log.error(f"[INVITE] Missing required fields - name: '{name}', familyId: '{family_id}'")
-        return corsify(jsonify({"ok": False, "error": "Missing required fields (name, familyId)"}), origin), 400
-    
-    if role not in TENANT_ROLES:
-        return corsify(jsonify({"ok": False, "error": "Invalid role"}), origin), 400
+    try:
+        data = request.get_json(silent=True) or {}
+        log.info(f"[INVITE] Received data: {data}")
+        
+        email = (data.get("email") or "").strip().lower()
+        name = (data.get("name") or "").strip()
+        family_id = data.get("familyId")
+        birthdate = data.get("birthdate")
+        role = data.get("role", "ADULT")
+        
+        log.info(f"[INVITE] Parsed - name: '{name}', familyId: '{family_id}', email: '{email}', role: '{role}'")
+        
+        # Calculate age if birthdate is provided
+        age = None
+        birth_date = None
+        if birthdate:
+            try:
+                from datetime import datetime
+                birth_date = datetime.fromisoformat(birthdate.replace('Z', '+00:00')).date()
+                age = calculate_age(birth_date)
+                # Auto-assign role based on age unless manually specified
+                if role == "ADULT" and age is not None:
+                    role = determine_role_from_age(age)
+                log.info(f"[INVITE] Calculated age: {age}, assigned role: {role}")
+            except ValueError as e:
+                log.error(f"[INVITE] Invalid birthdate format: {birthdate}, error: {e}")
+                pass
+        
+        # Email is optional for kids under 16
+        is_child_under_16 = age is not None and age < 16
+        if not is_child_under_16 and not email:
+            log.error(f"[INVITE] Email required for users 16+, age: {age}")
+            return corsify(jsonify({"ok": False, "error": "Email is required for users 16 and older"}), origin), 400
+        
+        if not name or not family_id:
+            log.error(f"[INVITE] Missing required fields - name: '{name}', familyId: '{family_id}'")
+            return corsify(jsonify({"ok": False, "error": "Missing required fields (name, familyId)"}), origin), 400
+        
+        if role not in TENANT_ROLES:
+            log.error(f"[INVITE] Invalid role: {role}, valid roles: {TENANT_ROLES}")
+            return corsify(jsonify({"ok": False, "error": "Invalid role"}), origin), 400
     
     with_db()
     with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
