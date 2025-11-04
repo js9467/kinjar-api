@@ -4660,7 +4660,7 @@ def invite_user(tenant_id: str):
 
 @app.get("/api/families/<family_slug>")
 def get_family_info(family_slug: str):
-    """Get basic family information"""
+    """Get detailed family information including members"""
     origin = request.headers.get("Origin")
     
     try:
@@ -4680,17 +4680,111 @@ def get_family_info(family_slug: str):
                 if not family:
                     return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
 
-                # Get member count
-                cur.execute("""
-                    SELECT COUNT(*) as member_count
-                    FROM tenant_users tu
-                    WHERE tu.tenant_id = %s
-                """, (family["id"],))
-                member_count = cur.fetchone()["member_count"]
+                tenant_id = family["id"]
 
-                family_data = dict(family)
+                # Fetch full member details
+                cur.execute("""
+                    SELECT 
+                        u.id AS user_id,
+                        u.email,
+                        tu.role,
+                        up.display_name,
+                        up.avatar_url,
+                        up.avatar_color,
+                        up.birthdate,
+                        up.bio,
+                        up.phone
+                    FROM tenant_users tu
+                    JOIN users u ON tu.user_id = u.id
+                    LEFT JOIN user_profiles up ON up.user_id = u.id
+                    WHERE tu.tenant_id = %s
+                    ORDER BY 
+                        CASE tu.role 
+                            WHEN 'OWNER' THEN 0
+                            WHEN 'ADMIN' THEN 1
+                            WHEN 'ADULT' THEN 2
+                            WHEN 'CHILD_16_ADULT' THEN 3
+                            WHEN 'CHILD_14_16' THEN 4
+                            WHEN 'CHILD_10_14' THEN 5
+                            WHEN 'CHILD_5_10' THEN 6
+                            WHEN 'CHILD_0_5' THEN 7
+                            ELSE 8
+                        END,
+                        COALESCE(up.display_name, u.email)
+                """, (tenant_id,))
+
+                member_rows = cur.fetchall()
+
+                members: List[Dict[str, Any]] = []
+                owner_id = None
+                admin_ids: List[str] = []
+
+                for row in member_rows:
+                    user_id = str(row["user_id"])
+                    display_name = row.get("display_name") or (row.get("email") or "").split("@")[0]
+                    email = row.get("email")
+                    # Hide internal placeholder emails for child accounts
+                    if email and email.endswith("@kinjar.internal"):
+                        email = ""
+
+                    birthdate_val = row.get("birthdate")
+                    birthdate_iso = birthdate_val.isoformat() if birthdate_val else None
+                    age = calculate_age(birthdate_val) if birthdate_val else None
+
+                    role = row.get("role") or "MEMBER"
+                    if role == "OWNER" and not owner_id:
+                        owner_id = user_id
+                    if role in ("OWNER", "ADMIN"):
+                        admin_ids.append(user_id)
+
+                    members.append({
+                        "id": user_id,
+                        "userId": user_id,
+                        "name": display_name,
+                        "email": email,
+                        "role": role,
+                        "avatarColor": row.get("avatar_color") or "#3B82F6",
+                        "avatarUrl": row.get("avatar_url"),
+                        "birthdate": birthdate_iso,
+                        "age": age,
+                        "bio": row.get("bio"),
+                        "phone": row.get("phone"),
+                        "permissions": get_role_permissions(role),
+                        "joinedAt": None,
+                        "quote": None,
+                        "avatarSeed": user_id,
+                    })
+
+                member_count = len(members)
+
+                family_data: Dict[str, Any] = {
+                    "id": str(tenant_id),
+                    "slug": family["slug"],
+                    "name": family["name"],
+                    "description": family.get("description") or "",
+                    "missionStatement": "",
+                    "bannerImage": family.get("family_photo"),
+                    "heroImage": family.get("family_photo"),
+                    "themeColor": family.get("theme_color") or "#3B82F6",
+                    "admins": admin_ids,
+                    "members": members,
+                    "posts": [],
+                    "connections": [],
+                    "connectedFamilies": [],
+                    "storageUsedMb": 0,
+                    "invitesSentThisMonth": 0,
+                    "pendingMembers": [],
+                    "highlights": [],
+                    "isPublic": bool(family.get("is_public")),
+                    "subdomain": family.get("slug"),
+                    "createdAt": family.get("created_at").isoformat() if family.get("created_at") else None,
+                    "ownerId": owner_id,
+                    "memberCount": member_count,
+                }
+
+                # Provide legacy snake_case key for compatibility with older clients
                 family_data["member_count"] = member_count
-                
+
                 return corsify(jsonify({"ok": True, "family": family_data}), origin)
 
     except Exception as e:
