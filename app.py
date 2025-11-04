@@ -2926,61 +2926,69 @@ def create_content_post(con, tenant_id: str, author_id: str, title: str, content
 
 def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
     """Get published posts for a tenant with author and media info"""
-    with con.cursor(row_factory=dict_row) as cur:
-        # First check if visibility column exists
-        cur.execute("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'content_posts' AND column_name = 'visibility'
-        """)
-        has_visibility = cur.fetchone() is not None
-        
-        # Build query with conditional visibility column
-        if has_visibility:
+    try:
+        with con.cursor(row_factory=dict_row) as cur:
+            # First check if visibility column exists
             cur.execute("""
-                SELECT 
-                    p.*,
-                    u.email as author_email,
-                    up.display_name as author_name,
-                    up.avatar_url as author_avatar,
-                    m.filename as media_filename,
-                    m.content_type as media_content_type,
-                    m.r2_key as media_r2_key,
-                    m.external_url as media_external_url,
-                    m.thumbnail_url as media_thumbnail,
-                    m.duration_seconds as media_duration
-                FROM content_posts p
-                JOIN users u ON p.author_id = u.id
-                LEFT JOIN user_profiles up ON u.id = up.user_id
-                LEFT JOIN media_objects m ON p.media_id = m.id
-                WHERE p.tenant_id = %s AND p.status = 'published'
-                ORDER BY p.published_at DESC
-                LIMIT %s OFFSET %s
-            """, (tenant_id, limit, offset))
-        else:
-            # Fallback query without visibility column
-            cur.execute("""
-                SELECT 
-                    p.*,
-                    u.email as author_email,
-                    up.display_name as author_name,
-                    up.avatar_url as author_avatar,
-                    m.filename as media_filename,
-                    m.content_type as media_content_type,
-                    m.r2_key as media_r2_key,
-                    m.external_url as media_external_url,
-                    m.thumbnail_url as media_thumbnail,
-                    m.duration_seconds as media_duration,
-                    CASE WHEN p.is_public THEN 'public' ELSE 'family' END as visibility
-                FROM content_posts p
-                JOIN users u ON p.author_id = u.id
-                LEFT JOIN user_profiles up ON u.id = up.user_id
-                LEFT JOIN media_objects m ON p.media_id = m.id
-                WHERE p.tenant_id = %s AND p.status = 'published'
-                ORDER BY p.published_at DESC
-                LIMIT %s OFFSET %s
-            """, (tenant_id, limit, offset))
-        return cur.fetchall()
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'content_posts' AND column_name = 'visibility'
+            """)
+            has_visibility = cur.fetchone() is not None
+            log.info(f"Visibility column exists: {has_visibility}")
+            
+            # Build query with conditional visibility column
+            if has_visibility:
+                cur.execute("""
+                    SELECT 
+                        p.*,
+                        u.email as author_email,
+                        up.display_name as author_name,
+                        up.avatar_url as author_avatar,
+                        m.filename as media_filename,
+                        m.content_type as media_content_type,
+                        m.r2_key as media_r2_key,
+                        m.external_url as media_external_url,
+                        m.thumbnail_url as media_thumbnail,
+                        m.duration_seconds as media_duration
+                    FROM content_posts p
+                    JOIN users u ON p.author_id = u.id
+                    LEFT JOIN user_profiles up ON u.id = up.user_id
+                    LEFT JOIN media_objects m ON p.media_id = m.id
+                    WHERE p.tenant_id = %s AND p.status = 'published'
+                    ORDER BY p.published_at DESC
+                    LIMIT %s OFFSET %s
+                """, (tenant_id, limit, offset))
+            else:
+                # Fallback query without visibility column
+                cur.execute("""
+                    SELECT 
+                        p.*,
+                        u.email as author_email,
+                        up.display_name as author_name,
+                        up.avatar_url as author_avatar,
+                        m.filename as media_filename,
+                        m.content_type as media_content_type,
+                        m.r2_key as media_r2_key,
+                        m.external_url as media_external_url,
+                        m.thumbnail_url as media_thumbnail,
+                        m.duration_seconds as media_duration,
+                        CASE WHEN p.is_public THEN 'public' ELSE 'family' END as visibility
+                    FROM content_posts p
+                    JOIN users u ON p.author_id = u.id
+                    LEFT JOIN user_profiles up ON u.id = up.user_id
+                    LEFT JOIN media_objects m ON p.media_id = m.id
+                    WHERE p.tenant_id = %s AND p.status = 'published'
+                    ORDER BY p.published_at DESC
+                    LIMIT %s OFFSET %s
+                """, (tenant_id, limit, offset))
+            
+            result = cur.fetchall()
+            log.info(f"Query returned {len(result)} posts")
+            return result
+    except Exception as e:
+        log.exception(f"Error in get_tenant_posts: {str(e)}")
+        raise
 
 def get_post_comments(con, post_id: str) -> List[Dict[str, Any]]:
     """Get comments for a post with author info"""
@@ -4701,7 +4709,9 @@ def get_family_posts(family_slug: str):
                     return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
 
                 # Get posts for this family
+                log.info(f"Getting posts for tenant_id: {tenant['id']}")
                 posts = get_tenant_posts(con, tenant["id"], limit, offset)
+                log.info(f"Retrieved {len(posts)} posts")
                 
                 # Add signed URLs for media if storage is configured
                 try:
@@ -4731,8 +4741,8 @@ def get_family_posts(family_slug: str):
                 return corsify(jsonify({"ok": True, "posts": posts}), origin)
 
     except Exception as e:
-        log.exception("Failed to get family posts")
-        return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
+        log.exception(f"Failed to get family posts for {family_slug}: {str(e)}")
+        return corsify(jsonify({"ok": False, "error": "fetch_failed", "details": str(e)}), origin), 500
 
 # ---------------- New Family Authentication & Management Routes ----------------
 
