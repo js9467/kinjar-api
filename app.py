@@ -5279,7 +5279,7 @@ def serve_media(filename):
 # ---------------- End New Family Authentication Routes ----------------
 
 @app.post("/families/<family_slug>/invite")
-def invite_family_member(family_slug: str):
+def invite_family_member_by_slug(family_slug: str):
     """Invite a user to join a family (by slug)"""
     origin = request.headers.get("Origin")
     # TODO: Add proper authentication later - allowing for development
