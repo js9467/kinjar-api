@@ -5047,7 +5047,7 @@ def update_member_role_legacy(member_id: str):
         return corsify(jsonify({"ok": False, "error": "update_role_failed"}), origin), 500
 
 @app.delete("/api/families/members/<member_id>")
-def remove_family_member(member_id: str):
+def remove_family_member_by_slug(member_id: str):
     """Remove a member from the family (admin/owner only)"""
     origin = request.headers.get("Origin")
     user = current_user_row()
