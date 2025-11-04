@@ -6290,5 +6290,46 @@ def options():
     response = make_response(("", 204))
     return corsify(response, origin)
 
+@app.post("/emergency/reset-password")
+def emergency_reset_password():
+    """Emergency password reset - temporary endpoint"""
+    origin = request.headers.get("Origin")
+    data = request.get_json(silent=True) or {}
+    
+    email = (data.get("email") or "").strip().lower()
+    new_password = data.get("password", "")
+    emergency_key = data.get("key", "")
+    
+    # Simple emergency key check
+    if emergency_key != "kinjar-emergency-2025":
+        return corsify(jsonify({"ok": False, "error": "Invalid emergency key"}), origin), 403
+    
+    if not email or not new_password:
+        return corsify(jsonify({"ok": False, "error": "Email and password required"}), origin), 400
+    
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Update password
+            pw_hash = ph.hash(new_password)
+            cur.execute("""
+                UPDATE users SET password_hash = %s WHERE email = %s
+            """, (pw_hash, email))
+            
+            if cur.rowcount == 0:
+                return corsify(jsonify({"ok": False, "error": "User not found"}), origin), 404
+            
+            con.commit()
+            log.info(f"Emergency password reset for {email}")
+            
+            return corsify(jsonify({
+                "ok": True, 
+                "message": f"Password reset successfully for {email}"
+            }), origin)
+            
+    except Exception as e:
+        log.error(f"Emergency password reset failed: {e}")
+        return corsify(jsonify({"ok": False, "error": "Reset failed"}), origin), 500
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
