@@ -310,12 +310,32 @@ def db_connect_once():
                   content_type  text NOT NULL DEFAULT 'video_blog', -- video_blog, photo_blog, text_post
                   status        text NOT NULL DEFAULT 'published', -- draft, published, archived
                   is_public     boolean DEFAULT true,
+                  visibility    text DEFAULT 'family', -- 'family', 'connections', 'public'
                   view_count    integer DEFAULT 0,
                   created_at    timestamptz NOT NULL DEFAULT now(),
                   updated_at    timestamptz NOT NULL DEFAULT now(),
                   published_at  timestamptz
                 );
             """)
+            
+            # Add visibility column if it doesn't exist (migration)
+            cur.execute("""
+                DO $$ BEGIN
+                    ALTER TABLE content_posts ADD COLUMN visibility text DEFAULT 'family';
+                EXCEPTION
+                    WHEN duplicate_column THEN NULL;
+                END $$;
+            """)
+            # Update existing rows to have proper visibility based on is_public
+            cur.execute("""
+                UPDATE content_posts 
+                SET visibility = CASE 
+                    WHEN is_public = true THEN 'public' 
+                    ELSE 'family' 
+                END 
+                WHERE visibility IS NULL;
+            """)
+            
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_content_posts_tenant_published
                   ON content_posts (tenant_id, published_at DESC) WHERE status = 'published';
@@ -1189,8 +1209,26 @@ def invite_family_member():
     birthdate = data.get("birthdate")
     role = data.get("role", "ADULT")
     
-    if not email or not name or not family_id:
-        return corsify(jsonify({"ok": False, "error": "Missing required fields"}), origin), 400
+    # Calculate age if birthdate is provided
+    age = None
+    if birthdate:
+        try:
+            from datetime import datetime
+            birth_date = datetime.fromisoformat(birthdate.replace('Z', '+00:00')).date()
+            age = calculate_age(birth_date)
+            # Auto-assign role based on age unless manually specified
+            if role == "ADULT" and age is not None:
+                role = determine_role_from_age(age)
+        except ValueError:
+            pass
+    
+    # Email is optional for kids under 16
+    is_child_under_16 = age is not None and age < 16
+    if not is_child_under_16 and not email:
+        return corsify(jsonify({"ok": False, "error": "Email is required for users 16 and older"}), origin), 400
+    
+    if not name or not family_id:
+        return corsify(jsonify({"ok": False, "error": "Missing required fields (name, familyId)"}), origin), 400
     
     if role not in TENANT_ROLES:
         return corsify(jsonify({"ok": False, "error": "Invalid role"}), origin), 400
@@ -1207,42 +1245,42 @@ def invite_family_member():
         if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
             return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
         
-        # Check if email is already a member
-        cur.execute("""
-            SELECT u.id FROM users u
-            JOIN tenant_users tu ON u.id = tu.user_id
-            WHERE u.email = %s AND tu.tenant_id = %s
-        """, (email, family_id))
-        if cur.fetchone():
-            return corsify(jsonify({"ok": False, "error": "User is already a member"}), origin), 409
+        # Check if email is already a member (only if email provided)
+        if email:
+            cur.execute("""
+                SELECT u.id FROM users u
+                JOIN tenant_users tu ON u.id = tu.user_id
+                WHERE u.email = %s AND tu.tenant_id = %s
+            """, (email, family_id))
+            if cur.fetchone():
+                return corsify(jsonify({"ok": False, "error": "User is already a member"}), origin), 409
         
         # Create user if they don't exist
-        cur.execute("SELECT id FROM users WHERE email = %s", (email,))
-        existing_user = cur.fetchone()
-        
-        if existing_user:
-            new_user_id = existing_user["id"]
+        new_user_id = None
+        if email:
+            cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+            existing_user = cur.fetchone()
+            
+            if existing_user:
+                new_user_id = existing_user["id"]
+            else:
+                # Create new user with email
+                new_user_id = str(uuid4())
+                cur.execute("""
+                    INSERT INTO users (id, email, global_role)
+                    VALUES (%s, %s, 'USER')
+                """, (new_user_id, email))
         else:
-            # Create new user without password (they'll need to set it)
+            # Create user without email (for kids under 16)
             new_user_id = str(uuid4())
+            # Generate a unique email placeholder for kids
+            child_email = f"child.{new_user_id}@kinjar.internal"
             cur.execute("""
                 INSERT INTO users (id, email, global_role)
                 VALUES (%s, %s, 'USER')
-            """, (new_user_id, email))
+            """, (new_user_id, child_email))
         
         # Create or update profile
-        age = None
-        if birthdate:
-            try:
-                from datetime import datetime
-                birth_date = datetime.fromisoformat(birthdate.replace('Z', '+00:00')).date()
-                age = calculate_age(birth_date)
-                # Auto-assign role based on age unless manually specified
-                if role == "ADULT" and age is not None:
-                    role = determine_role_from_age(age)
-            except ValueError:
-                pass
-        
         cur.execute("""
             INSERT INTO user_profiles (user_id, display_name, birthdate)
             VALUES (%s, %s, %s)
@@ -2798,7 +2836,8 @@ def upload_complete():
 
 # Helper functions for video blog features
 def create_content_post(con, tenant_id: str, author_id: str, title: str, content: str = "", 
-                       media_id: str = None, media_url: str = None, content_type: str = "video_blog", is_public: bool = True) -> Dict[str, Any]:
+                       media_id: str = None, media_url: str = None, content_type: str = "video_blog", 
+                       is_public: bool = True, visibility: str = "family") -> Dict[str, Any]:
     """Create a new content post (video blog entry)"""
     post_id = str(uuid4())
     published_at = datetime.datetime.now(datetime.timezone.utc)
@@ -2851,10 +2890,10 @@ def create_content_post(con, tenant_id: str, author_id: str, title: str, content
         # Create the post with appropriate status
         cur.execute("""
             INSERT INTO content_posts (id, tenant_id, author_id, media_id, title, content, 
-                                     content_type, is_public, status, published_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                     content_type, is_public, visibility, status, published_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
-        """, (post_id, tenant_id, author_id, actual_media_id, title, content, content_type, is_public, status, published_at))
+        """, (post_id, tenant_id, author_id, actual_media_id, title, content, content_type, is_public, visibility, status, published_at))
         post = cur.fetchone()
         
         # Add to activity feed
@@ -3079,7 +3118,11 @@ def create_post():
     visibility = body.get("visibility", "family")
     if visibility == "public":
         is_public = True
-    elif visibility == "family":
+    elif visibility in ["family", "connections"]:
+        is_public = False
+    else:
+        # Default unknown values to family
+        visibility = "family"
         is_public = False
 
     if not title and not content:
@@ -3105,7 +3148,7 @@ def create_post():
                 #     return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
 
             post = create_content_post(con, tenant["id"], user["id"], title, content, 
-                                     media_id, media_url, content_type, is_public)
+                                     media_id, media_url, content_type, is_public, visibility)
             
             audit("post_created", tenant=tenant_slug, post_id=post["id"], title=title)
             return corsify(jsonify({"ok": True, "post": post}), origin)
