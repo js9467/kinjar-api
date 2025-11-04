@@ -1294,7 +1294,9 @@ def auth_register():
             invitation = None
             if invitation_token:
                 cur.execute("""
-                    SELECT ti.*, t.name as family_name, t.slug as family_slug
+                    SELECT ti.id, ti.tenant_id, ti.invited_by, ti.email, ti.invited_name, 
+                           ti.role, ti.status, ti.invite_token, ti.expires_at, ti.created_at, ti.accepted_at,
+                           t.name as family_name, t.slug as family_slug
                     FROM tenant_invitations ti
                     JOIN tenants t ON ti.tenant_id = t.id
                     WHERE ti.invite_token = %s AND ti.status = 'pending'
