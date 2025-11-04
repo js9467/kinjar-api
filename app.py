@@ -8,6 +8,7 @@ from uuid import uuid4
 from typing import Optional, List, Dict, Any
 
 from flask import Flask, request, jsonify, make_response, redirect
+from flask_cors import CORS
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -24,6 +25,18 @@ import mimetypes
 
 # ---------------- Setup ----------------
 app = Flask(__name__)
+
+# Configure CORS to allow requests from Kinjar subdomains
+CORS(app, 
+     origins=[
+         'https://*.kinjar.com',  # All Kinjar subdomains
+         'http://localhost:3000', # Local development
+         'https://kinjar.vercel.app', # Vercel deployments
+         'https://*.vercel.app'   # Preview deployments
+     ],
+     allow_headers=['Content-Type', 'Authorization', 'x-tenant-slug'],
+     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
+)
 
 # Configure Flask for larger file uploads. Some iOS Live Photos and newer
 # devices can easily exceed 50MB even when they appear "small" in the photo
