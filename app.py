@@ -6,6 +6,9 @@ import logging
 import datetime
 from uuid import uuid4
 from typing import Optional, List, Dict, Any
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 from flask import Flask, request, jsonify, make_response, redirect
 from flask_cors import CORS
@@ -126,6 +129,14 @@ PORT = int(os.getenv("PORT", "8080"))
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit.log")
 ROOT_DOMAIN = os.getenv("ROOT_DOMAIN", "kinjar.com")
+
+# Email Configuration for invitations
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "noreply@kinjar.com")
+SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Kinjar Family Platform")
 
 # Auth / Session
 JWT_SECRET = os.getenv("JWT_SECRET", "temp-dev-secret-change-in-production")  # Temporary default for development
@@ -819,6 +830,102 @@ def unique_slug(conn, base: str) -> str:
             i += 1
     return slug
 
+def send_invitation_email(email: str, name: str, family_name: str, invitation_token: str, family_slug: str):
+    """Send an invitation email to a new family member"""
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        log.warning(f"SMTP not configured, skipping email to {email}")
+        return False
+    
+    try:
+        # Create the invitation URL
+        base_url = f"https://{ROOT_DOMAIN}"
+        invitation_url = f"{base_url}/auth/register?token={invitation_token}&family={family_slug}"
+        
+        # Create email content
+        subject = f"You're invited to join {family_name} on Kinjar!"
+        
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <div style="text-align: center; margin-bottom: 30px;">
+                <h1 style="color: #3B82F6;">Welcome to Kinjar!</h1>
+            </div>
+            
+            <div style="background: #F8FAFC; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                <h2 style="color: #1F2937; margin-top: 0;">Hi {name}!</h2>
+                <p style="color: #4B5563; font-size: 16px; line-height: 1.5;">
+                    You've been invited to join <strong>{family_name}</strong> on Kinjar, 
+                    a private family social platform where you can share photos, videos, 
+                    and memories with your loved ones.
+                </p>
+            </div>
+            
+            <div style="text-align: center; margin: 30px 0;">
+                <a href="{invitation_url}" 
+                   style="background: #3B82F6; color: white; padding: 14px 28px; 
+                          text-decoration: none; border-radius: 6px; font-weight: bold; 
+                          font-size: 16px; display: inline-block;">
+                    Join {family_name}
+                </a>
+            </div>
+            
+            <div style="border-top: 1px solid #E5E7EB; padding-top: 20px; margin-top: 30px;">
+                <p style="color: #6B7280; font-size: 14px;">
+                    If the button doesn't work, copy and paste this link into your browser:
+                </p>
+                <p style="color: #3B82F6; font-size: 14px; word-break: break-all;">
+                    {invitation_url}
+                </p>
+                <p style="color: #6B7280; font-size: 12px; margin-top: 20px;">
+                    This invitation will expire in 7 days. If you have any questions, 
+                    please contact the family member who invited you.
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        text_body = f"""
+Hi {name}!
+
+You've been invited to join {family_name} on Kinjar, a private family social platform 
+where you can share photos, videos, and memories with your loved ones.
+
+To accept this invitation and create your account, please visit:
+{invitation_url}
+
+This invitation will expire in 7 days. If you have any questions, 
+please contact the family member who invited you.
+
+Welcome to the family!
+The Kinjar Team
+        """
+        
+        # Create message
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+        msg['To'] = email
+        
+        # Attach text and HTML versions
+        text_part = MIMEText(text_body, 'plain')
+        html_part = MIMEText(html_body, 'html')
+        msg.attach(text_part)
+        msg.attach(html_part)
+        
+        # Send email
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+            
+        log.info(f"Invitation email sent successfully to {email}")
+        return True
+        
+    except Exception as e:
+        log.error(f"Failed to send invitation email to {email}: {str(e)}")
+        return False
+
 def ensure_user_basic(con, email: str) -> Dict[str, Any]:
     email = email.strip().lower()
     if not email:
@@ -1166,27 +1273,116 @@ def auth_register():
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
+    invitation_token = data.get("token") or ""  # Invitation token
+    
     if not email or not password or len(password) < 8:
         return corsify(jsonify({"ok": False, "error": "Invalid email or password"}), origin), 400
+    
     pw_hash = ph.hash(password)
 
     with_db()
     try:
         with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Check if this is an invitation-based registration
+            invitation = None
+            if invitation_token:
+                cur.execute("""
+                    SELECT ti.*, t.name as family_name, t.slug as family_slug
+                    FROM tenant_invitations ti
+                    JOIN tenants t ON ti.tenant_id = t.id
+                    WHERE ti.invite_token = %s AND ti.status = 'pending'
+                      AND ti.expires_at > now()
+                """, (invitation_token,))
+                invitation = cur.fetchone()
+                
+                if not invitation:
+                    return corsify(jsonify({"ok": False, "error": "Invalid or expired invitation"}), origin), 400
+                
+                if invitation["email"] != email:
+                    return corsify(jsonify({"ok": False, "error": "Email doesn't match invitation"}), origin), 400
+            
+            # Create user account
             uid = str(uuid4())
             role = "ROOT" if email in ROOT_EMAILS else "USER"
             cur.execute("""INSERT INTO users (id,email,password_hash,global_role)
                            VALUES (%s,%s,%s,%s) RETURNING id,email,global_role,created_at""",
                         (uid, email, pw_hash, role))
             user = cur.fetchone()
+            
+            # If this is an invitation-based registration, add user to family
+            if invitation:
+                # Create user profile with name from invitation if available
+                cur.execute("""
+                    INSERT INTO user_profiles (user_id, display_name)
+                    VALUES (%s, %s)
+                """, (uid, email.split('@')[0]))  # Use email prefix as default name
+                
+                # Add user to family with invited role
+                cur.execute("""
+                    INSERT INTO tenant_users (user_id, tenant_id, role)
+                    VALUES (%s, %s, %s)
+                """, (uid, invitation["tenant_id"], invitation["role"]))
+                
+                # Mark invitation as accepted
+                cur.execute("""
+                    UPDATE tenant_invitations 
+                    SET status = 'accepted', accepted_at = now()
+                    WHERE id = %s
+                """, (invitation["id"],))
+                
+                log.info(f"User {email} registered and added to family {invitation['family_name']} with role {invitation['role']}")
+            
+            con.commit()
+            
     except psycopg.errors.UniqueViolation:
         return corsify(jsonify({"ok": False, "error": "Email already registered"}), origin), 409
 
     now = int(datetime.datetime.utcnow().timestamp())
     token = sign_jwt({"uid": str(user["id"]), "iat": now, "exp": now + JWT_TTL_MIN * 60})
-    resp = make_response(jsonify({"ok": True, "user": user}))
+    resp_data = {"ok": True, "user": user}
+    
+    # Include family info if this was an invitation registration
+    if invitation:
+        resp_data["family"] = {
+            "id": invitation["tenant_id"],
+            "name": invitation["family_name"],
+            "slug": invitation["family_slug"],
+            "role": invitation["role"]
+        }
+    
+    resp = make_response(jsonify(resp_data))
     set_session_cookie(resp, token)
     return corsify(resp, origin)
+
+@app.get("/auth/invitation/<token>")
+def get_invitation_details(token: str):
+    """Get details about an invitation token for the registration form"""
+    origin = request.headers.get("Origin")
+    
+    with_db()
+    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            SELECT ti.email, ti.role, ti.expires_at, t.name as family_name, t.slug as family_slug
+            FROM tenant_invitations ti
+            JOIN tenants t ON ti.tenant_id = t.id
+            WHERE ti.invite_token = %s AND ti.status = 'pending'
+              AND ti.expires_at > now()
+        """, (token,))
+        invitation = cur.fetchone()
+        
+        if not invitation:
+            return corsify(jsonify({"ok": False, "error": "Invalid or expired invitation"}), origin), 404
+        
+        return corsify(jsonify({
+            "ok": True,
+            "invitation": {
+                "email": invitation["email"],
+                "role": invitation["role"],
+                "familyName": invitation["family_name"],
+                "familySlug": invitation["family_slug"],
+                "expiresAt": invitation["expires_at"].isoformat()
+            }
+        }), origin)
 
 # ---------------- User Profile Management ----------------
 @app.patch("/auth/profile")
@@ -1249,6 +1445,285 @@ def update_profile():
     
     return corsify(jsonify({"ok": True, "message": "Profile updated successfully"}), origin)
 
+@app.post("/auth/upload-avatar")
+def upload_avatar():
+    """Upload and set user avatar"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+    
+    if 'avatar' not in request.files:
+        return corsify(jsonify({"ok": False, "error": "No avatar file provided"}), origin), 400
+    
+    file = request.files['avatar']
+    if file.filename == '':
+        return corsify(jsonify({"ok": False, "error": "No file selected"}), origin), 400
+    
+    # Validate file type
+    content_type = file.content_type or mimetypes.guess_type(file.filename)[0] or ""
+    if not content_type.startswith('image/'):
+        return corsify(jsonify({"ok": False, "error": "File must be an image"}), origin), 400
+    
+    # Validate file size (max 5MB for avatars)
+    file_data = file.read()
+    if len(file_data) > 5 * 1024 * 1024:  # 5MB
+        return corsify(jsonify({"ok": False, "error": "Avatar file too large (max 5MB)"}), origin), 400
+    
+    try:
+        # Generate filename for avatar
+        file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
+        avatar_filename = f"avatars/{user['id']}.{file_extension}"
+        
+        # Upload to Vercel Blob
+        avatar_url = upload_to_vercel_blob(file_data, avatar_filename, content_type)
+        
+        # Update user profile with new avatar URL
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Create profile if it doesn't exist
+            cur.execute("""
+                INSERT INTO user_profiles (user_id, avatar_url) 
+                VALUES (%s, %s) 
+                ON CONFLICT (user_id) DO UPDATE SET
+                    avatar_url = EXCLUDED.avatar_url,
+                    updated_at = now()
+            """, (user["id"], avatar_url))
+            
+            con.commit()
+        
+        return corsify(jsonify({
+            "ok": True, 
+            "message": "Avatar uploaded successfully",
+            "avatarUrl": avatar_url
+        }), origin)
+        
+    except Exception as e:
+        log.error(f"Failed to upload avatar for user {user['id']}: {str(e)}")
+        return corsify(jsonify({"ok": False, "error": "Failed to upload avatar"}), origin), 500
+
+@app.post("/api/family/<family_id>/member/<member_id>/avatar")
+def upload_member_avatar(family_id: str, member_id: str):
+    """Upload avatar for a family member (admin only)"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+    
+    with_db()
+    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        # Check if user has admin permissions for this family
+        cur.execute("""
+            SELECT role FROM tenant_users 
+            WHERE user_id = %s AND tenant_id = %s
+        """, (user["id"], family_id))
+        membership = cur.fetchone()
+        
+        if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
+            return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
+        
+        # Verify member exists in family
+        cur.execute("""
+            SELECT u.id FROM users u
+            JOIN tenant_users tu ON u.id = tu.user_id
+            WHERE u.id = %s AND tu.tenant_id = %s
+        """, (member_id, family_id))
+        member = cur.fetchone()
+        
+        if not member:
+            return corsify(jsonify({"ok": False, "error": "Member not found"}), origin), 404
+    
+    if 'avatar' not in request.files:
+        return corsify(jsonify({"ok": False, "error": "No avatar file provided"}), origin), 400
+    
+    file = request.files['avatar']
+    if file.filename == '':
+        return corsify(jsonify({"ok": False, "error": "No file selected"}), origin), 400
+    
+    # Validate file type
+    content_type = file.content_type or mimetypes.guess_type(file.filename)[0] or ""
+    if not content_type.startswith('image/'):
+        return corsify(jsonify({"ok": False, "error": "File must be an image"}), origin), 400
+    
+    # Validate file size (max 5MB for avatars)
+    file_data = file.read()
+    if len(file_data) > 5 * 1024 * 1024:  # 5MB
+        return corsify(jsonify({"ok": False, "error": "Avatar file too large (max 5MB)"}), origin), 400
+    
+    try:
+        # Generate filename for avatar
+        file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
+        avatar_filename = f"avatars/{member_id}.{file_extension}"
+        
+        # Upload to Vercel Blob
+        avatar_url = upload_to_vercel_blob(file_data, avatar_filename, content_type)
+        
+        # Update member profile with new avatar URL
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Create profile if it doesn't exist
+            cur.execute("""
+                INSERT INTO user_profiles (user_id, avatar_url) 
+                VALUES (%s, %s) 
+                ON CONFLICT (user_id) DO UPDATE SET
+                    avatar_url = EXCLUDED.avatar_url,
+                    updated_at = now()
+            """, (member_id, avatar_url))
+            
+            con.commit()
+        
+        return corsify(jsonify({
+            "ok": True, 
+            "message": "Member avatar updated successfully",
+            "avatarUrl": avatar_url
+        }), origin)
+        
+    except Exception as e:
+        log.error(f"Failed to upload avatar for member {member_id}: {str(e)}")
+        return corsify(jsonify({"ok": False, "error": "Failed to upload avatar"}), origin), 500
+
+@app.patch("/api/family/<family_id>/member/<member_id>")
+def update_family_member(family_id: str, member_id: str):
+    """Update family member details (admin only)"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+    
+    data = request.get_json(silent=True) or {}
+    
+    with_db()
+    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        # Check if user has admin permissions for this family
+        cur.execute("""
+            SELECT role FROM tenant_users 
+            WHERE user_id = %s AND tenant_id = %s
+        """, (user["id"], family_id))
+        membership = cur.fetchone()
+        
+        if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
+            return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
+        
+        # Verify member exists in family
+        cur.execute("""
+            SELECT u.id, tu.role FROM users u
+            JOIN tenant_users tu ON u.id = tu.user_id
+            WHERE u.id = %s AND tu.tenant_id = %s
+        """, (member_id, family_id))
+        member = cur.fetchone()
+        
+        if not member:
+            return corsify(jsonify({"ok": False, "error": "Member not found"}), origin), 404
+        
+        # Prepare updates
+        profile_updates = {}
+        role_update = None
+        
+        if "name" in data:
+            profile_updates["display_name"] = data["name"].strip()[:100] if data["name"] else None
+        if "quote" in data:
+            profile_updates["bio"] = data["quote"].strip()[:500] if data["quote"] else None
+        if "birthdate" in data:
+            if data["birthdate"]:
+                try:
+                    from datetime import datetime
+                    birthdate = datetime.fromisoformat(data["birthdate"].replace('Z', '+00:00')).date()
+                    profile_updates["birthdate"] = birthdate
+                except ValueError:
+                    return corsify(jsonify({"ok": False, "error": "Invalid birthdate format"}), origin), 400
+            else:
+                profile_updates["birthdate"] = None
+        
+        if "role" in data and data["role"] in TENANT_ROLES:
+            role_update = data["role"]
+        
+        # Update profile if there are changes
+        if profile_updates:
+            # Create profile if it doesn't exist
+            cur.execute("""
+                INSERT INTO user_profiles (user_id) 
+                VALUES (%s) 
+                ON CONFLICT (user_id) DO NOTHING
+            """, (member_id,))
+            
+            # Build update query dynamically
+            set_clauses = [f"{k} = %s" for k in profile_updates.keys()]
+            values = list(profile_updates.values()) + [member_id]
+            
+            cur.execute(f"""
+                UPDATE user_profiles 
+                SET {', '.join(set_clauses)}, updated_at = now()
+                WHERE user_id = %s
+            """, values)
+        
+        # Update role if specified
+        if role_update and role_update != member["role"]:
+            cur.execute("""
+                UPDATE tenant_users 
+                SET role = %s
+                WHERE user_id = %s AND tenant_id = %s
+            """, (role_update, member_id, family_id))
+        
+        con.commit()
+    
+    return corsify(jsonify({"ok": True, "message": "Member updated successfully"}), origin)
+
+@app.delete("/api/family/<family_id>/member/<member_id>")
+def remove_family_member(family_id: str, member_id: str):
+    """Remove a member from the family (admin only)"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+    
+    with_db()
+    with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+        # Check if user has admin permissions for this family
+        cur.execute("""
+            SELECT role FROM tenant_users 
+            WHERE user_id = %s AND tenant_id = %s
+        """, (user["id"], family_id))
+        membership = cur.fetchone()
+        
+        if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
+            return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
+        
+        # Verify member exists in family
+        cur.execute("""
+            SELECT u.id, tu.role FROM users u
+            JOIN tenant_users tu ON u.id = tu.user_id
+            WHERE u.id = %s AND tu.tenant_id = %s
+        """, (member_id, family_id))
+        member = cur.fetchone()
+        
+        if not member:
+            return corsify(jsonify({"ok": False, "error": "Member not found"}), origin), 404
+        
+        # Prevent removing the last owner
+        if member["role"] == "OWNER":
+            cur.execute("""
+                SELECT COUNT(*) as owner_count FROM tenant_users 
+                WHERE tenant_id = %s AND role = 'OWNER'
+            """, (family_id,))
+            owner_count = cur.fetchone()["owner_count"]
+            
+            if owner_count <= 1:
+                return corsify(jsonify({"ok": False, "error": "Cannot remove the last owner"}), origin), 400
+        
+        # Prevent self-removal
+        if member_id == user["id"]:
+            return corsify(jsonify({"ok": False, "error": "Cannot remove yourself"}), origin), 400
+        
+        # Remove member from family
+        cur.execute("""
+            DELETE FROM tenant_users 
+            WHERE user_id = %s AND tenant_id = %s
+        """, (member_id, family_id))
+        
+        con.commit()
+    
+    return corsify(jsonify({"ok": True, "message": "Member removed successfully"}), origin)
+
 @app.post("/auth/invite-member")
 def invite_family_member():
     """Invite a new member to join a family"""
@@ -1305,67 +1780,103 @@ def invite_family_member():
         if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
             return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
         
-        # Check if email is already a member (only if email provided)
-        if email:
-            cur.execute("""
-                SELECT u.id FROM users u
-                JOIN tenant_users tu ON u.id = tu.user_id
-                WHERE u.email = %s AND tu.tenant_id = %s
-            """, (email, family_id))
-            if cur.fetchone():
-                return corsify(jsonify({"ok": False, "error": "User is already a member"}), origin), 409
+        # Get family info for the invitation
+        cur.execute("""
+            SELECT name, slug FROM tenants WHERE id = %s
+        """, (family_id,))
+        family = cur.fetchone()
+        if not family:
+            return corsify(jsonify({"ok": False, "error": "Family not found"}), origin), 404
         
-        # Create user if they don't exist
-        new_user_id = None
-        if email:
-            cur.execute("SELECT id FROM users WHERE email = %s", (email,))
-            existing_user = cur.fetchone()
+        # For children under 16, create them directly without sending an email
+        if is_child_under_16:
+            # Check if child already exists by name (since no email)
+            cur.execute("""
+                SELECT up.user_id FROM user_profiles up
+                JOIN tenant_users tu ON up.user_id = tu.user_id
+                WHERE up.display_name = %s AND tu.tenant_id = %s
+            """, (name, family_id))
+            if cur.fetchone():
+                return corsify(jsonify({"ok": False, "error": "Child with this name already exists in family"}), origin), 409
             
-            if existing_user:
-                new_user_id = existing_user["id"]
-            else:
-                # Create new user with email
-                new_user_id = str(uuid4())
-                cur.execute("""
-                    INSERT INTO users (id, email, global_role)
-                    VALUES (%s, %s, 'USER')
-                """, (new_user_id, email))
-        else:
             # Create user without email (for kids under 16)
             new_user_id = str(uuid4())
-            # Generate a unique email placeholder for kids
             child_email = f"child.{new_user_id}@kinjar.internal"
             cur.execute("""
                 INSERT INTO users (id, email, global_role)
                 VALUES (%s, %s, 'USER')
             """, (new_user_id, child_email))
+            
+            # Create profile
+            cur.execute("""
+                INSERT INTO user_profiles (user_id, display_name, birthdate)
+                VALUES (%s, %s, %s)
+            """, (new_user_id, name, birth_date if birthdate else None))
+            
+            # Add to family
+            cur.execute("""
+                INSERT INTO tenant_users (user_id, tenant_id, role)
+                VALUES (%s, %s, %s)
+            """, (new_user_id, family_id, role))
+            
+            con.commit()
+            
+            return corsify(jsonify({
+                "ok": True, 
+                "message": f"Child {name} added to family successfully",
+                "userId": new_user_id,
+                "assignedRole": role,
+                "emailSent": False
+            }), origin)
         
-        # Create or update profile
-        cur.execute("""
-            INSERT INTO user_profiles (user_id, display_name, birthdate)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (user_id) DO UPDATE SET
-                display_name = EXCLUDED.display_name,
-                birthdate = EXCLUDED.birthdate,
-                updated_at = now()
-        """, (new_user_id, name, birth_date if birthdate else None))
+        # For adults and teens (16+), send an invitation email
+        if not email:
+            return corsify(jsonify({"ok": False, "error": "Email is required for members 16 and older"}), origin), 400
         
-        # Add to family
+        # Check if email is already a member
         cur.execute("""
-            INSERT INTO tenant_users (user_id, tenant_id, role)
-            VALUES (%s, %s, %s)
-        """, (new_user_id, family_id, role))
+            SELECT u.id FROM users u
+            JOIN tenant_users tu ON u.id = tu.user_id
+            WHERE u.email = %s AND tu.tenant_id = %s
+        """, (email, family_id))
+        if cur.fetchone():
+            return corsify(jsonify({"ok": False, "error": "User is already a member"}), origin), 409
+        
+        # Check if there's already a pending invitation for this email
+        cur.execute("""
+            SELECT id FROM tenant_invitations 
+            WHERE email = %s AND tenant_id = %s AND status = 'pending'
+        """, (email, family_id))
+        existing_invitation = cur.fetchone()
+        
+        if existing_invitation:
+            return corsify(jsonify({"ok": False, "error": "Invitation already sent to this email"}), origin), 409
+        
+        # Create invitation token and record
+        invite_id = str(uuid4())
+        invite_token = str(uuid4()).replace('-', '')  # Clean token for URL
+        expires_at = datetime.datetime.now() + datetime.timedelta(days=7)  # 7 day expiry
+        
+        cur.execute("""
+            INSERT INTO tenant_invitations (
+                id, tenant_id, invited_by, email, role, 
+                invite_token, expires_at, status
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
+        """, (invite_id, family_id, user["id"], email, role, invite_token, expires_at))
         
         con.commit()
         
-        # TODO: Send invitation email if user doesn't have a password
+        # Send invitation email
+        email_sent = send_invitation_email(email, name, family["name"], invite_token, family["slug"])
         
-    return corsify(jsonify({
-        "ok": True, 
-        "message": "Member invited successfully",
-        "userId": new_user_id,
-        "assignedRole": role
-    }), origin)
+        return corsify(jsonify({
+            "ok": True, 
+            "message": "Invitation sent successfully",
+            "invitationId": invite_id,
+            "assignedRole": role,
+            "emailSent": email_sent,
+            "expiresAt": expires_at.isoformat()
+        }), origin)
 
 # ---------------- Signup Request (Queue) ----------------
 @app.post("/signup/request")
