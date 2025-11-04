@@ -3136,6 +3136,99 @@ def delete_post(post_id: str):
         return corsify(jsonify({"ok": False, "error": "delete_failed"}), origin), 500
 
 
+@app.patch("/api/posts/<post_id>")
+def edit_post(post_id: str):
+    """Edit a post's content."""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    # Get request data
+    data = request.get_json() or {}
+    content = data.get("content", "").strip()
+    if not content:
+        return corsify(jsonify({"ok": False, "error": "content_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Check if post exists and user has permission
+                cur.execute(
+                    """
+                        SELECT p.id, p.tenant_id, p.author_id, p.content, t.slug AS tenant_slug
+                        FROM content_posts p
+                        JOIN tenants t ON p.tenant_id = t.id
+                        WHERE p.id = %s
+                    """,
+                    (post_id,),
+                )
+                post = cur.fetchone()
+
+                if not post or post["tenant_slug"] != tenant_slug:
+                    return corsify(jsonify({"ok": False, "error": "post_not_found"}), origin), 404
+
+                # Check if user is the author or has admin permissions
+                user_is_author = post["author_id"] == user["id"]
+                if not user_is_author:
+                    # Check if user has admin permissions for this tenant
+                    cur.execute(
+                        """
+                            SELECT role FROM tenant_members
+                            WHERE tenant_id = %s AND user_id = %s
+                        """,
+                        (post["tenant_id"], user["id"]),
+                    )
+                    membership = cur.fetchone()
+                    if not membership or membership["role"] not in {"ADMIN", "OWNER"}:
+                        return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                # Update the post content
+                cur.execute(
+                    """
+                        UPDATE content_posts
+                        SET content = %s, updated_at = now()
+                        WHERE id = %s
+                        RETURNING *
+                    """,
+                    (content, post_id),
+                )
+                updated_post = cur.fetchone()
+                con.commit()
+
+                if not updated_post:
+                    return corsify(jsonify({"ok": False, "error": "update_failed"}), origin), 500
+
+                # Get additional post details for response
+                cur.execute(
+                    """
+                        SELECT 
+                            p.*,
+                            u.name AS author_name,
+                            u.avatar_color AS author_avatar_color,
+                            t.name AS tenant_name,
+                            t.slug AS tenant_slug
+                        FROM content_posts p
+                        JOIN users u ON p.author_id = u.id
+                        JOIN tenants t ON p.tenant_id = t.id
+                        WHERE p.id = %s
+                    """,
+                    (post_id,),
+                )
+                full_post = cur.fetchone()
+
+                return corsify(jsonify({"ok": True, "post": dict(full_post)}), origin)
+
+    except Exception as e:
+        log.exception("Failed to edit post")
+        return corsify(jsonify({"ok": False, "error": "edit_failed"}), origin), 500
+
+
 @app.post("/api/posts/<post_id>/comments")
 def add_post_comment(post_id: str):
     """Add a comment to a post"""
