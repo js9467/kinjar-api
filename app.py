@@ -1203,11 +1203,15 @@ def invite_family_member():
         return corsify(err, origin)
     
     data = request.get_json(silent=True) or {}
+    log.info(f"[INVITE] Received data: {data}")
+    
     email = (data.get("email") or "").strip().lower()
     name = (data.get("name") or "").strip()
     family_id = data.get("familyId")
     birthdate = data.get("birthdate")
     role = data.get("role", "ADULT")
+    
+    log.info(f"[INVITE] Parsed - name: '{name}', familyId: '{family_id}', email: '{email}', role: '{role}'")
     
     # Calculate age if birthdate is provided
     age = None
@@ -1228,6 +1232,7 @@ def invite_family_member():
         return corsify(jsonify({"ok": False, "error": "Email is required for users 16 and older"}), origin), 400
     
     if not name or not family_id:
+        log.error(f"[INVITE] Missing required fields - name: '{name}', familyId: '{family_id}'")
         return corsify(jsonify({"ok": False, "error": "Missing required fields (name, familyId)"}), origin), 400
     
     if role not in TENANT_ROLES:
@@ -3694,12 +3699,14 @@ def edit_post(post_id: str):
                     """
                         SELECT 
                             p.*,
-                            u.name AS author_name,
-                            u.avatar_color AS author_avatar_color,
+                            u.email as author_email,
+                            up.display_name AS author_name,
+                            up.avatar_url AS author_avatar,
                             t.name AS tenant_name,
                             t.slug AS tenant_slug
                         FROM content_posts p
                         JOIN users u ON p.author_id = u.id
+                        LEFT JOIN user_profiles up ON u.id = up.user_id
                         JOIN tenants t ON p.tenant_id = t.id
                         WHERE p.id = %s
                     """,
@@ -3723,9 +3730,9 @@ def edit_post(post_id: str):
                 return corsify(jsonify({"ok": True, "post": post_dict}), origin)
 
     except Exception as e:
-        log.exception("Failed to edit post")
+        log.exception(f"Failed to edit post {post_id}: {str(e)}")
         # Updated error handling for better post edit reliability
-        return corsify(jsonify({"ok": False, "error": "edit_failed"}), origin), 500
+        return corsify(jsonify({"ok": False, "error": "edit_failed", "details": str(e)}), origin), 500
 
 
 @app.post("/api/posts/<post_id>/comments")
