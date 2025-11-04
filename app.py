@@ -4353,10 +4353,11 @@ def edit_post(post_id: str):
                     # Allow if user is ADMIN/OWNER
                     has_admin_permission = membership and membership["role"] in {"ADMIN", "OWNER"}
                     
-                    # Allow if user is ADULT and post author is a child (for "post as child" feature)
-                    has_adult_child_permission = False
+                    # Allow if user is ADULT and post author is NOT an adult
+                    # This covers: children, non-existent users (from "post as" feature), etc.
+                    has_adult_edit_permission = False
                     if membership and membership["role"] == "ADULT":
-                        # Check if the post author is a child in the same family
+                        # Check if the post author is an adult in the same family
                         cur.execute(
                             """
                                 SELECT role FROM tenant_users
@@ -4366,14 +4367,17 @@ def edit_post(post_id: str):
                         )
                         author_membership = cur.fetchone()
                         log.info(f"Edit permission check - Post author membership: {author_membership}")
-                        if author_membership and author_membership["role"].startswith("CHILD"):
-                            has_adult_child_permission = True
-                            log.info(f"Edit permission check - Adult user can edit child post. Author role: {author_membership['role']}")
+                        
+                        # Allow editing if author is NOT an adult (or doesn't exist)
+                        if not author_membership or author_membership["role"] != "ADULT":
+                            has_adult_edit_permission = True
+                            author_role = author_membership["role"] if author_membership else "No membership found"
+                            log.info(f"Edit permission check - Adult can edit non-adult post. Author role: {author_role}")
                         else:
-                            log.info(f"Edit permission check - Author is not a child. Author role: {author_membership['role'] if author_membership else 'No membership found'}")
+                            log.info(f"Edit permission check - Cannot edit adult post. Author role: {author_membership['role']}")
                     
-                    if not (has_admin_permission or has_adult_child_permission):
-                        log.info(f"Edit permission check - DENIED. Admin permission: {has_admin_permission}, Adult-child permission: {has_adult_child_permission}")
+                    if not (has_admin_permission or has_adult_edit_permission):
+                        log.info(f"Edit permission check - DENIED. Admin permission: {has_admin_permission}, Adult edit permission: {has_adult_edit_permission}")
                         return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
 
                 # Update the post content
