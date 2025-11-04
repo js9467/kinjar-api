@@ -3188,6 +3188,11 @@ def create_post():
         # Default unknown values to family
         visibility = "family"
         is_public = False
+    
+    # Support "post as" feature - allow posting as another member (e.g., child)
+    # Frontend sends author_id when user selects a different member from dropdown
+    author_id = body.get("author_id", user["id"])
+    log.info(f"[DEBUG] Post author_id: {author_id} (logged-in user: {user['id']})")
 
     if not title and not content:
         return corsify(jsonify({"ok": False, "error": "content_required"}), origin), 400
@@ -3202,16 +3207,17 @@ def create_post():
                 if not tenant:
                     return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
 
-                # Check user is member of tenant (temporarily disabled for demo)
-                # cur.execute("""
-                #     SELECT role FROM tenant_users 
-                #     WHERE user_id = %s AND tenant_id = %s
-                # """, (user["id"], tenant["id"]))
-                # membership = cur.fetchone()
-                # if not membership:
-                #     return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+                # Verify author_id is a member of the tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (author_id, tenant["id"]))
+                author_membership = cur.fetchone()
+                if not author_membership:
+                    log.warning(f"[DEBUG] author_id {author_id} is not a member of tenant {tenant['id']}")
+                    return corsify(jsonify({"ok": False, "error": "author_not_tenant_member"}), origin), 403
 
-            post = create_content_post(con, tenant["id"], user["id"], title, content, 
+            post = create_content_post(con, tenant["id"], author_id, title, content, 
                                      media_id, media_url, content_type, is_public, visibility)
             
             audit("post_created", tenant=tenant_slug, post_id=post["id"], title=title)
