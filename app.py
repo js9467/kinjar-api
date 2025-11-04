@@ -436,6 +436,7 @@ def db_connect_once():
                   tenant_id    uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
                   invited_by   uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                   email        text NOT NULL,
+                  invited_name text,
                   role         text NOT NULL DEFAULT 'MEMBER',
                   status       text NOT NULL DEFAULT 'pending', -- pending, accepted, expired, revoked
                   invite_token text UNIQUE NOT NULL,
@@ -451,6 +452,12 @@ def db_connect_once():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_tenant_invitations_token
                   ON tenant_invitations (invite_token) WHERE status = 'pending';
+            """)
+            
+            # Migration: Add invited_name column if it doesn't exist
+            cur.execute("""
+                ALTER TABLE tenant_invitations 
+                ADD COLUMN IF NOT EXISTS invited_name text;
             """)
 
             # User profiles for additional info
@@ -1311,11 +1318,14 @@ def auth_register():
             
             # If this is an invitation-based registration, add user to family
             if invitation:
-                # Create user profile with name from invitation if available
+                # Use the invited name from invitation, or fall back to email prefix
+                display_name = invitation.get("invited_name") or email.split('@')[0]
+                
+                # Create user profile with name from invitation
                 cur.execute("""
                     INSERT INTO user_profiles (user_id, display_name)
                     VALUES (%s, %s)
-                """, (uid, email.split('@')[0]))  # Use email prefix as default name
+                """, (uid, display_name))
                 
                 # Add user to family with invited role
                 cur.execute("""
@@ -1913,10 +1923,10 @@ def invite_family_member():
             
             cur.execute("""
                 INSERT INTO tenant_invitations (
-                    id, tenant_id, invited_by, email, role, 
+                    id, tenant_id, invited_by, email, invited_name, role, 
                     invite_token, expires_at, status
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
-            """, (invite_id, family_id, user["id"], email, role, invite_token, expires_at))
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending')
+            """, (invite_id, family_id, user["id"], email, name, role, invite_token, expires_at))
             
             con.commit()
             
