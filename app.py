@@ -29,13 +29,15 @@ app = Flask(__name__)
 # Configure CORS to allow requests from Kinjar subdomains
 CORS(app, 
      origins=[
-         'https://*.kinjar.com',  # All Kinjar subdomains
-         'http://localhost:3000', # Local development
-         'https://kinjar.vercel.app', # Vercel deployments
-         'https://*.vercel.app'   # Preview deployments
+         'https://slaughterbeck.kinjar.com',  # Specific subdomain
+         'https://kinjar.com',               # Main domain
+         'https://www.kinjar.com',           # WWW subdomain
+         'http://localhost:3000',            # Local development
+         'https://kinjar.vercel.app',        # Vercel deployments
      ],
      allow_headers=['Content-Type', 'Authorization', 'x-tenant-slug'],
-     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
+     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+     supports_credentials=True
 )
 
 # Configure Flask for larger file uploads. Some iOS Live Photos and newer
