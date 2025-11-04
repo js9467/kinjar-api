@@ -4252,7 +4252,7 @@ def delete_post(post_id: str):
                         (user["id"], post["tenant_id"]),
                     )
                     membership = cur.fetchone()
-                    if not membership or membership["role"] not in {"ADMIN", "OWNER"}:
+                    if not membership or membership["role"] not in {"ADMIN", "OWNER", "ADULT"}:
                         return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
 
                 cur.execute(
