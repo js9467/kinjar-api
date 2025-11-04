@@ -1697,7 +1697,7 @@ def remove_family_member(family_id: str, member_id: str):
         """, (user["id"], family_id))
         membership = cur.fetchone()
         
-        if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
+        if not membership or membership["role"] not in ["OWNER", "ADMIN", "ADULT"]:
             return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
         
         # Verify member exists in family
@@ -5153,7 +5153,7 @@ def remove_family_member_by_slug(member_id: str):
                 # Check requesting user is admin/owner of tenant
                 cur.execute("""
                     SELECT role FROM tenant_users 
-                    WHERE user_id = %s AND tenant_id = %s AND role IN ('ADMIN', 'OWNER')
+                    WHERE user_id = %s AND tenant_id = %s AND role IN ('ADMIN', 'OWNER', 'ADULT')
                 """, (user["id"], tenant["id"]))
                 requester_membership = cur.fetchone()
                 if not requester_membership:
