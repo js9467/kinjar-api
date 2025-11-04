@@ -3222,7 +3222,20 @@ def edit_post(post_id: str):
                 )
                 full_post = cur.fetchone()
 
-                return corsify(jsonify({"ok": True, "post": dict(full_post)}), origin)
+                if not full_post:
+                    # This shouldn't happen but let's handle it gracefully
+                    log.error(f"Post {post_id} not found after successful update")
+                    return corsify(jsonify({"ok": False, "error": "post_not_found_after_update"}), origin), 500
+
+                # Convert to dict and ensure all values are JSON serializable
+                post_dict = dict(full_post)
+                
+                # Convert datetime objects to ISO strings
+                for key, value in post_dict.items():
+                    if hasattr(value, 'isoformat'):
+                        post_dict[key] = value.isoformat()
+
+                return corsify(jsonify({"ok": True, "post": post_dict}), origin)
 
     except Exception as e:
         log.exception("Failed to edit post")
