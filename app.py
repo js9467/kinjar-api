@@ -1843,8 +1843,8 @@ def invite_family_member():
             membership = cur.fetchone()
             
             log.info(f"[INVITE] User membership: {membership}")
-            if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
-                log.error(f"[INVITE] Permission denied - membership: {membership}, required roles: ['OWNER', 'ADMIN']")
+            if not membership or membership["role"] not in ["OWNER", "ADMIN", "ADULT"]:
+                log.error(f"[INVITE] Permission denied - membership: {membership}, required roles: ['OWNER', 'ADMIN', 'ADULT']")
                 return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
             
             # Get family info for the invitation
