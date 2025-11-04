@@ -4629,8 +4629,7 @@ def edit_comment(comment_id: str):
         return corsify(jsonify({"ok": False, "error": "edit_failed"}), origin), 500
 
 
-@app.delete("/api/comments/<int:comment_id>")
-@app.options("/api/comments/<int:comment_id>")
+@app.route("/api/comments/<int:comment_id>", methods=['DELETE', 'OPTIONS'])
 def delete_comment(comment_id):
     origin = request.headers.get('Origin')
     
