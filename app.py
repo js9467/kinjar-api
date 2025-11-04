@@ -4,6 +4,7 @@ import time
 import json
 import logging
 import datetime
+from datetime import timedelta
 from uuid import uuid4
 from typing import Optional, List, Dict, Any
 import smtplib
@@ -565,6 +566,36 @@ def db_connect_once():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_content_visibility_tenant_granted
                   ON content_visibility (tenant_id, granted_at DESC);
+            """)
+
+            # Family creation invitations - for inviting new families
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS family_creation_invitations (
+                  id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                  token                uuid UNIQUE NOT NULL DEFAULT gen_random_uuid(),
+                  email                text NOT NULL,
+                  invited_name         text NOT NULL,
+                  message              text,
+                  invited_by_user_id   uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  requesting_tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                  status               text DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'expired')),
+                  created_at           timestamptz NOT NULL DEFAULT now(),
+                  expires_at           timestamptz NOT NULL,
+                  accepted_at          timestamptz,
+                  created_tenant_id    uuid REFERENCES tenants(id) ON DELETE SET NULL
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_family_creation_invitations_token
+                  ON family_creation_invitations (token);
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_family_creation_invitations_email
+                  ON family_creation_invitations (email);
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_family_creation_invitations_requesting
+                  ON family_creation_invitations (requesting_tenant_id, created_at DESC);
             """)
 
         DB_READY = True
@@ -5107,6 +5138,124 @@ def respond_to_family_connection(connection_id: str):
         log.exception("Failed to respond to family connection")
         return corsify(jsonify({"ok": False, "error": "response_failed"}), origin), 500
 
+@app.post("/api/families/invite-new-family")
+def invite_new_family():
+    """Invite someone to create a new family with automatic connection"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    body = request.get_json(silent=True) or {}
+    email = body.get("email", "").strip().lower()
+    name = body.get("name", "").strip()
+    message = body.get("message", "").strip()
+
+    if not email or not name:
+        return corsify(jsonify({"ok": False, "error": "email_and_name_required"}), origin), 400
+
+    # Get requesting tenant from user's current context
+    requesting_tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+    if not requesting_tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get requesting tenant
+                cur.execute("SELECT id, slug, name FROM tenants WHERE slug = %s", (requesting_tenant_slug,))
+                requesting_tenant = cur.fetchone()
+                if not requesting_tenant:
+                    return corsify(jsonify({"ok": False, "error": "requesting_family_not_found"}), origin), 404
+
+                # Check user is admin/owner of requesting tenant
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s AND role IN ('ADMIN', 'OWNER')
+                """, (user["id"], requesting_tenant["id"]))
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                # Check if email is already registered
+                cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+                existing_user = cur.fetchone()
+                if existing_user:
+                    return corsify(jsonify({"ok": False, "error": "email_already_registered"}), origin), 409
+
+                # Create family creation invitation
+                invitation_id = str(uuid4())
+                invitation_token = str(uuid4())
+                expires_at = datetime.utcnow() + timedelta(days=7)  # 7 days to accept
+                
+                cur.execute("""
+                    INSERT INTO family_creation_invitations 
+                    (id, token, email, invited_name, message, invited_by_user_id, 
+                     requesting_tenant_id, expires_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                """, (invitation_id, invitation_token, email, name, message, 
+                     user["id"], requesting_tenant["id"], expires_at))
+                invitation = cur.fetchone()
+
+                # Send invitation email
+                try:
+                    base_url = request.headers.get("Origin", "https://kinjar.com")
+                    invitation_url = f"{base_url}/auth/create-family?token={invitation_token}"
+                    
+                    email_subject = f"Join Kinjar and Connect with {requesting_tenant['name']}"
+                    email_body = f"""
+Hello {name},
+
+{user.get('display_name', user['email'])} from {requesting_tenant['name']} has invited you to join Kinjar, a safe family social platform.
+
+{message if message else f"We'd love to connect our families on Kinjar!"}
+
+Kinjar is a private social platform designed for families to share memories and stay connected safely. When you create your family space, you'll automatically be connected with {requesting_tenant['name']}.
+
+To accept this invitation and create your family space:
+{invitation_url}
+
+This invitation expires in 7 days.
+
+Welcome to the Kinjar family!
+
+Best regards,
+The Kinjar Team
+                    """
+                    
+                    success = send_invitation_email(
+                        email=email,
+                        name=name,
+                        family_name=requesting_tenant['name'],
+                        invitation_token=invitation_token,
+                        family_slug=requesting_tenant['slug']
+                    )
+                    
+                    if not success:
+                        log.warning(f"Failed to send family creation invitation email to {email}")
+                
+                except Exception as e:
+                    log.exception(f"Failed to send family creation invitation email to {email}")
+
+            audit("family_creation_invitation_sent", 
+                  invited_email=email,
+                  invited_name=name,
+                  requesting_family=requesting_tenant_slug,
+                  invited_by=user["email"])
+            
+            return corsify(jsonify({
+                "ok": True, 
+                "invitation": dict(invitation),
+                "message": f"Invitation sent to {email}",
+                "expires_at": expires_at.isoformat()
+            }), origin)
+
+    except Exception as e:
+        log.exception("Failed to send family creation invitation")
+        return corsify(jsonify({"ok": False, "error": "invitation_failed"}), origin), 500
+
 @app.get("/api/families/settings")
 def get_family_settings():
     """Get family settings for current tenant"""
@@ -5915,6 +6064,298 @@ def create_family():
     except Exception as e:
         log.exception("Failed to create family")
         return corsify(jsonify({"ok": False, "error": "creation_failed"}), origin), 500
+
+@app.post("/families/create-with-invitation")
+def create_family_with_invitation():
+    """Create a new family from a family creation invitation"""
+    origin = request.headers.get("Origin")
+    data = request.get_json(silent=True) or {}
+    
+    invitation_token = data.get("invitationToken", "").strip()
+    family_name = data.get("familyName", "").strip()
+    subdomain = data.get("subdomain", "").strip().lower()
+    description = data.get("description", "").strip()
+    admin_name = data.get("adminName", "").strip()
+    admin_email = data.get("adminEmail", "").strip().lower()
+    password = data.get("password", "")
+    is_public = data.get("isPublic", False)
+
+    # Validation
+    if not all([invitation_token, family_name, subdomain, admin_name, admin_email, password]):
+        return corsify(jsonify({"ok": False, "error": "Missing required fields"}), origin), 400
+    
+    if len(password) < 8:
+        return corsify(jsonify({"ok": False, "error": "Password must be at least 8 characters"}), origin), 400
+    
+    if not re.match(r'^[a-z0-9-]+$', subdomain) or len(subdomain) < 3 or len(subdomain) > 20:
+        return corsify(jsonify({"ok": False, "error": "Invalid subdomain format"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get and validate invitation
+                cur.execute("""
+                    SELECT fci.*, t.name as requesting_family_name, t.slug as requesting_family_slug
+                    FROM family_creation_invitations fci
+                    JOIN tenants t ON fci.requesting_tenant_id = t.id
+                    WHERE fci.token = %s AND fci.status = 'pending' AND fci.expires_at > NOW()
+                """, (invitation_token,))
+                invitation = cur.fetchone()
+                
+                if not invitation:
+                    return corsify(jsonify({"ok": False, "error": "Invalid or expired invitation"}), origin), 400
+                
+                if invitation["email"].lower() != admin_email.lower():
+                    return corsify(jsonify({"ok": False, "error": "Email doesn't match invitation"}), origin), 400
+
+                # Check if subdomain/email already exists
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (subdomain,))
+                if cur.fetchone():
+                    return corsify(jsonify({"ok": False, "error": "Subdomain already taken"}), origin), 400
+                
+                cur.execute("SELECT id FROM users WHERE email = %s", (admin_email,))
+                if cur.fetchone():
+                    return corsify(jsonify({"ok": False, "error": "Email already registered"}), origin), 400
+                
+                # Create user
+                user_id = str(uuid4())
+                password_hash = ph.hash(password)
+                cur.execute("""
+                    INSERT INTO users (id, email, password_hash, global_role)
+                    VALUES (%s, %s, %s, 'USER') RETURNING *
+                """, (user_id, admin_email, password_hash))
+                user = cur.fetchone()
+                
+                # Create user profile
+                cur.execute("""
+                    INSERT INTO user_profiles (user_id, display_name)
+                    VALUES (%s, %s)
+                """, (user_id, admin_name))
+                
+                # Create family (tenant)
+                family_id = str(uuid4())
+                cur.execute("""
+                    INSERT INTO tenants (id, slug, name, schema, region)
+                    VALUES (%s, %s, %s, 'public', 'us-east-1') RETURNING *
+                """, (family_id, subdomain, family_name))
+                family = cur.fetchone()
+                
+                # Create family settings
+                cur.execute("""
+                    INSERT INTO family_settings (tenant_id, description, is_public)
+                    VALUES (%s, %s, %s)
+                """, (family_id, description, is_public))
+                
+                # Add admin as OWNER of the family
+                cur.execute("""
+                    INSERT INTO tenant_users (user_id, tenant_id, role)
+                    VALUES (%s, %s, 'OWNER')
+                """, (user_id, family_id))
+                
+                # Mark invitation as accepted
+                cur.execute("""
+                    UPDATE family_creation_invitations 
+                    SET status = 'accepted', accepted_at = NOW(), created_tenant_id = %s
+                    WHERE id = %s
+                """, (family_id, invitation["id"]))
+                
+                # Create automatic family connection
+                connection_id = str(uuid4())
+                cur.execute("""
+                    INSERT INTO family_connections 
+                    (id, requesting_tenant_id, target_tenant_id, requested_by, status, responded_by, responded_at)
+                    VALUES (%s, %s, %s, %s, 'accepted', %s, NOW())
+                """, (connection_id, invitation["requesting_tenant_id"], family_id, 
+                     invitation["invited_by_user_id"], user_id))
+
+                # Generate JWT token
+                now = int(datetime.datetime.utcnow().timestamp())
+                token = sign_jwt({"uid": user_id, "iat": now, "exp": now + JWT_TTL_MIN * 60})
+
+        user_data = {
+            "id": user_id,
+            "name": admin_name,
+            "email": admin_email,
+            "avatarColor": "#3B82F6",
+            "globalRole": "USER",
+            "memberships": [{
+                "familyId": family_id,
+                "familySlug": subdomain,
+                "familyName": family_name,
+                "memberId": user_id,
+                "role": "OWNER",
+                "joinedAt": datetime.datetime.utcnow().isoformat()
+            }],
+            "createdAt": datetime.datetime.utcnow().isoformat()
+        }
+
+        family_data = {
+            "id": family_id,
+            "name": family_name,
+            "slug": subdomain,
+            "role": "OWNER",
+            "memberCount": 1,
+            "createdAt": datetime.datetime.utcnow().isoformat(),
+            "connectedTo": invitation["requesting_family_name"]
+        }
+
+        audit("family_created_from_invitation", 
+              family_id=family_id, 
+              family_slug=subdomain, 
+              admin_email=admin_email,
+              invitation_id=invitation["id"],
+              requesting_family=invitation["requesting_family_slug"])
+        
+        resp = make_response(jsonify({
+            "ok": True,
+            "token": token,
+            "user": user_data,
+            "family": family_data,
+            "message": f"Family created and connected to {invitation['requesting_family_name']}"
+        }))
+        set_session_cookie(resp, token)
+        return corsify(resp, origin)
+
+    except Exception as e:
+        log.exception("Failed to create family from invitation")
+        return corsify(jsonify({"ok": False, "error": "creation_failed"}), origin), 500
+
+@app.get("/api/families/invitation/<invitation_token>")
+def get_family_creation_invitation(invitation_token: str):
+    """Get family creation invitation details"""
+    origin = request.headers.get("Origin")
+    
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT fci.*, t.name as requesting_family_name, t.slug as requesting_family_slug,
+                       u.email as invited_by_email, up.display_name as invited_by_name
+                FROM family_creation_invitations fci
+                JOIN tenants t ON fci.requesting_tenant_id = t.id
+                JOIN users u ON fci.invited_by_user_id = u.id
+                LEFT JOIN user_profiles up ON u.id = up.user_id
+                WHERE fci.token = %s AND fci.status = 'pending' AND fci.expires_at > NOW()
+            """, (invitation_token,))
+            invitation = cur.fetchone()
+            
+            if not invitation:
+                return corsify(jsonify({"ok": False, "error": "Invalid or expired invitation"}), origin), 404
+            
+            invitation_data = {
+                "id": invitation["id"],
+                "email": invitation["email"],
+                "invitedName": invitation["invited_name"],
+                "message": invitation["message"],
+                "requestingFamily": {
+                    "name": invitation["requesting_family_name"],
+                    "slug": invitation["requesting_family_slug"]
+                },
+                "invitedBy": {
+                    "email": invitation["invited_by_email"],
+                    "name": invitation["invited_by_name"] or invitation["invited_by_email"]
+                },
+                "expiresAt": invitation["expires_at"].isoformat(),
+                "createdAt": invitation["created_at"].isoformat()
+            }
+            
+            return corsify(jsonify({"ok": True, "invitation": invitation_data}), origin)
+            
+    except Exception as e:
+        log.exception("Failed to get family creation invitation")
+        return corsify(jsonify({"ok": False, "error": "invitation_fetch_failed"}), origin), 500
+
+@app.get("/api/families/search")
+def search_families():
+    """Search for discoverable families"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    search_query = request.args.get("q", "").strip()
+    limit = min(max(int(request.args.get("limit", "20")), 1), 100)
+    offset = max(int(request.args.get("offset", "0")), 0)
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get current user's family context to exclude from results
+                current_tenant_slug = request.headers.get("x-tenant-slug", "").strip()
+                current_tenant_id = None
+                if current_tenant_slug:
+                    cur.execute("SELECT id FROM tenants WHERE slug = %s", (current_tenant_slug,))
+                    current_tenant = cur.fetchone()
+                    if current_tenant:
+                        current_tenant_id = current_tenant["id"]
+
+                # Search for families that are public/discoverable
+                query = """
+                    SELECT t.id, t.slug, t.name, t.created_at,
+                           fs.description, fs.family_photo, fs.theme_color,
+                           COUNT(tu.user_id) as member_count
+                    FROM tenants t
+                    JOIN family_settings fs ON t.id = fs.tenant_id
+                    LEFT JOIN tenant_users tu ON t.id = tu.tenant_id
+                    WHERE fs.is_public = true
+                """
+                params = []
+
+                # Exclude current family
+                if current_tenant_id:
+                    query += " AND t.id != %s"
+                    params.append(current_tenant_id)
+
+                # Add search filter if provided
+                if search_query:
+                    query += " AND (LOWER(t.name) LIKE %s OR LOWER(fs.description) LIKE %s)"
+                    search_param = f"%{search_query.lower()}%"
+                    params.extend([search_param, search_param])
+
+                query += """
+                    GROUP BY t.id, t.slug, t.name, t.created_at, fs.description, fs.family_photo, fs.theme_color
+                    ORDER BY t.name
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([limit, offset])
+
+                cur.execute(query, params)
+                families = cur.fetchall()
+
+                # Check connection status for each family
+                family_results = []
+                for family in families:
+                    connection_status = "none"
+                    if current_tenant_id:
+                        # Check if there's already a connection or pending request
+                        cur.execute("""
+                            SELECT status FROM family_connections 
+                            WHERE (requesting_tenant_id = %s AND target_tenant_id = %s)
+                               OR (requesting_tenant_id = %s AND target_tenant_id = %s)
+                        """, (current_tenant_id, family["id"], family["id"], current_tenant_id))
+                        connection = cur.fetchone()
+                        if connection:
+                            connection_status = connection["status"]
+
+                    family_results.append({
+                        "id": family["id"],
+                        "slug": family["slug"],
+                        "name": family["name"],
+                        "description": family["description"],
+                        "familyPhoto": family["family_photo"],
+                        "themeColor": family["theme_color"] or "#2563eb",
+                        "memberCount": family["member_count"],
+                        "createdAt": family["created_at"].isoformat() if family["created_at"] else None,
+                        "connectionStatus": connection_status
+                    })
+
+            return corsify(jsonify({"ok": True, "families": family_results}), origin)
+
+    except Exception as e:
+        log.exception("Failed to search families")
+        return corsify(jsonify({"ok": False, "error": "search_failed"}), origin), 500
 
 @app.get("/families/check-subdomain/<subdomain>")
 def check_subdomain_availability(subdomain: str):
