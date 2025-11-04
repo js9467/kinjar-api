@@ -1835,13 +1835,16 @@ def invite_family_member():
         with_db()
         with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
             # Check if user has permission to invite members to this family
+            log.info(f"[INVITE] Checking permissions for user {user['id']} in family {family_id}")
             cur.execute("""
                 SELECT role FROM tenant_users 
                 WHERE user_id = %s AND tenant_id = %s
             """, (user["id"], family_id))
             membership = cur.fetchone()
             
+            log.info(f"[INVITE] User membership: {membership}")
             if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
+                log.error(f"[INVITE] Permission denied - membership: {membership}, required roles: ['OWNER', 'ADMIN']")
                 return corsify(jsonify({"ok": False, "error": "Permission denied"}), origin), 403
             
             # Get family info for the invitation
