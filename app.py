@@ -4365,9 +4365,12 @@ def edit_post(post_id: str):
                             (post["tenant_id"], post["author_id"]),
                         )
                         author_membership = cur.fetchone()
+                        log.info(f"Edit permission check - Post author membership: {author_membership}")
                         if author_membership and author_membership["role"].startswith("CHILD"):
                             has_adult_child_permission = True
                             log.info(f"Edit permission check - Adult user can edit child post. Author role: {author_membership['role']}")
+                        else:
+                            log.info(f"Edit permission check - Author is not a child. Author role: {author_membership['role'] if author_membership else 'No membership found'}")
                     
                     if not (has_admin_permission or has_adult_child_permission):
                         log.info(f"Edit permission check - DENIED. Admin permission: {has_admin_permission}, Adult-child permission: {has_adult_child_permission}")
