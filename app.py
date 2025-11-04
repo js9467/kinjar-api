@@ -4934,20 +4934,22 @@ def get_family_by_slug(family_slug: str):
                 "createdAt": family["created_at"].isoformat() if family["created_at"] else None
             }
             
-            # Add more details if user is authenticated and is a member
+            # Add more details if user is authenticated and is a member OR is a global admin
             user = current_user_row()
             if user:
+                # Check if user is a member of the family
                 cur.execute("""
                     SELECT role FROM tenant_users 
                     WHERE user_id = %s AND tenant_id = %s
                 """, (user["id"], family["id"]))
                 membership = cur.fetchone()
-                
-                if membership:
-                    # User is a member, include private details
+                # Check if user is a global admin
+                is_global_admin = user.get("global_role") in ["ROOT", "ADMIN"]
+                if membership or is_global_admin:
+                    # User is a member or global admin, include private details
                     cur.execute("""
                         SELECT u.id, up.display_name as name, u.email, tu.role,
-                               up.avatar_url
+                               up.avatar_url, up.bio, up.quote
                         FROM tenant_users tu
                         JOIN users u ON tu.user_id = u.id
                         LEFT JOIN user_profiles up ON u.id = up.user_id
@@ -4955,7 +4957,6 @@ def get_family_by_slug(family_slug: str):
                         ORDER BY tu.role DESC, u.email ASC
                     """, (family["id"],))
                     members = list(cur.fetchall())
-                    
                     family_data["members"] = [
                         {
                             "id": m["id"],
@@ -4963,11 +4964,13 @@ def get_family_by_slug(family_slug: str):
                             "email": m["email"],
                             "role": m["role"],
                             "joinedAt": None,
-                            "avatarUrl": m["avatar_url"]
+                            "avatarUrl": m["avatar_url"],
+                            "bio": m.get("bio"),
+                            "quote": m.get("quote")
                         }
                         for m in members
                     ]
-                    family_data["userRole"] = membership["role"]
+                    family_data["userRole"] = membership["role"] if membership else user.get("global_role")
 
         return corsify(jsonify({"ok": True, "family": family_data}), origin)
 
