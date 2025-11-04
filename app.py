@@ -4340,7 +4340,7 @@ def edit_post(post_id: str):
                     # Check if user has admin permissions for this tenant
                     cur.execute(
                         """
-                            SELECT role FROM tenant_members
+                            SELECT role FROM tenant_users
                             WHERE tenant_id = %s AND user_id = %s
                         """,
                         (post["tenant_id"], user["id"]),
