@@ -4336,6 +4336,8 @@ def edit_post(post_id: str):
 
                 # Check if user is the author or has admin permissions
                 user_is_author = post["author_id"] == user["id"]
+                log.info(f"Edit permission check - Post ID: {post_id}, Post author_id: {post['author_id']}, User ID: {user['id']}, User is author: {user_is_author}")
+                
                 if not user_is_author:
                     # Check if user has admin permissions for this tenant
                     cur.execute(
@@ -4346,6 +4348,7 @@ def edit_post(post_id: str):
                         (post["tenant_id"], user["id"]),
                     )
                     membership = cur.fetchone()
+                    log.info(f"Edit permission check - Tenant ID: {post['tenant_id']}, User ID: {user['id']}, Membership: {membership}")
                     if not membership or membership["role"] not in {"ADMIN", "OWNER"}:
                         return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
 
