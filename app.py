@@ -5481,8 +5481,11 @@ def invite_new_family():
                 """, (invitation_id, invitation_token, email, name, message, 
                      user["id"], requesting_tenant["id"], expires_at))
                 invitation = cur.fetchone()
+                
+                # Commit the transaction
+                con.commit()
 
-                # Send invitation email
+                # Send invitation email (after commit so we don't lose the invitation if email fails)
                 try:
                     base_url = request.headers.get("Origin", "https://kinjar.com")
                     invitation_url = f"{base_url}/auth/create-family?token={invitation_token}"
@@ -5522,18 +5525,18 @@ The Kinjar Team
                 except Exception as e:
                     log.exception(f"Failed to send family creation invitation email to {email}")
 
-            audit("family_creation_invitation_sent", 
-                  invited_email=email,
-                  invited_name=name,
-                  requesting_family=requesting_tenant_slug,
-                  invited_by=user["email"])
-            
-            return corsify(jsonify({
-                "ok": True, 
-                "invitation": dict(invitation),
-                "message": f"Invitation sent to {email}",
-                "expires_at": expires_at.isoformat()
-            }), origin)
+        audit("family_creation_invitation_sent", 
+              invited_email=email,
+              invited_name=name,
+              requesting_family=requesting_tenant_slug,
+              invited_by=user["email"])
+        
+        return corsify(jsonify({
+            "ok": True, 
+            "invitation": dict(invitation),
+            "message": f"Invitation sent to {email}",
+            "expires_at": expires_at.isoformat()
+        }), origin)
 
     except Exception as e:
         log.exception("Failed to send family creation invitation")
@@ -6451,6 +6454,9 @@ def create_family_with_invitation():
                     VALUES (%s, %s, %s, %s, 'accepted', %s, NOW())
                 """, (connection_id, invitation["requesting_tenant_id"], family_id, 
                      invitation["invited_by_user_id"], user_id))
+                
+                # Commit the transaction
+                con.commit()
 
                 # Generate JWT token
                 now = int(datetime.datetime.utcnow().timestamp())
