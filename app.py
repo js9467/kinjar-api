@@ -5036,6 +5036,7 @@ def list_family_connections():
                     return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
 
                 # Get all connections (incoming and outgoing)
+                tenant_id = tenant["id"]
                 cur.execute("""
                     SELECT 
                         fc.*,
@@ -5064,7 +5065,7 @@ def list_family_connections():
                     LEFT JOIN user_profiles responder_profile ON responder.id = responder_profile.user_id
                     WHERE fc.requesting_tenant_id = %s OR fc.target_tenant_id = %s
                     ORDER BY fc.created_at DESC
-                """, (tenant["id"], tenant["id"], tenant["id"], tenant["id"], tenant["id"], tenant["id"]))
+                """, (tenant_id, tenant_id, tenant_id, tenant_id, tenant_id))
                 
                 connections_raw = [dict(row) for row in cur.fetchall()]
                 
