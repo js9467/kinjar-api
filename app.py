@@ -3603,8 +3603,8 @@ def create_content_post(con, tenant_id: str, author_id: str, title: str, content
         """, (str(uuid4()), tenant_id, author_id, action_type, "content_post", post_id, 
               json.dumps({"title": title, "content_type": content_type, "status": status})))
         
-        # If visibility is 'family_and_connections', automatically share with all connected families
-        if visibility == "family_and_connections" and status == "published":
+        # If visibility is 'family_and_connections' OR 'connections' (legacy), automatically share with all connected families
+        if (visibility == "family_and_connections" or visibility == "connections") and status == "published":
             # Get all connected families
             cur.execute("""
                 SELECT CASE 
@@ -3779,7 +3779,8 @@ def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset:
     with con.cursor(row_factory=dict_row) as cur:
         # Get posts from own tenant and connected families
         # For own family: show all posts regardless of visibility
-        # For connected families: only show posts with visibility='family_and_connections' that are shared in content_visibility
+        # For connected families: show posts with visibility='connections' (legacy) or 'family_and_connections' (new)
+        # Also check content_visibility table for explicitly shared posts
         cur.execute("""
             SELECT DISTINCT
                 p.*,
@@ -3805,8 +3806,7 @@ def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset:
                 -- Own family posts (all visibility levels)
                 p.tenant_id = %s
                 OR
-                -- Connected family posts that are explicitly shared via content_visibility
-                -- (only posts with visibility='family_and_connections' get auto-shared there)
+                -- Connected family posts with connections/family_and_connections visibility
                 (p.tenant_id IN (
                     SELECT CASE 
                         WHEN fc.requesting_tenant_id = %s THEN fc.target_tenant_id
@@ -3815,9 +3815,18 @@ def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset:
                     FROM family_connections fc
                     WHERE (fc.requesting_tenant_id = %s OR fc.target_tenant_id = %s)
                       AND fc.status = 'accepted'
-                ) AND EXISTS (
-                    SELECT 1 FROM content_visibility cv 
-                    WHERE cv.post_id = p.id AND cv.tenant_id = %s
+                ) AND (
+                    -- Legacy: visibility='connections' 
+                    p.visibility = 'connections'
+                    OR
+                    -- New: visibility='family_and_connections'
+                    p.visibility = 'family_and_connections'
+                    OR
+                    -- Also check content_visibility table for explicitly shared posts
+                    EXISTS (
+                        SELECT 1 FROM content_visibility cv 
+                        WHERE cv.post_id = p.id AND cv.tenant_id = %s
+                    )
                 ))
             )
             ORDER BY p.published_at DESC
