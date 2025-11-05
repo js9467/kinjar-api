@@ -3167,11 +3167,13 @@ def get_media_info(media_id: str):
         with pool.connection() as con:
             with con.cursor(row_factory=dict_row) as cur:
                 # Get media with tenant info - try by ID first, then by filename
+                # Allow both 'uploaded' and 'completed' status for backward compatibility
                 cur.execute("""
                     SELECT mo.*, t.id as tenant_id, t.slug as tenant_slug 
                     FROM media_objects mo
                     JOIN tenants t ON mo.tenant = t.slug
-                    WHERE (mo.id = %s OR mo.filename = %s) AND mo.status = 'uploaded'
+                    WHERE (mo.id = %s OR mo.filename = %s) 
+                      AND mo.status IN ('uploaded', 'completed')
                 """, (media_id, media_id))
                 media_obj = cur.fetchone()
                 
@@ -3203,20 +3205,25 @@ def get_media_info(media_id: str):
                 if media_obj.get("external_url"):
                     return redirect(media_obj["external_url"], code=302)
 
-                # Generate signed URL and redirect
-                try:
-                    s3 = s3_client()
-                    signed_url = s3.generate_presigned_url(
-                        ClientMethod="get_object",
-                        Params={"Bucket": S3_BUCKET, "Key": media_obj["r2_key"]},
-                        ExpiresIn=3600,
-                    )
-                    # Redirect to the signed URL instead of returning JSON
-                    return redirect(signed_url, code=302)
-                    
-                except StorageNotConfigured as e:
-                    log.warning("get_media_info requested but storage is not configured: %s", e)
-                    return corsify(jsonify({"ok": False, "error": "storage_not_configured"}), origin), 503
+                # Generate signed URL and redirect (only if r2_key exists)
+                if media_obj.get("r2_key"):
+                    try:
+                        s3 = s3_client()
+                        signed_url = s3.generate_presigned_url(
+                            ClientMethod="get_object",
+                            Params={"Bucket": S3_BUCKET, "Key": media_obj["r2_key"]},
+                            ExpiresIn=3600,
+                        )
+                        # Redirect to the signed URL instead of returning JSON
+                        return redirect(signed_url, code=302)
+                        
+                    except StorageNotConfigured as e:
+                        log.warning("get_media_info requested but storage is not configured: %s", e)
+                        return corsify(jsonify({"ok": False, "error": "storage_not_configured"}), origin), 503
+                else:
+                    # No r2_key and no external_url - media object is incomplete
+                    log.error(f"Media object {media_id} has no r2_key or external_url")
+                    return corsify(jsonify({"ok": False, "error": "media_unavailable"}), origin), 404
 
     except Exception as e:
         log.exception("Failed to get media info")
