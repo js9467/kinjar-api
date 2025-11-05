@@ -403,6 +403,15 @@ def db_connect_once():
                 WHERE visibility IS NULL;
             """)
             
+            # Add posted_as_id column for tracking when parents post on behalf of children
+            cur.execute("""
+                DO $$ BEGIN
+                    ALTER TABLE content_posts ADD COLUMN posted_as_id uuid REFERENCES users(id) ON DELETE SET NULL;
+                EXCEPTION
+                    WHEN duplicate_column THEN NULL;
+                END $$;
+            """)
+            
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_content_posts_tenant_published
                   ON content_posts (tenant_id, published_at DESC) WHERE status = 'published';
@@ -430,48 +439,6 @@ def db_connect_once():
                   ON content_comments (post_id, created_at ASC) WHERE status = 'published';
             """)
 
-            # User invitations to tenants
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS tenant_invitations (
-                  id           uuid PRIMARY KEY,
-                  tenant_id    uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-                  invited_by   uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                  email        text NOT NULL,
-                  invited_name text,
-                  role         text NOT NULL DEFAULT 'MEMBER',
-                  status       text NOT NULL DEFAULT 'pending', -- pending, accepted, expired, revoked
-                  invite_token text UNIQUE NOT NULL,
-                  expires_at   timestamptz NOT NULL,
-                  created_at   timestamptz NOT NULL DEFAULT now(),
-                  accepted_at  timestamptz
-                );
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tenant_invitations_tenant_status
-                  ON tenant_invitations (tenant_id, status);
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tenant_invitations_token
-                  ON tenant_invitations (invite_token) WHERE status = 'pending';
-            """)
-            
-            # Migration: Add invited_name column if it doesn't exist
-            cur.execute("""
-                ALTER TABLE tenant_invitations 
-                ADD COLUMN IF NOT EXISTS invited_name text;
-            """)
-
-            # User profiles for additional info
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS user_profiles (
-                  user_id     uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                  display_name text,
-                  avatar_url  text,
-                  bio         text,
-                  phone       text,
-                  updated_at  timestamptz NOT NULL DEFAULT now()
-                );
-            """)
 
             # Add new columns for enhanced user profiles
             try:
@@ -964,6 +931,88 @@ The Kinjar Team
         log.error(f"Failed to send invitation email to {email}: {str(e)}")
         return False
 
+def send_family_creation_invite_email(email: str, name: str, requesting_family_name: str, invitation_token: str, origin: Optional[str] = None):
+    """Send an email inviting someone to create a new family (auto-connect flow)."""
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        log.warning(f"SMTP not configured, skipping email to {email}")
+        return False
+
+    try:
+        # Create the invitation URL (prefer request Origin when available)
+        base_url = origin or f"https://{ROOT_DOMAIN}"
+        invitation_url = f"{base_url}/auth/create-family?token={invitation_token}"
+
+        subject = f"Create your family on Kinjar and connect with {requesting_family_name}"
+
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <div style="text-align: center; margin-bottom: 30px;">
+                <h1 style="color: #3B82F6;">You're invited to Kinjar</h1>
+            </div>
+            <div style="background: #F8FAFC; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                <h2 style="color: #1F2937; margin-top: 0;">Hi {name}!</h2>
+                <p style="color: #4B5563; font-size: 16px; line-height: 1.5;">
+                    <strong>{requesting_family_name}</strong> invited you to create your own family space on Kinjar.
+                    When you finish, your families will be automatically connected so it's easy to share together.
+                </p>
+            </div>
+            <div style="text-align: center; margin: 30px 0;">
+                <a href="{invitation_url}"
+                   style="background: #3B82F6; color: white; padding: 14px 28px;
+                          text-decoration: none; border-radius: 6px; font-weight: bold;
+                          font-size: 16px; display: inline-block;">
+                    Create your family
+                </a>
+            </div>
+            <div style="border-top: 1px solid #E5E7EB; padding-top: 20px; margin-top: 30px;">
+                <p style="color: #6B7280; font-size: 14px;">
+                    If the button doesn't work, copy and paste this link into your browser:
+                </p>
+                <p style="color: #3B82F6; font-size: 14px; word-break: break-all;">
+                    {invitation_url}
+                </p>
+                <p style="color: #6B7280; font-size: 12px; margin-top: 20px;">
+                    This invitation will expire in 7 days.
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+
+        text_body = f"""
+Hi {name}!
+
+{requesting_family_name} invited you to create your own family on Kinjar.
+When you finish, your families will be automatically connected.
+
+Open this link to get started:
+{invitation_url}
+
+This invitation will expire in 7 days.
+        """
+
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+        msg['To'] = email
+
+        text_part = MIMEText(text_body, 'plain')
+        html_part = MIMEText(html_body, 'html')
+        msg.attach(text_part)
+        msg.attach(html_part)
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+
+        log.info(f"Family creation invitation email sent successfully to {email}")
+        return True
+    except Exception as e:
+        log.error(f"Failed to send family creation invitation email to {email}: {str(e)}")
+        return False
+
 def send_family_invitation_accepted_email(inviter_email: str, inviter_name: str, family_name: str, accepter_name: str, accepter_family_name: str):
     """Send notification email when someone accepts a family invitation"""
     if not SMTP_USERNAME or not SMTP_PASSWORD:
@@ -1058,9 +1107,7 @@ you sent a family connection invitation to {accepter_name}.
         
     except Exception as e:
         log.error(f"Failed to send family invitation accepted email to {inviter_email}: {str(e)}")
-        return False
-
-def ensure_user_basic(con, email: str) -> Dict[str, Any]:
+        return Falsedef ensure_user_basic(con, email: str) -> Dict[str, Any]:
     email = email.strip().lower()
     if not email:
         raise ValueError("email_required")
@@ -3252,7 +3299,7 @@ def complete_media_upload(upload_id: str):
 
 @app.get("/api/media/<media_id>")
 def get_media_info(media_id: str):
-    """Get media object info with signed URL"""
+    """Get media object and redirect to signed URL or serve from storage"""
     origin = request.headers.get("Origin")
     user = current_user_row()
     if not user:
@@ -3262,13 +3309,15 @@ def get_media_info(media_id: str):
         with_db()
         with pool.connection() as con:
             with con.cursor(row_factory=dict_row) as cur:
-                # Get media with tenant info
+                # Get media with tenant info - try by ID first, then by filename
+                # Allow both 'uploaded' and 'completed' status for backward compatibility
                 cur.execute("""
                     SELECT mo.*, t.id as tenant_id, t.slug as tenant_slug 
                     FROM media_objects mo
                     JOIN tenants t ON mo.tenant = t.slug
-                    WHERE mo.id = %s AND mo.status = 'uploaded'
-                """, (media_id,))
+                    WHERE (mo.id = %s OR mo.filename = %s) 
+                      AND mo.status IN ('uploaded', 'completed')
+                """, (media_id, media_id))
                 media_obj = cur.fetchone()
                 
                 if not media_obj:
@@ -3295,22 +3344,29 @@ def get_media_info(media_id: str):
                     if not cur.fetchone():
                         return corsify(jsonify({"ok": False, "error": "access_denied"}), origin), 403
 
-                # Generate signed URL
-                try:
-                    s3 = s3_client()
-                    signed_url = s3.generate_presigned_url(
-                        ClientMethod="get_object",
-                        Params={"Bucket": S3_BUCKET, "Key": media_obj["r2_key"]},
-                        ExpiresIn=3600,
-                    )
-                    media_dict = dict(media_obj)
-                    media_dict["url"] = signed_url
-                    
-                    return corsify(jsonify({"ok": True, "media": media_dict}), origin)
-                    
-                except StorageNotConfigured as e:
-                    log.warning("get_media_info requested but storage is not configured: %s", e)
-                    return corsify(jsonify({"ok": False, "error": "storage_not_configured"}), origin), 503
+                # If external URL exists, redirect to it
+                if media_obj.get("external_url"):
+                    return redirect(media_obj["external_url"], code=302)
+
+                # Generate signed URL and redirect (only if r2_key exists)
+                if media_obj.get("r2_key"):
+                    try:
+                        s3 = s3_client()
+                        signed_url = s3.generate_presigned_url(
+                            ClientMethod="get_object",
+                            Params={"Bucket": S3_BUCKET, "Key": media_obj["r2_key"]},
+                            ExpiresIn=3600,
+                        )
+                        # Redirect to the signed URL instead of returning JSON
+                        return redirect(signed_url, code=302)
+                        
+                    except StorageNotConfigured as e:
+                        log.warning("get_media_info requested but storage is not configured: %s", e)
+                        return corsify(jsonify({"ok": False, "error": "storage_not_configured"}), origin), 503
+                else:
+                    # No r2_key and no external_url - media object is incomplete
+                    log.error(f"Media object {media_id} has no r2_key or external_url")
+                    return corsify(jsonify({"ok": False, "error": "media_unavailable"}), origin), 404
 
     except Exception as e:
         log.exception("Failed to get media info")
@@ -3614,7 +3670,7 @@ def upload_complete():
 # Helper functions for video blog features
 def create_content_post(con, tenant_id: str, author_id: str, title: str, content: str = "", 
                        media_id: str = None, media_url: str = None, content_type: str = "video_blog", 
-                       is_public: bool = True, visibility: str = "family") -> Dict[str, Any]:
+                       is_public: bool = True, visibility: str = "family", posted_as_id: str = None) -> Dict[str, Any]:
     """Create a new content post (video blog entry)"""
     post_id = str(uuid4())
     published_at = datetime.datetime.now(datetime.timezone.utc)
@@ -3675,19 +3731,19 @@ def create_content_post(con, tenant_id: str, author_id: str, title: str, content
         
         if has_visibility:
             cur.execute("""
-                INSERT INTO content_posts (id, tenant_id, author_id, media_id, title, content, 
+                INSERT INTO content_posts (id, tenant_id, author_id, posted_as_id, media_id, title, content, 
                                          content_type, is_public, visibility, status, published_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
-            """, (post_id, tenant_id, author_id, actual_media_id, title, content, content_type, is_public, visibility, status, published_at))
+            """, (post_id, tenant_id, author_id, posted_as_id, actual_media_id, title, content, content_type, is_public, visibility, status, published_at))
         else:
             # Fallback for databases without visibility column
             cur.execute("""
-                INSERT INTO content_posts (id, tenant_id, author_id, media_id, title, content, 
+                INSERT INTO content_posts (id, tenant_id, author_id, posted_as_id, media_id, title, content, 
                                          content_type, is_public, status, published_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
-            """, (post_id, tenant_id, author_id, actual_media_id, title, content, content_type, is_public, status, published_at))
+            """, (post_id, tenant_id, author_id, posted_as_id, actual_media_id, title, content, content_type, is_public, status, published_at))
         
         post = cur.fetchone()
         
@@ -3699,23 +3755,77 @@ def create_content_post(con, tenant_id: str, author_id: str, title: str, content
         """, (str(uuid4()), tenant_id, author_id, action_type, "content_post", post_id, 
               json.dumps({"title": title, "content_type": content_type, "status": status})))
         
+        # If visibility is 'family_and_connections' OR 'connections' (legacy), automatically share with all connected families
+        if (visibility == "family_and_connections" or visibility == "connections") and status == "published":
+            # Get all connected families
+            cur.execute("""
+                SELECT CASE 
+                    WHEN fc.requesting_tenant_id = %s THEN fc.target_tenant_id
+                    ELSE fc.requesting_tenant_id
+                END as connected_tenant_id
+                FROM family_connections fc
+                WHERE (fc.requesting_tenant_id = %s OR fc.target_tenant_id = %s)
+                  AND fc.status = 'accepted'
+            """, (tenant_id, tenant_id, tenant_id))
+            connected_families = cur.fetchall()
+            
+            # Share post with each connected family
+            for family in connected_families:
+                try:
+                    cur.execute("""
+                        INSERT INTO content_visibility (post_id, tenant_id, granted_by)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (post_id, tenant_id) DO NOTHING
+                    """, (post_id, family["connected_tenant_id"], author_id))
+                    log.info(f"Auto-shared post {post_id} with connected family {family['connected_tenant_id']}")
+                except Exception as e:
+                    log.warning(f"Failed to auto-share post {post_id} with family {family['connected_tenant_id']}: {e}")
+        
     return post
 
 def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
     """Get published posts for a tenant with author and media info"""
     try:
         with con.cursor(row_factory=dict_row) as cur:
-            # First check if visibility column exists
+            # First check if visibility and posted_as_id columns exist
             cur.execute("""
                 SELECT column_name 
                 FROM information_schema.columns 
-                WHERE table_name = 'content_posts' AND column_name = 'visibility'
+                WHERE table_name = 'content_posts' AND column_name IN ('visibility', 'posted_as_id')
             """)
-            has_visibility = cur.fetchone() is not None
-            log.info(f"Visibility column exists: {has_visibility}")
+            existing_columns = {row['column_name'] for row in cur.fetchall()}
+            has_visibility = 'visibility' in existing_columns
+            has_posted_as = 'posted_as_id' in existing_columns
+            log.info(f"Visibility column exists: {has_visibility}, Posted_as_id column exists: {has_posted_as}")
             
-            # Build query with conditional visibility column
-            if has_visibility:
+            # Build query with conditional columns
+            if has_visibility and has_posted_as:
+                cur.execute("""
+                    SELECT 
+                        p.*,
+                        u.email as author_email,
+                        up.display_name as author_name,
+                        up.avatar_url as author_avatar,
+                        up2.display_name as posted_as_name,
+                        up2.avatar_url as posted_as_avatar,
+                        m.filename as media_filename,
+                        m.content_type as media_content_type,
+                        m.r2_key as media_r2_key,
+                        m.external_url as media_external_url,
+                        m.thumbnail_url as media_thumbnail,
+                        m.duration_seconds as media_duration
+                    FROM content_posts p
+                    JOIN users u ON p.author_id = u.id
+                    LEFT JOIN user_profiles up ON u.id = up.user_id
+                    LEFT JOIN users u2 ON p.posted_as_id = u2.id
+                    LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
+                    LEFT JOIN media_objects m ON p.media_id = m.id
+                    WHERE p.tenant_id = %s AND p.status = 'published'
+                    ORDER BY p.published_at DESC
+                    LIMIT %s OFFSET %s
+                """, (tenant_id, limit, offset))
+            elif has_visibility:
+                # Has visibility but not posted_as_id yet
                 cur.execute("""
                     SELECT 
                         p.*,
@@ -3737,7 +3847,7 @@ def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> L
                     LIMIT %s OFFSET %s
                 """, (tenant_id, limit, offset))
             else:
-                # Fallback query without visibility column
+                # Fallback query without visibility or posted_as_id columns
                 cur.execute("""
                     SELECT 
                         p.*,
@@ -3805,7 +3915,8 @@ def add_comment(con, post_id: str, author_id: str, content: str, parent_id: str 
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (str(uuid4()), tenant_row['tenant_id'], author_id, "comment_added", "comment", comment_id,
                   json.dumps({"post_id": post_id, "content_preview": content[:100]})))
-        
+    
+    con.commit()
     return comment
 
 def get_connected_families(con, tenant_id: str) -> List[Dict[str, Any]]:
@@ -3847,32 +3958,76 @@ def get_connected_families(con, tenant_id: str) -> List[Dict[str, Any]]:
 def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
     """Get posts visible to this family from connected families"""
     with con.cursor(row_factory=dict_row) as cur:
-        # Get posts from own tenant and connected families
+        # Check if posted_as_id column exists
         cur.execute("""
-            SELECT DISTINCT
-                p.*,
-                u.email as author_email,
-                up.display_name as author_name,
-                up.avatar_url as author_avatar,
-                m.filename as media_filename,
-                m.content_type as media_content_type,
-                m.r2_key as media_r2_key,
-                m.thumbnail_url as media_thumbnail,
-                m.duration_seconds as media_duration,
-                t.slug as family_slug,
-                t.name as family_name,
-                fs.family_photo as family_photo
-            FROM content_posts p
-            JOIN users u ON p.author_id = u.id
-            JOIN tenants t ON p.tenant_id = t.id
-            LEFT JOIN user_profiles up ON u.id = up.user_id
-            LEFT JOIN media_objects m ON p.media_id = m.id
-            LEFT JOIN family_settings fs ON t.id = fs.tenant_id
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'content_posts' AND column_name = 'posted_as_id'
+        """)
+        has_posted_as = cur.fetchone() is not None
+        
+        # Build query based on column availability
+        if has_posted_as:
+            query = """
+                SELECT DISTINCT
+                    p.*,
+                    u.email as author_email,
+                    up.display_name as author_name,
+                    up.avatar_url as author_avatar,
+                    up2.display_name as posted_as_name,
+                    up2.avatar_url as posted_as_avatar,
+                    m.filename as media_filename,
+                    m.content_type as media_content_type,
+                    m.r2_key as media_r2_key,
+                    m.thumbnail_url as media_thumbnail,
+                    m.duration_seconds as media_duration,
+                    m.external_url as media_external_url,
+                    t.slug as family_slug,
+                    t.name as family_name,
+                    fs.family_photo as family_photo
+                FROM content_posts p
+                JOIN users u ON p.author_id = u.id
+                JOIN tenants t ON p.tenant_id = t.id
+                LEFT JOIN user_profiles up ON u.id = up.user_id
+                LEFT JOIN users u2 ON p.posted_as_id = u2.id
+                LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
+                LEFT JOIN media_objects m ON p.media_id = m.id
+                LEFT JOIN family_settings fs ON t.id = fs.tenant_id
+            """
+        else:
+            query = """
+                SELECT DISTINCT
+                    p.*,
+                    u.email as author_email,
+                    up.display_name as author_name,
+                    up.avatar_url as author_avatar,
+                    m.filename as media_filename,
+                    m.content_type as media_content_type,
+                    m.r2_key as media_r2_key,
+                    m.thumbnail_url as media_thumbnail,
+                    m.duration_seconds as media_duration,
+                    m.external_url as media_external_url,
+                    t.slug as family_slug,
+                    t.name as family_name,
+                    fs.family_photo as family_photo
+                FROM content_posts p
+                JOIN users u ON p.author_id = u.id
+                JOIN tenants t ON p.tenant_id = t.id
+                LEFT JOIN user_profiles up ON u.id = up.user_id
+                LEFT JOIN media_objects m ON p.media_id = m.id
+                LEFT JOIN family_settings fs ON t.id = fs.tenant_id
+            """
+        
+        # Get posts from own tenant and connected families
+        # For own family: show all posts regardless of visibility
+        # For connected families: show posts with visibility='connections' (legacy) or 'family_and_connections' (new)
+        # Also check content_visibility table for explicitly shared posts
+        cur.execute(query + """
             WHERE p.status = 'published' AND (
-                -- Own family posts
+                -- Own family posts (all visibility levels)
                 p.tenant_id = %s
                 OR
-                -- Connected family posts that are shared
+                -- Connected family posts with connections/family_and_connections visibility
                 (p.tenant_id IN (
                     SELECT CASE 
                         WHEN fc.requesting_tenant_id = %s THEN fc.target_tenant_id
@@ -3881,9 +4036,18 @@ def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset:
                     FROM family_connections fc
                     WHERE (fc.requesting_tenant_id = %s OR fc.target_tenant_id = %s)
                       AND fc.status = 'accepted'
-                ) AND EXISTS (
-                    SELECT 1 FROM content_visibility cv 
-                    WHERE cv.post_id = p.id AND cv.tenant_id = %s
+                ) AND (
+                    -- Legacy: visibility='connections' 
+                    p.visibility = 'connections'
+                    OR
+                    -- New: visibility='family_and_connections'
+                    p.visibility = 'family_and_connections'
+                    OR
+                    -- Also check content_visibility table for explicitly shared posts
+                    EXISTS (
+                        SELECT 1 FROM content_visibility cv 
+                        WHERE cv.post_id = p.id AND cv.tenant_id = %s
+                    )
                 ))
             )
             ORDER BY p.published_at DESC
@@ -3951,22 +4115,28 @@ def create_post():
     is_public = body.get("is_public", True)
     
     # Map visibility to is_public for new format
-    visibility = body.get("visibility", "family")
+    visibility = body.get("visibility", "family_and_connections")
     if visibility == "public":
-        is_public = True
-    elif visibility in ["family", "connections"]:
+        # Legacy support - map public to family_and_connections
+        is_public = False
+        visibility = "family_and_connections"
+    elif visibility == "family_and_connections":
+        is_public = False
+    elif visibility == "family_only":
         is_public = False
     else:
-        # Default unknown values to family
-        visibility = "family"
+        # Default unknown values to family_and_connections
+        visibility = "family_and_connections"
         is_public = False
     
     # Support "post as" feature - allow posting as another member (e.g., child)
-    # Frontend sends author_id when user selects a different member from dropdown
-    author_id = body.get("author_id", user["id"])
-    log.info(f"[DEBUG] Post author_id from request: {author_id}")
-    log.info(f"[DEBUG] Logged-in user ID: {user['id']}")
-    log.info(f"[DEBUG] Request body author_id field: {body.get('author_id')}")
+    # Frontend sends posted_as_id when user selects a different member from dropdown
+    # author_id is ALWAYS the logged-in user who actually created the post
+    author_id = user["id"]  # The actual logged-in user
+    posted_as_id = body.get("posted_as_id")  # The member being posted as (can be different)
+    
+    log.info(f"[DEBUG] Post author_id (logged-in user): {author_id}")
+    log.info(f"[DEBUG] Post posted_as_id (displayed author): {posted_as_id}")
 
     if not title and not content:
         return corsify(jsonify({"ok": False, "error": "content_required"}), origin), 400
@@ -3981,18 +4151,19 @@ def create_post():
                 if not tenant:
                     return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
 
-                # Verify author_id is a member of the tenant
-                cur.execute("""
-                    SELECT role FROM tenant_users 
-                    WHERE user_id = %s AND tenant_id = %s
-                """, (author_id, tenant["id"]))
-                author_membership = cur.fetchone()
-                if not author_membership:
-                    log.warning(f"[DEBUG] author_id {author_id} is not a member of tenant {tenant['id']}")
-                    return corsify(jsonify({"ok": False, "error": "author_not_tenant_member"}), origin), 403
+                # Verify posted_as_id is a member of the tenant if provided
+                if posted_as_id:
+                    cur.execute("""
+                        SELECT role FROM tenant_users 
+                        WHERE user_id = %s AND tenant_id = %s
+                    """, (posted_as_id, tenant["id"]))
+                    posted_as_membership = cur.fetchone()
+                    if not posted_as_membership:
+                        log.warning(f"[DEBUG] posted_as_id {posted_as_id} is not a member of tenant {tenant['id']}")
+                        return corsify(jsonify({"ok": False, "error": "posted_as_not_tenant_member"}), origin), 403
 
             post = create_content_post(con, tenant["id"], author_id, title, content, 
-                                     media_id, media_url, content_type, is_public, visibility)
+                                     media_id, media_url, content_type, is_public, visibility, posted_as_id)
             
             # Enrich post with author details for frontend
             with con.cursor(row_factory=dict_row) as cur:
@@ -4011,6 +4182,24 @@ def create_post():
                     post['author_name'] = author_info.get('author_name') or author_info.get('author_email', 'User')
                     post['author_avatar'] = author_info.get('author_avatar')
                     post['author_avatar_color'] = author_info.get('avatar_color')
+                
+                # If there's a posted_as_id, get that person's info too
+                if posted_as_id:
+                    cur.execute("""
+                        SELECT 
+                            u.email as posted_as_email,
+                            up.display_name as posted_as_name,
+                            up.avatar_url as posted_as_avatar,
+                            up.avatar_color as posted_as_avatar_color
+                        FROM users u
+                        LEFT JOIN user_profiles up ON u.id = up.user_id
+                        WHERE u.id = %s
+                    """, (posted_as_id,))
+                    posted_as_info = cur.fetchone()
+                    if posted_as_info:
+                        post['posted_as_name'] = posted_as_info.get('posted_as_name') or posted_as_info.get('posted_as_email', 'User')
+                        post['posted_as_avatar'] = posted_as_info.get('posted_as_avatar')
+                        post['posted_as_avatar_color'] = posted_as_info.get('posted_as_avatar_color')
             
             audit("post_created", tenant=tenant_slug, post_id=post["id"], title=title)
             return corsify(jsonify({"ok": True, "post": post}), origin)
@@ -4067,9 +4256,19 @@ def get_public_feed():
                 # Create media object if media exists
                 media = None
                 if post.get("media_filename"):
+                    # Use external URL if available, otherwise construct backend API URL
+                    if post["media_external_url"]:
+                        media_url = post["media_external_url"]
+                    else:
+                        # Use full backend URL with HTTPS for media endpoint
+                        proto = request.headers.get('X-Forwarded-Proto', 'https')
+                        host = request.headers.get('X-Forwarded-Host') or request.headers.get('Host') or request.host
+                        backend_host = f"{proto}://{host}".rstrip('/')
+                        media_url = f"{backend_host}/api/media/{post['media_filename']}"
+                    
                     media = {
                         "type": "image" if post["media_content_type"] and "image" in post["media_content_type"] else "video",
-                        "url": post["media_external_url"] or f"/media/{post['media_filename']}",
+                        "url": media_url,
                         "alt": post["title"]
                     }
 
@@ -4127,14 +4326,20 @@ def list_posts():
             else:
                 posts = get_tenant_posts(con, tenant["id"], limit, offset)
             
-            # Add signed URLs for media
+            # Add signed URLs for media and format properly
             try:
                 media_s3 = s3_client()
             except StorageNotConfigured as e:
                 media_s3 = None
                 log.warning("list_posts skipping media URL sign because storage is not configured: %s", e)
 
+            # Get backend host with proper protocol (HTTPS on Fly.io)
+            proto = request.headers.get('X-Forwarded-Proto', 'https')
+            host = request.headers.get('X-Forwarded-Host') or request.headers.get('Host') or request.host
+            backend_host = f"{proto}://{host}".rstrip('/')
+            
             for post in posts:
+                # Generate signed URL if using R2/S3
                 if post.get("media_r2_key") and media_s3:
                     try:
                         signed_url = media_s3.generate_presigned_url(
@@ -4145,6 +4350,12 @@ def list_posts():
                         post["media_url"] = signed_url
                     except Exception:
                         log.exception(f"Failed to generate signed URL for {post['media_r2_key']}")
+                # If we have an external URL (e.g., Vercel Blob), use that directly
+                elif post.get("media_external_url") and not post.get("media_url"):
+                    post["media_url"] = post["media_external_url"]
+                # If we have a media filename but no URL, use backend API endpoint
+                elif post.get("media_filename") and not post.get("media_url"):
+                    post["media_url"] = f"{backend_host}/api/media/{post['media_filename']}"
 
             return corsify(jsonify({"ok": True, "posts": posts}), origin)
 
@@ -4644,22 +4855,60 @@ def add_post_comment(post_id: str):
             # Verify post exists and user can comment
             with con.cursor(row_factory=dict_row) as cur:
                 cur.execute("""
-                    SELECT p.*, t.slug as tenant_slug FROM content_posts p
+                    SELECT 
+                        p.id,
+                        p.tenant_id,
+                        p.author_id,
+                        p.content,
+                        p.media_id,
+                        p.created_at,
+                        p.updated_at,
+                        p.status,
+                        p.visibility,
+                        mo.external_url AS media_url,
+                        t.slug AS tenant_slug
+                    FROM content_posts p
                     JOIN tenants t ON p.tenant_id = t.id
+                    LEFT JOIN media_objects mo ON p.media_id = mo.id
                     WHERE p.id = %s AND p.status = 'published'
                 """, (post_id,))
                 post = cur.fetchone()
                 if not post:
                     return corsify(jsonify({"ok": False, "error": "post_not_found"}), origin), 404
 
-                # Check user is member of tenant
+                # Check user is member of post's tenant OR has a connected family
                 cur.execute("""
                     SELECT role FROM tenant_users 
                     WHERE user_id = %s AND tenant_id = %s
                 """, (user["id"], post["tenant_id"]))
                 membership = cur.fetchone()
+                
                 if not membership:
-                    return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+                    # Check if user's family is connected to post's family
+                    cur.execute("""
+                        SELECT tu.tenant_id as user_tenant_id
+                        FROM tenant_users tu
+                        WHERE tu.user_id = %s
+                        LIMIT 1
+                    """, (user["id"],))
+                    user_tenant = cur.fetchone()
+                    
+                    if user_tenant:
+                        cur.execute("""
+                            SELECT 1 FROM family_connections fc
+                            WHERE fc.status = 'accepted'
+                            AND (
+                                (fc.requesting_tenant_id = %s AND fc.target_tenant_id = %s)
+                                OR (fc.requesting_tenant_id = %s AND fc.target_tenant_id = %s)
+                            )
+                        """, (user_tenant["user_tenant_id"], post["tenant_id"], 
+                              post["tenant_id"], user_tenant["user_tenant_id"]))
+                        connection = cur.fetchone()
+                        
+                        if not connection:
+                            return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+                    else:
+                        return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
 
             comment = add_comment(con, post_id, user["id"], content, parent_id)
             
@@ -4754,6 +5003,57 @@ def edit_comment(comment_id: str):
     except Exception as e:
         log.exception("Failed to edit comment")
         return corsify(jsonify({"ok": False, "error": "edit_failed"}), origin), 500
+
+@app.delete("/api/comments/<comment_id>")
+def delete_comment_by_uuid(comment_id: str):
+    """Delete a comment by UUID"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get comment details with tenant info
+                cur.execute("""
+                    SELECT c.*, p.tenant_id, t.slug as tenant_slug
+                    FROM content_comments c
+                    JOIN content_posts p ON c.post_id = p.id
+                    JOIN tenants t ON p.tenant_id = t.id
+                    WHERE c.id = %s
+                """, (comment_id,))
+                comment = cur.fetchone()
+                
+                if not comment:
+                    return corsify(jsonify({"ok": False, "error": "comment_not_found"}), origin), 404
+
+                # Check if user is comment author, family admin, or root admin
+                is_author = comment["author_id"] == user["id"]
+                
+                cur.execute("""
+                    SELECT role FROM tenant_users
+                    WHERE tenant_id = %s AND user_id = %s
+                """, (comment["tenant_id"], user["id"]))
+                membership = cur.fetchone()
+                
+                is_admin = membership and membership["role"] in {"ADMIN", "OWNER"}
+                is_root_admin = user.get("is_root_admin", False)
+                
+                if not (is_author or is_admin or is_root_admin):
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                # Delete the comment
+                cur.execute("DELETE FROM content_comments WHERE id = %s", (comment_id,))
+                con.commit()
+
+                audit("comment_deleted", comment_id=comment_id, post_id=comment["post_id"], tenant=comment["tenant_slug"])
+                return corsify(jsonify({"ok": True}), origin)
+
+    except Exception as e:
+        log.exception("Failed to delete comment")
+        return corsify(jsonify({"ok": False, "error": "delete_failed"}), origin), 500
 
 
 @app.route("/api/comments/<int:comment_id>", methods=['DELETE', 'OPTIONS'])
@@ -5132,6 +5432,7 @@ def list_family_connections():
                     return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
 
                 # Get all connections (incoming and outgoing)
+                tenant_id = tenant["id"]
                 cur.execute("""
                     SELECT 
                         fc.*,
@@ -5156,19 +5457,39 @@ def list_family_connections():
                     JOIN tenants target_t ON fc.target_tenant_id = target_t.id
                     JOIN users requester ON fc.requested_by = requester.id
                     LEFT JOIN users responder ON fc.responded_by = responder.id
-                    LEFT JOIN user_profiles requester_profile ON requester.id::text = requester_profile.user_id
-                    LEFT JOIN user_profiles responder_profile ON responder.id::text = responder_profile.user_id
+                    LEFT JOIN user_profiles requester_profile ON requester.id = requester_profile.user_id
+                    LEFT JOIN user_profiles responder_profile ON responder.id = responder_profile.user_id
                     WHERE fc.requesting_tenant_id = %s OR fc.target_tenant_id = %s
                     ORDER BY fc.created_at DESC
-                """, (tenant["id"], tenant["id"], tenant["id"], tenant["id"], tenant["id"], tenant["id"]))
+                """, (tenant_id, tenant_id, tenant_id, tenant_id, tenant_id))
                 
-                connections = [dict(row) for row in cur.fetchall()]
+                connections_raw = [dict(row) for row in cur.fetchall()]
+                
+                # Convert snake_case to camelCase for frontend
+                connections = []
+                for conn in connections_raw:
+                    connections.append({
+                        'id': conn['id'],
+                        'direction': conn['direction'],
+                        'otherFamilySlug': conn['other_family_slug'],
+                        'otherFamilyName': conn['other_family_name'],
+                        'status': conn['status'],
+                        'requestMessage': conn.get('request_message'),
+                        'responseMessage': conn.get('response_message'),
+                        'requesterName': conn['requester_name'],
+                        'responderName': conn.get('responder_name'),
+                        'createdAt': conn['created_at'].isoformat() if conn.get('created_at') else None,
+                        'respondedAt': conn['responded_at'].isoformat() if conn.get('responded_at') else None,
+                    })
 
             return corsify(jsonify({"ok": True, "connections": connections}), origin)
 
     except Exception as e:
         log.exception("Failed to list family connections")
-        return corsify(jsonify({"ok": False, "error": "list_connections_failed"}), origin), 500
+        import traceback
+        error_details = traceback.format_exc()
+        log.error(f"Full traceback: {error_details}")
+        return corsify(jsonify({"ok": False, "error": "list_connections_failed", "details": str(e)}), origin), 500
 
 @app.post("/api/families/connections/<connection_id>/respond")
 def respond_to_family_connection(connection_id: str):
@@ -5274,16 +5595,17 @@ def invite_new_family():
                 if not membership:
                     return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
 
-                # Check if email is already registered
+                # Allow inviting an email even if it's already registered.
+                # This supports inviting existing users to create a new family that will auto-connect.
+                # We still proceed to create an invitation and send an email.
                 cur.execute("SELECT id FROM users WHERE email = %s", (email,))
                 existing_user = cur.fetchone()
-                if existing_user:
-                    return corsify(jsonify({"ok": False, "error": "email_already_registered"}), origin), 409
 
                 # Create family creation invitation
                 invitation_id = str(uuid4())
                 invitation_token = str(uuid4())
-                expires_at = datetime.utcnow() + timedelta(days=7)  # 7 days to accept
+                # Use datetime.datetime.utcnow (module import is `import datetime`)
+                expires_at = datetime.datetime.utcnow() + timedelta(days=7)  # 7 days to accept
                 
                 cur.execute("""
                     INSERT INTO family_creation_invitations 
@@ -5294,39 +5616,18 @@ def invite_new_family():
                 """, (invitation_id, invitation_token, email, name, message, 
                      user["id"], requesting_tenant["id"], expires_at))
                 invitation = cur.fetchone()
+                
+                # Commit the transaction
+                con.commit()
 
-                # Send invitation email
+                # Send invitation email (after commit so we don't lose the invitation if email fails)
                 try:
-                    base_url = request.headers.get("Origin", "https://kinjar.com")
-                    invitation_url = f"{base_url}/auth/create-family?token={invitation_token}"
-                    
-                    email_subject = f"Join Kinjar and Connect with {requesting_tenant['name']}"
-                    email_body = f"""
-Hello {name},
-
-{user.get('display_name', user['email'])} from {requesting_tenant['name']} has invited you to join Kinjar, a safe family social platform.
-
-{message if message else f"We'd love to connect our families on Kinjar!"}
-
-Kinjar is a private social platform designed for families to share memories and stay connected safely. When you create your family space, you'll automatically be connected with {requesting_tenant['name']}.
-
-To accept this invitation and create your family space:
-{invitation_url}
-
-This invitation expires in 7 days.
-
-Welcome to the Kinjar family!
-
-Best regards,
-The Kinjar Team
-                    """
-                    
-                    success = send_invitation_email(
+                    success = send_family_creation_invite_email(
                         email=email,
                         name=name,
-                        family_name=requesting_tenant['name'],
+                        requesting_family_name=requesting_tenant['name'],
                         invitation_token=invitation_token,
-                        family_slug=requesting_tenant['slug']
+                        origin=request.headers.get("Origin")
                     )
                     
                     if not success:
@@ -5335,18 +5636,18 @@ The Kinjar Team
                 except Exception as e:
                     log.exception(f"Failed to send family creation invitation email to {email}")
 
-            audit("family_creation_invitation_sent", 
-                  invited_email=email,
-                  invited_name=name,
-                  requesting_family=requesting_tenant_slug,
-                  invited_by=user["email"])
-            
-            return corsify(jsonify({
-                "ok": True, 
-                "invitation": dict(invitation),
-                "message": f"Invitation sent to {email}",
-                "expires_at": expires_at.isoformat()
-            }), origin)
+        audit("family_creation_invitation_sent", 
+              invited_email=email,
+              invited_name=name,
+              requesting_family=requesting_tenant_slug,
+              invited_by=user["email"])
+        
+        return corsify(jsonify({
+            "ok": True, 
+            "invitation": dict(invitation),
+            "message": f"Invitation sent to {email}",
+            "expires_at": expires_at.isoformat()
+        }), origin)
 
     except Exception as e:
         log.exception("Failed to send family creation invitation")
@@ -6071,29 +6372,46 @@ def create_family():
         with_db()
         with pool.connection() as con:
             with con.cursor(row_factory=dict_row) as cur:
-                # Check if subdomain/email already exists
+                # Check if subdomain already exists
                 cur.execute("SELECT id FROM tenants WHERE slug = %s", (subdomain,))
                 if cur.fetchone():
                     return corsify(jsonify({"ok": False, "error": "Subdomain already taken"}), origin), 400
                 
-                cur.execute("SELECT id FROM users WHERE email = %s", (admin_email,))
-                if cur.fetchone():
-                    return corsify(jsonify({"ok": False, "error": "Email already registered"}), origin), 400
-                
-                # Create user
-                user_id = str(uuid4())
-                password_hash = ph.hash(password)
-                cur.execute("""
-                    INSERT INTO users (id, email, password_hash, global_role)
-                    VALUES (%s, %s, %s, 'USER') RETURNING *
-                """, (user_id, admin_email, password_hash))
-                user = cur.fetchone()
+                # Determine user context: reuse existing account or create a new one
+                cur.execute("SELECT id, password_hash FROM users WHERE email = %s", (admin_email,))
+                existing_user = cur.fetchone()
+                if existing_user:
+                    # Verify password for existing account
+                    try:
+                        ph.verify(existing_user["password_hash"], password)
+                    except Exception:
+                        return corsify(jsonify({"ok": False, "error": "Invalid credentials"}), origin), 401
+                    user_id = existing_user["id"]
+                else:
+                    # Create user
+                    user_id = str(uuid4())
+                    password_hash = ph.hash(password)
+                    cur.execute("""
+                        INSERT INTO users (id, email, password_hash, global_role)
+                        VALUES (%s, %s, %s, 'USER') RETURNING *
+                    """, (user_id, admin_email, password_hash))
+                    user = cur.fetchone()
                 
                 # Create user profile
-                cur.execute("""
-                    INSERT INTO user_profiles (user_id, display_name)
-                    VALUES (%s, %s)
-                """, (user_id, admin_name))
+                # If profile exists, optionally update missing display_name; else create
+                cur.execute("SELECT user_id FROM user_profiles WHERE user_id = %s", (user_id,))
+                has_profile = cur.fetchone()
+                if has_profile:
+                    cur.execute("""
+                        UPDATE user_profiles
+                        SET display_name = COALESCE(NULLIF(display_name, ''), %s)
+                        WHERE user_id = %s
+                    """, (admin_name, user_id))
+                else:
+                    cur.execute("""
+                        INSERT INTO user_profiles (user_id, display_name)
+                        VALUES (%s, %s)
+                    """, (user_id, admin_name))
                 
                 # Create family (tenant)
                 family_id = str(uuid4())
@@ -6205,35 +6523,52 @@ def create_family_with_invitation():
                 if invitation["email"].lower() != admin_email.lower():
                     return corsify(jsonify({"ok": False, "error": "Email doesn't match invitation"}), origin), 400
 
-                # Check if subdomain/email already exists
+                # Check if subdomain already exists
                 cur.execute("SELECT id FROM tenants WHERE slug = %s", (subdomain,))
                 if cur.fetchone():
                     return corsify(jsonify({"ok": False, "error": "Subdomain already taken"}), origin), 400
                 
-                cur.execute("SELECT id FROM users WHERE email = %s", (admin_email,))
-                if cur.fetchone():
-                    return corsify(jsonify({"ok": False, "error": "Email already registered"}), origin), 400
+                # Check if user already exists
+                cur.execute("SELECT id, password_hash FROM users WHERE email = %s", (admin_email,))
+                existing_user = cur.fetchone()
                 
-                # Create user
-                user_id = str(uuid4())
-                password_hash = ph.hash(password)
-                cur.execute("""
-                    INSERT INTO users (id, email, password_hash, global_role)
-                    VALUES (%s, %s, %s, 'USER') RETURNING *
-                """, (user_id, admin_email, password_hash))
-                user = cur.fetchone()
-                
-                # Create user profile
-                cur.execute("""
-                    INSERT INTO user_profiles (user_id, display_name)
-                    VALUES (%s, %s)
-                """, (user_id, admin_name))
+                if existing_user:
+                    # User exists - verify password
+                    try:
+                        ph.verify(existing_user["password_hash"], password)
+                    except Exception:
+                        return corsify(jsonify({"ok": False, "error": "Invalid password"}), origin), 401
+                    
+                    user_id = existing_user["id"]
+                    
+                    # Check if user profile exists, create if not
+                    cur.execute("SELECT user_id FROM user_profiles WHERE user_id = %s", (user_id,))
+                    if not cur.fetchone():
+                        cur.execute("""
+                            INSERT INTO user_profiles (user_id, display_name)
+                            VALUES (%s, %s)
+                        """, (user_id, admin_name))
+                else:
+                    # Create new user
+                    user_id = str(uuid4())
+                    password_hash = ph.hash(password)
+                    cur.execute("""
+                        INSERT INTO users (id, email, password_hash, global_role)
+                        VALUES (%s, %s, %s, 'USER') RETURNING *
+                    """, (user_id, admin_email, password_hash))
+                    user = cur.fetchone()
+                    
+                    # Create user profile
+                    cur.execute("""
+                        INSERT INTO user_profiles (user_id, display_name)
+                        VALUES (%s, %s)
+                    """, (user_id, admin_name))
                 
                 # Create family (tenant)
                 family_id = str(uuid4())
                 cur.execute("""
-                    INSERT INTO tenants (id, slug, name, schema, region)
-                    VALUES (%s, %s, %s, 'public', 'us-east-1') RETURNING *
+                    INSERT INTO tenants (id, slug, name)
+                    VALUES (%s, %s, %s) RETURNING *
                 """, (family_id, subdomain, family_name))
                 family = cur.fetchone()
                 
@@ -6291,6 +6626,9 @@ def create_family_with_invitation():
                     VALUES (%s, %s, %s, %s, 'accepted', %s, NOW())
                 """, (connection_id, invitation["requesting_tenant_id"], family_id, 
                      invitation["invited_by_user_id"], user_id))
+                
+                # Commit the transaction
+                con.commit()
 
                 # Generate JWT token
                 now = int(datetime.datetime.utcnow().timestamp())
