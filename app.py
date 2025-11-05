@@ -6474,8 +6474,8 @@ def create_family_with_invitation():
                 # Create family (tenant)
                 family_id = str(uuid4())
                 cur.execute("""
-                    INSERT INTO tenants (id, slug, name, schema, region)
-                    VALUES (%s, %s, %s, 'public', 'us-east-1') RETURNING *
+                    INSERT INTO tenants (id, slug, name)
+                    VALUES (%s, %s, %s) RETURNING *
                 """, (family_id, subdomain, family_name))
                 family = cur.fetchone()
                 
