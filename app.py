@@ -4720,7 +4720,10 @@ def add_post_comment(post_id: str):
             # Verify post exists and user can comment
             with con.cursor(row_factory=dict_row) as cur:
                 cur.execute("""
-                    SELECT p.*, t.slug as tenant_slug FROM content_posts p
+                    SELECT p.id, p.tenant_id, p.author_id, p.content, p.media_urls, 
+                           p.created_at, p.updated_at, p.status, p.visibility, 
+                           t.slug as tenant_slug 
+                    FROM content_posts p
                     JOIN tenants t ON p.tenant_id = t.id
                     WHERE p.id = %s AND p.status = 'published'
                 """, (post_id,))
