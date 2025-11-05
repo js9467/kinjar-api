@@ -5066,7 +5066,24 @@ def list_family_connections():
                     ORDER BY fc.created_at DESC
                 """, (tenant["id"], tenant["id"], tenant["id"], tenant["id"], tenant["id"], tenant["id"]))
                 
-                connections = [dict(row) for row in cur.fetchall()]
+                connections_raw = [dict(row) for row in cur.fetchall()]
+                
+                # Convert snake_case to camelCase for frontend
+                connections = []
+                for conn in connections_raw:
+                    connections.append({
+                        'id': conn['id'],
+                        'direction': conn['direction'],
+                        'otherFamilySlug': conn['other_family_slug'],
+                        'otherFamilyName': conn['other_family_name'],
+                        'status': conn['status'],
+                        'requestMessage': conn.get('request_message'),
+                        'responseMessage': conn.get('response_message'),
+                        'requesterName': conn['requester_name'],
+                        'responderName': conn.get('responder_name'),
+                        'createdAt': conn['created_at'].isoformat() if conn.get('created_at') else None,
+                        'respondedAt': conn['responded_at'].isoformat() if conn.get('responded_at') else None,
+                    })
 
             return corsify(jsonify({"ok": True, "connections": connections}), origin)
 
