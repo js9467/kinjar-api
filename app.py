@@ -1107,7 +1107,9 @@ you sent a family connection invitation to {accepter_name}.
         
     except Exception as e:
         log.error(f"Failed to send family invitation accepted email to {inviter_email}: {str(e)}")
-        return Falsedef ensure_user_basic(con, email: str) -> Dict[str, Any]:
+        return False
+
+def ensure_user_basic(con, email: str) -> Dict[str, Any]:
     email = email.strip().lower()
     if not email:
         raise ValueError("email_required")
