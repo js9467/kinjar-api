@@ -3156,7 +3156,7 @@ def complete_media_upload(upload_id: str):
 
 @app.get("/api/media/<media_id>")
 def get_media_info(media_id: str):
-    """Get media object info with signed URL"""
+    """Get media object and redirect to signed URL or serve from storage"""
     origin = request.headers.get("Origin")
     user = current_user_row()
     if not user:
@@ -3166,13 +3166,13 @@ def get_media_info(media_id: str):
         with_db()
         with pool.connection() as con:
             with con.cursor(row_factory=dict_row) as cur:
-                # Get media with tenant info
+                # Get media with tenant info - try by ID first, then by filename
                 cur.execute("""
                     SELECT mo.*, t.id as tenant_id, t.slug as tenant_slug 
                     FROM media_objects mo
                     JOIN tenants t ON mo.tenant = t.slug
-                    WHERE mo.id = %s AND mo.status = 'uploaded'
-                """, (media_id,))
+                    WHERE (mo.id = %s OR mo.filename = %s) AND mo.status = 'uploaded'
+                """, (media_id, media_id))
                 media_obj = cur.fetchone()
                 
                 if not media_obj:
@@ -3199,7 +3199,11 @@ def get_media_info(media_id: str):
                     if not cur.fetchone():
                         return corsify(jsonify({"ok": False, "error": "access_denied"}), origin), 403
 
-                # Generate signed URL
+                # If external URL exists, redirect to it
+                if media_obj.get("external_url"):
+                    return redirect(media_obj["external_url"], code=302)
+
+                # Generate signed URL and redirect
                 try:
                     s3 = s3_client()
                     signed_url = s3.generate_presigned_url(
@@ -3207,10 +3211,8 @@ def get_media_info(media_id: str):
                         Params={"Bucket": S3_BUCKET, "Key": media_obj["r2_key"]},
                         ExpiresIn=3600,
                     )
-                    media_dict = dict(media_obj)
-                    media_dict["url"] = signed_url
-                    
-                    return corsify(jsonify({"ok": True, "media": media_dict}), origin)
+                    # Redirect to the signed URL instead of returning JSON
+                    return redirect(signed_url, code=302)
                     
                 except StorageNotConfigured as e:
                     log.warning("get_media_info requested but storage is not configured: %s", e)
