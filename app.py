@@ -4117,7 +4117,10 @@ def list_posts():
                         post["media_url"] = signed_url
                     except Exception:
                         log.exception(f"Failed to generate signed URL for {post['media_r2_key']}")
-                # If we have a media filename but no signed URL, use backend API endpoint
+                # If we have an external URL (e.g., Vercel Blob), use that directly
+                elif post.get("media_external_url") and not post.get("media_url"):
+                    post["media_url"] = post["media_external_url"]
+                # If we have a media filename but no URL, use backend API endpoint
                 elif post.get("media_filename") and not post.get("media_url"):
                     post["media_url"] = f"{backend_host}/api/media/{post['media_filename']}"
 
