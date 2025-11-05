@@ -4403,8 +4403,36 @@ def list_posts():
                 # If we have a media filename but no URL, use backend API endpoint
                 elif post.get("media_filename") and not post.get("media_url"):
                     post["media_url"] = f"{backend_host}/api/media/{post['media_filename']}"
+            
+            # Format posts to ensure proper camelCase and avatar fields
+            formatted_posts = []
+            for post in posts:
+                formatted_post = {
+                    "id": post["id"],
+                    "tenantId": post["tenant_id"],
+                    "authorId": post["author_id"],
+                    "authorName": post.get("posted_as_name") or post.get("author_name") or post.get("author_email", "").split("@")[0],
+                    "authorAvatarColor": post.get("posted_as_avatar_color") or post.get("author_avatar_color") or "#3B82F6",
+                    "authorAvatarUrl": post.get("posted_as_avatar") or post.get("author_avatar"),
+                    "content": post["content"],
+                    "title": post.get("title"),
+                    "mediaUrl": post.get("media_url"),
+                    "mediaType": post.get("media_content_type"),
+                    "createdAt": post.get("created_at").isoformat() if post.get("created_at") else None,
+                    "publishedAt": post.get("published_at").isoformat() if post.get("published_at") else None,
+                    "visibility": post.get("visibility", "family_only"),
+                    "status": post.get("status", "published"),
+                }
+                
+                # Add family info if present (for cross-family posts)
+                if post.get("family_slug"):
+                    formatted_post["familySlug"] = post["family_slug"]
+                    formatted_post["familyName"] = post.get("family_name")
+                    formatted_post["familyThemeColor"] = post.get("family_theme_color") or "#2563eb"
+                
+                formatted_posts.append(formatted_post)
 
-            return corsify(jsonify({"ok": True, "posts": posts}), origin)
+            return corsify(jsonify({"ok": True, "posts": formatted_posts}), origin)
 
     except Exception as e:
         log.exception("Failed to list posts")
@@ -4875,7 +4903,24 @@ def get_post_comments_endpoint(post_id: str):
 
             # Get comments
             comments = get_post_comments(con, post_id)
-            return corsify(jsonify({"ok": True, "comments": comments}), origin)
+            
+            # Format comments with camelCase
+            formatted_comments = []
+            for comment in comments:
+                formatted_comments.append({
+                    "id": comment["id"],
+                    "postId": comment["post_id"],
+                    "authorId": comment["author_id"],
+                    "authorName": comment.get("author_name") or comment.get("author_email", "").split("@")[0],
+                    "authorAvatarColor": comment.get("author_avatar_color") or "#3B82F6",
+                    "authorAvatarUrl": comment.get("author_avatar"),
+                    "content": comment["content"],
+                    "createdAt": comment.get("created_at").isoformat() if comment.get("created_at") else None,
+                    "parentId": comment.get("parent_id"),
+                    "status": comment.get("status", "published")
+                })
+            
+            return corsify(jsonify({"ok": True, "comments": formatted_comments}), origin)
 
     except Exception as e:
         log.exception("Failed to get comments")
@@ -6989,6 +7034,74 @@ def get_family_by_slug(family_slug: str):
     except Exception as e:
         log.exception(f"Failed to get family {family_slug}")
         return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
+
+@app.post("/api/families/<family_id>/upload-photo")
+def upload_family_photo(family_id: str):
+    """Upload a family photo/avatar"""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Verify user is admin of this family
+            cur.execute("""
+                SELECT role FROM tenant_users 
+                WHERE user_id = %s AND tenant_id = %s
+            """, (user["id"], family_id))
+            membership = cur.fetchone()
+            
+            if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
+                if user.get("global_role") != "ROOT":
+                    return corsify(jsonify({"ok": False, "error": "permission_denied"}), origin), 403
+
+            # Get tenant info
+            cur.execute("SELECT slug FROM tenants WHERE id = %s", (family_id,))
+            tenant = cur.fetchone()
+            if not tenant:
+                return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+
+            # Check if file is in request
+            if "file" not in request.files:
+                return corsify(jsonify({"ok": False, "error": "no_file"}), origin), 400
+
+            file = request.files["file"]
+            if not file or file.filename == "":
+                return corsify(jsonify({"ok": False, "error": "empty_file"}), origin), 400
+
+            # Upload to Vercel Blob
+            blob_result = upload_to_vercel_blob(
+                file,
+                tenant_slug=tenant["slug"],
+                user_email=user["email"]
+            )
+            
+            family_photo_url = blob_result.get("url")
+            if not family_photo_url:
+                return corsify(jsonify({"ok": False, "error": "upload_failed"}), origin), 500
+
+            # Update family settings
+            cur.execute("""
+                INSERT INTO family_settings (tenant_id, family_photo)
+                VALUES (%s, %s)
+                ON CONFLICT (tenant_id) DO UPDATE SET
+                    family_photo = EXCLUDED.family_photo,
+                    updated_at = now()
+            """, (family_id, family_photo_url))
+            con.commit()
+
+            audit("family_photo_uploaded", family_id=family_id, actor=user["email"])
+
+            return corsify(jsonify({
+                "ok": True,
+                "familyPhotoUrl": family_photo_url
+            }), origin)
+
+    except Exception as e:
+        log.exception("Failed to upload family photo")
+        return corsify(jsonify({"ok": False, "error": "upload_failed"}), origin), 500
 
 @app.patch("/api/families/<family_id>")
 def update_family_details(family_id: str):
