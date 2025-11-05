@@ -565,6 +565,35 @@ def db_connect_once():
                   ON family_creation_invitations (requesting_tenant_id, created_at DESC);
             """)
 
+            # Tenant invitations - for inviting new members to existing families
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tenant_invitations (
+                  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                  tenant_id     uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                  invited_by    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  email         text NOT NULL,
+                  invited_name  text,
+                  role          text NOT NULL DEFAULT 'MEMBER',
+                  invite_token  uuid UNIQUE NOT NULL DEFAULT gen_random_uuid(),
+                  status        text DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'expired', 'used')),
+                  created_at    timestamptz NOT NULL DEFAULT now(),
+                  expires_at    timestamptz NOT NULL,
+                  accepted_at   timestamptz
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tenant_invitations_token
+                  ON tenant_invitations (invite_token);
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tenant_invitations_email
+                  ON tenant_invitations (email);
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tenant_invitations_tenant
+                  ON tenant_invitations (tenant_id, created_at DESC);
+            """)
+
         DB_READY = True
         DB_ERR = None
     except Exception as e:
