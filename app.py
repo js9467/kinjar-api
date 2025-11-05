@@ -3781,7 +3781,8 @@ def add_comment(con, post_id: str, author_id: str, content: str, parent_id: str 
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (str(uuid4()), tenant_row['tenant_id'], author_id, "comment_added", "comment", comment_id,
                   json.dumps({"post_id": post_id, "content_preview": content[:100]})))
-        
+    
+    con.commit()
     return comment
 
 def get_connected_families(con, tenant_id: str) -> List[Dict[str, Any]]:
