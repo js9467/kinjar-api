@@ -3975,8 +3975,10 @@ def get_public_feed():
                     if post["media_external_url"]:
                         media_url = post["media_external_url"]
                     else:
-                        # Use full backend URL for media endpoint
-                        backend_host = request.host_url.rstrip('/')
+                        # Use full backend URL with HTTPS for media endpoint
+                        proto = request.headers.get('X-Forwarded-Proto', 'https')
+                        host = request.headers.get('X-Forwarded-Host') or request.headers.get('Host') or request.host
+                        backend_host = f"{proto}://{host}".rstrip('/')
                         media_url = f"{backend_host}/api/media/{post['media_filename']}"
                     
                     media = {
@@ -4046,7 +4048,11 @@ def list_posts():
                 media_s3 = None
                 log.warning("list_posts skipping media URL sign because storage is not configured: %s", e)
 
-            backend_host = request.host_url.rstrip('/')
+            # Get backend host with proper protocol (HTTPS on Fly.io)
+            proto = request.headers.get('X-Forwarded-Proto', 'https')
+            host = request.headers.get('X-Forwarded-Host') or request.headers.get('Host') or request.host
+            backend_host = f"{proto}://{host}".rstrip('/')
+            
             for post in posts:
                 # Generate signed URL if using R2/S3
                 if post.get("media_r2_key") and media_s3:
