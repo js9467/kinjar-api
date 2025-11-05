@@ -3653,17 +3653,19 @@ def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> L
     """Get published posts for a tenant with author and media info"""
     try:
         with con.cursor(row_factory=dict_row) as cur:
-            # First check if visibility column exists
+            # First check if visibility and posted_as_id columns exist
             cur.execute("""
                 SELECT column_name 
                 FROM information_schema.columns 
-                WHERE table_name = 'content_posts' AND column_name = 'visibility'
+                WHERE table_name = 'content_posts' AND column_name IN ('visibility', 'posted_as_id')
             """)
-            has_visibility = cur.fetchone() is not None
-            log.info(f"Visibility column exists: {has_visibility}")
+            existing_columns = {row['column_name'] for row in cur.fetchall()}
+            has_visibility = 'visibility' in existing_columns
+            has_posted_as = 'posted_as_id' in existing_columns
+            log.info(f"Visibility column exists: {has_visibility}, Posted_as_id column exists: {has_posted_as}")
             
-            # Build query with conditional visibility column
-            if has_visibility:
+            # Build query with conditional columns
+            if has_visibility and has_posted_as:
                 cur.execute("""
                     SELECT 
                         p.*,
@@ -3688,16 +3690,36 @@ def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> L
                     ORDER BY p.published_at DESC
                     LIMIT %s OFFSET %s
                 """, (tenant_id, limit, offset))
-            else:
-                # Fallback query without visibility column
+            elif has_visibility:
+                # Has visibility but not posted_as_id yet
                 cur.execute("""
                     SELECT 
                         p.*,
                         u.email as author_email,
                         up.display_name as author_name,
                         up.avatar_url as author_avatar,
-                        up2.display_name as posted_as_name,
-                        up2.avatar_url as posted_as_avatar,
+                        m.filename as media_filename,
+                        m.content_type as media_content_type,
+                        m.r2_key as media_r2_key,
+                        m.external_url as media_external_url,
+                        m.thumbnail_url as media_thumbnail,
+                        m.duration_seconds as media_duration
+                    FROM content_posts p
+                    JOIN users u ON p.author_id = u.id
+                    LEFT JOIN user_profiles up ON u.id = up.user_id
+                    LEFT JOIN media_objects m ON p.media_id = m.id
+                    WHERE p.tenant_id = %s AND p.status = 'published'
+                    ORDER BY p.published_at DESC
+                    LIMIT %s OFFSET %s
+                """, (tenant_id, limit, offset))
+            else:
+                # Fallback query without visibility or posted_as_id columns
+                cur.execute("""
+                    SELECT 
+                        p.*,
+                        u.email as author_email,
+                        up.display_name as author_name,
+                        up.avatar_url as author_avatar,
                         m.filename as media_filename,
                         m.content_type as media_content_type,
                         m.r2_key as media_r2_key,
@@ -3708,8 +3730,6 @@ def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> L
                     FROM content_posts p
                     JOIN users u ON p.author_id = u.id
                     LEFT JOIN user_profiles up ON u.id = up.user_id
-                    LEFT JOIN users u2 ON p.posted_as_id = u2.id
-                    LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
                     LEFT JOIN media_objects m ON p.media_id = m.id
                     WHERE p.tenant_id = %s AND p.status = 'published'
                     ORDER BY p.published_at DESC
@@ -3803,35 +3823,71 @@ def get_connected_families(con, tenant_id: str) -> List[Dict[str, Any]]:
 def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
     """Get posts visible to this family from connected families"""
     with con.cursor(row_factory=dict_row) as cur:
+        # Check if posted_as_id column exists
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'content_posts' AND column_name = 'posted_as_id'
+        """)
+        has_posted_as = cur.fetchone() is not None
+        
+        # Build query based on column availability
+        if has_posted_as:
+            query = """
+                SELECT DISTINCT
+                    p.*,
+                    u.email as author_email,
+                    up.display_name as author_name,
+                    up.avatar_url as author_avatar,
+                    up2.display_name as posted_as_name,
+                    up2.avatar_url as posted_as_avatar,
+                    m.filename as media_filename,
+                    m.content_type as media_content_type,
+                    m.r2_key as media_r2_key,
+                    m.thumbnail_url as media_thumbnail,
+                    m.duration_seconds as media_duration,
+                    m.external_url as media_external_url,
+                    t.slug as family_slug,
+                    t.name as family_name,
+                    fs.family_photo as family_photo
+                FROM content_posts p
+                JOIN users u ON p.author_id = u.id
+                JOIN tenants t ON p.tenant_id = t.id
+                LEFT JOIN user_profiles up ON u.id = up.user_id
+                LEFT JOIN users u2 ON p.posted_as_id = u2.id
+                LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
+                LEFT JOIN media_objects m ON p.media_id = m.id
+                LEFT JOIN family_settings fs ON t.id = fs.tenant_id
+            """
+        else:
+            query = """
+                SELECT DISTINCT
+                    p.*,
+                    u.email as author_email,
+                    up.display_name as author_name,
+                    up.avatar_url as author_avatar,
+                    m.filename as media_filename,
+                    m.content_type as media_content_type,
+                    m.r2_key as media_r2_key,
+                    m.thumbnail_url as media_thumbnail,
+                    m.duration_seconds as media_duration,
+                    m.external_url as media_external_url,
+                    t.slug as family_slug,
+                    t.name as family_name,
+                    fs.family_photo as family_photo
+                FROM content_posts p
+                JOIN users u ON p.author_id = u.id
+                JOIN tenants t ON p.tenant_id = t.id
+                LEFT JOIN user_profiles up ON u.id = up.user_id
+                LEFT JOIN media_objects m ON p.media_id = m.id
+                LEFT JOIN family_settings fs ON t.id = fs.tenant_id
+            """
+        
         # Get posts from own tenant and connected families
         # For own family: show all posts regardless of visibility
         # For connected families: show posts with visibility='connections' (legacy) or 'family_and_connections' (new)
         # Also check content_visibility table for explicitly shared posts
-        cur.execute("""
-            SELECT DISTINCT
-                p.*,
-                u.email as author_email,
-                up.display_name as author_name,
-                up.avatar_url as author_avatar,
-                up2.display_name as posted_as_name,
-                up2.avatar_url as posted_as_avatar,
-                m.filename as media_filename,
-                m.content_type as media_content_type,
-                m.r2_key as media_r2_key,
-                m.thumbnail_url as media_thumbnail,
-                m.duration_seconds as media_duration,
-                m.external_url as media_external_url,
-                t.slug as family_slug,
-                t.name as family_name,
-                fs.family_photo as family_photo
-            FROM content_posts p
-            JOIN users u ON p.author_id = u.id
-            JOIN tenants t ON p.tenant_id = t.id
-            LEFT JOIN user_profiles up ON u.id = up.user_id
-            LEFT JOIN users u2 ON p.posted_as_id = u2.id
-            LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
-            LEFT JOIN media_objects m ON p.media_id = m.id
-            LEFT JOIN family_settings fs ON t.id = fs.tenant_id
+        cur.execute(query + """
             WHERE p.status = 'published' AND (
                 -- Own family posts (all visibility levels)
                 p.tenant_id = %s
