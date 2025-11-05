@@ -3603,6 +3603,32 @@ def create_content_post(con, tenant_id: str, author_id: str, title: str, content
         """, (str(uuid4()), tenant_id, author_id, action_type, "content_post", post_id, 
               json.dumps({"title": title, "content_type": content_type, "status": status})))
         
+        # If visibility is 'family_and_connections', automatically share with all connected families
+        if visibility == "family_and_connections" and status == "published":
+            # Get all connected families
+            cur.execute("""
+                SELECT CASE 
+                    WHEN fc.requesting_tenant_id = %s THEN fc.target_tenant_id
+                    ELSE fc.requesting_tenant_id
+                END as connected_tenant_id
+                FROM family_connections fc
+                WHERE (fc.requesting_tenant_id = %s OR fc.target_tenant_id = %s)
+                  AND fc.status = 'accepted'
+            """, (tenant_id, tenant_id, tenant_id))
+            connected_families = cur.fetchall()
+            
+            # Share post with each connected family
+            for family in connected_families:
+                try:
+                    cur.execute("""
+                        INSERT INTO content_visibility (post_id, tenant_id, granted_by)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (post_id, tenant_id) DO NOTHING
+                    """, (post_id, family["connected_tenant_id"], author_id))
+                    log.info(f"Auto-shared post {post_id} with connected family {family['connected_tenant_id']}")
+                except Exception as e:
+                    log.warning(f"Failed to auto-share post {post_id} with family {family['connected_tenant_id']}: {e}")
+        
     return post
 
 def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
@@ -3752,6 +3778,8 @@ def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset:
     """Get posts visible to this family from connected families"""
     with con.cursor(row_factory=dict_row) as cur:
         # Get posts from own tenant and connected families
+        # For own family: show all posts regardless of visibility
+        # For connected families: only show posts with visibility='family_and_connections' that are shared in content_visibility
         cur.execute("""
             SELECT DISTINCT
                 p.*,
@@ -3763,6 +3791,7 @@ def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset:
                 m.r2_key as media_r2_key,
                 m.thumbnail_url as media_thumbnail,
                 m.duration_seconds as media_duration,
+                m.external_url as media_external_url,
                 t.slug as family_slug,
                 t.name as family_name,
                 fs.family_photo as family_photo
@@ -3773,10 +3802,11 @@ def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset:
             LEFT JOIN media_objects m ON p.media_id = m.id
             LEFT JOIN family_settings fs ON t.id = fs.tenant_id
             WHERE p.status = 'published' AND (
-                -- Own family posts
+                -- Own family posts (all visibility levels)
                 p.tenant_id = %s
                 OR
-                -- Connected family posts that are shared
+                -- Connected family posts that are explicitly shared via content_visibility
+                -- (only posts with visibility='family_and_connections' get auto-shared there)
                 (p.tenant_id IN (
                     SELECT CASE 
                         WHEN fc.requesting_tenant_id = %s THEN fc.target_tenant_id
@@ -3855,14 +3885,18 @@ def create_post():
     is_public = body.get("is_public", True)
     
     # Map visibility to is_public for new format
-    visibility = body.get("visibility", "family")
+    visibility = body.get("visibility", "family_and_connections")
     if visibility == "public":
-        is_public = True
-    elif visibility in ["family", "connections"]:
+        # Legacy support - map public to family_and_connections
+        is_public = False
+        visibility = "family_and_connections"
+    elif visibility == "family_and_connections":
+        is_public = False
+    elif visibility == "family_only":
         is_public = False
     else:
-        # Default unknown values to family
-        visibility = "family"
+        # Default unknown values to family_and_connections
+        visibility = "family_and_connections"
         is_public = False
     
     # Support "post as" feature - allow posting as another member (e.g., child)
