@@ -964,6 +964,102 @@ The Kinjar Team
         log.error(f"Failed to send invitation email to {email}: {str(e)}")
         return False
 
+def send_family_invitation_accepted_email(inviter_email: str, inviter_name: str, family_name: str, accepter_name: str, accepter_family_name: str):
+    """Send notification email when someone accepts a family invitation"""
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        log.warning(f"SMTP not configured, skipping email to {inviter_email}")
+        return False
+    
+    try:
+        subject = f"{accepter_name} has joined Kinjar!"
+        
+        # Create the family URL
+        base_url = f"https://{ROOT_DOMAIN}"
+        family_url = f"{base_url}/family"
+        
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <div style="text-align: center; margin-bottom: 30px;">
+                <h1 style="color: #3B82F6;">Great News!</h1>
+            </div>
+            
+            <div style="background: #F0F9FF; padding: 20px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #3B82F6;">
+                <h2 style="color: #1F2937; margin-top: 0;">Hi {inviter_name}!</h2>
+                <p style="color: #4B5563; font-size: 16px; line-height: 1.5;">
+                    <strong>{accepter_name}</strong> from the <strong>{accepter_family_name}</strong> family has accepted your family connection invitation and joined Kinjar!
+                </p>
+                <p style="color: #4B5563; font-size: 16px; line-height: 1.5;">
+                    Your families are now connected and can start sharing memories together.
+                </p>
+            </div>
+            
+            <div style="text-align: center; margin: 30px 0;">
+                <a href="{family_url}" 
+                   style="background: #10B981; color: white; padding: 14px 28px; 
+                          text-decoration: none; border-radius: 6px; font-weight: bold; 
+                          font-size: 16px; display: inline-block;">
+                    Visit Your Family
+                </a>
+            </div>
+            
+            <div style="border-top: 1px solid #E5E7EB; padding-top: 20px; margin-top: 30px;">
+                <p style="color: #6B7280; font-size: 14px;">
+                    You can now see posts from the {accepter_family_name} family in your Connected Families feed!
+                </p>
+                <p style="color: #6B7280; font-size: 12px; margin-top: 20px;">
+                    This is an automated notification from Kinjar. You're receiving this because 
+                    you sent a family connection invitation to {accepter_name}.
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        text_body = f"""
+Hi {inviter_name}!
+
+Great news! {accepter_name} from the {accepter_family_name} family has accepted your family connection invitation and joined Kinjar.
+
+Your families are now connected and can start sharing memories together.
+
+You can visit your family space at: {family_url}
+
+You can now see posts from the {accepter_family_name} family in your Connected Families feed!
+
+Best regards,
+The Kinjar Team
+
+---
+This is an automated notification from Kinjar. You're receiving this because 
+you sent a family connection invitation to {accepter_name}.
+        """
+        
+        # Create message
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+        msg['To'] = inviter_email
+        
+        # Attach text and HTML versions
+        text_part = MIMEText(text_body, 'plain')
+        html_part = MIMEText(html_body, 'html')
+        msg.attach(text_part)
+        msg.attach(html_part)
+        
+        # Send email
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+            
+        log.info(f"Family invitation accepted notification email sent successfully to {inviter_email}")
+        return True
+        
+    except Exception as e:
+        log.error(f"Failed to send family invitation accepted email to {inviter_email}: {str(e)}")
+        return False
+
 def ensure_user_basic(con, email: str) -> Dict[str, Any]:
     email = email.strip().lower()
     if not email:
@@ -6160,6 +6256,33 @@ def create_family_with_invitation():
                     WHERE id = %s
                 """, (family_id, invitation["id"]))
                 
+                # Send notification email to the inviting family
+                try:
+                    # Get the inviting user's details
+                    cur.execute("""
+                        SELECT u.email, u.name, t.name as family_name
+                        FROM users u
+                        JOIN tenant_memberships tm ON u.id = tm.user_id
+                        JOIN tenants t ON tm.tenant_id = t.id
+                        WHERE u.id = %s AND t.id = %s
+                    """, (invitation["invited_by_user_id"], invitation["requesting_tenant_id"]))
+                    
+                    inviting_user = cur.fetchone()
+                    if inviting_user:
+                        notification_sent = send_family_invitation_accepted_email(
+                            inviting_user['email'],
+                            inviting_user['name'],
+                            inviting_user['family_name'],
+                            admin_name,
+                            family_name
+                        )
+                        if notification_sent:
+                            log.info(f"Sent family invitation accepted notification to {inviting_user['email']}")
+                        else:
+                            log.warning(f"Failed to send family invitation accepted notification to {inviting_user['email']}")
+                except Exception as e:
+                    log.error(f"Error sending family invitation accepted notification: {e}")
+                
                 # Create automatic family connection
                 connection_id = str(uuid4())
                 cur.execute("""
@@ -7160,6 +7283,129 @@ def emergency_reset_password():
     except Exception as e:
         log.error(f"Emergency password reset failed: {e}")
         return corsify(jsonify({"ok": False, "error": "Reset failed"}), origin), 500
+
+@app.get("/api/families/pending-invitations")
+def get_pending_invitations():
+    """Get all pending invitations sent by the current family"""
+    origin = request.headers.get("Origin")
+    
+    # Check authentication
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+    
+    # Get tenant slug from header
+    tenant_slug = request.headers.get('x-tenant-slug')
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "Missing tenant slug"}), origin), 400
+        
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Get tenant_id for the current family
+            cur.execute("""
+                SELECT id FROM tenants WHERE slug = %s
+            """, (tenant_slug,))
+            tenant = cur.fetchone()
+            
+            if not tenant:
+                return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+            
+            tenant_id = tenant['id']
+            
+            # Check if user has permission to view invitations for this family
+            cur.execute("""
+                SELECT role FROM tenant_memberships 
+                WHERE tenant_id = %s AND user_id = %s
+            """, (tenant_id, user['id']))
+            membership = cur.fetchone()
+            
+            if not membership or membership['role'] not in ['ADMIN', 'ADULT']:
+                return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+            
+            invitations = []
+            
+            # Get pending family member invitations
+            cur.execute("""
+                SELECT 
+                    ti.id,
+                    ti.email as recipient_email,
+                    ti.invited_name as recipient_name,
+                    NULL as message,
+                    ti.created_at as sent_at,
+                    ti.expires_at,
+                    ti.status,
+                    'member_invitation' as type,
+                    u.name as invited_by_name
+                FROM tenant_invitations ti
+                LEFT JOIN users u ON ti.invited_by = u.id
+                WHERE ti.tenant_id = %s 
+                AND ti.status = 'pending'
+                AND ti.expires_at > NOW()
+                ORDER BY ti.created_at DESC
+            """, (tenant_id,))
+            
+            member_invitations = cur.fetchall()
+            for inv in member_invitations:
+                invitations.append({
+                    'id': inv['id'],
+                    'type': 'member_invitation',
+                    'recipientEmail': inv['recipient_email'],
+                    'recipientName': inv['recipient_name'],
+                    'message': inv['message'],
+                    'sentAt': inv['sent_at'].isoformat() if inv['sent_at'] else None,
+                    'expiresAt': inv['expires_at'].isoformat() if inv['expires_at'] else None,
+                    'status': inv['status'],
+                    'invitedBy': inv['invited_by_name']
+                })
+            
+            # Get pending family creation invitations sent by this family
+            cur.execute("""
+                SELECT 
+                    fci.id,
+                    fci.email as recipient_email,
+                    fci.invited_name as recipient_name,
+                    fci.message,
+                    fci.created_at as sent_at,
+                    fci.expires_at,
+                    fci.status,
+                    'family_creation' as type,
+                    u.name as invited_by_name
+                FROM family_creation_invitations fci
+                LEFT JOIN users u ON fci.invited_by = u.id
+                WHERE fci.requesting_tenant_id = %s 
+                AND fci.status = 'pending'
+                AND fci.expires_at > NOW()
+                ORDER BY fci.created_at DESC
+            """, (tenant_id,))
+            
+            family_invitations = cur.fetchall()
+            for inv in family_invitations:
+                invitations.append({
+                    'id': inv['id'],
+                    'type': 'family_creation',
+                    'recipientEmail': inv['recipient_email'],
+                    'recipientName': inv['recipient_name'],
+                    'message': inv['message'],
+                    'sentAt': inv['sent_at'].isoformat() if inv['sent_at'] else None,
+                    'expiresAt': inv['expires_at'].isoformat() if inv['expires_at'] else None,
+                    'status': inv['status'],
+                    'invitedBy': inv['invited_by_name']
+                })
+            
+            # Sort all invitations by sent date (newest first)
+            invitations.sort(key=lambda x: x['sentAt'] or '', reverse=True)
+            
+            log.info(f"Retrieved {len(invitations)} pending invitations for family {tenant_slug}")
+            
+            return corsify(jsonify({
+                "ok": True,
+                "invitations": invitations
+            }), origin)
+            
+    except Exception as e:
+        log.error(f"Failed to get pending invitations: {e}")
+        return corsify(jsonify({"ok": False, "error": "server_error"}), origin), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
