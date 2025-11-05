@@ -439,45 +439,20 @@ def db_connect_once():
                   ON content_comments (post_id, created_at ASC) WHERE status = 'published';
             """)
 
-            # User invitations to tenants
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS tenant_invitations (
-                  id           uuid PRIMARY KEY,
-                  tenant_id    uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-                  invited_by   uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                  email        text NOT NULL,
-                  invited_name text,
-                  role         text NOT NULL DEFAULT 'MEMBER',
-                  status       text NOT NULL DEFAULT 'pending', -- pending, accepted, expired, revoked
-                  invite_token text UNIQUE NOT NULL,
-                  expires_at   timestamptz NOT NULL,
-                  created_at   timestamptz NOT NULL DEFAULT now(),
-                  accepted_at  timestamptz
-                );
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tenant_invitations_tenant_status
-                  ON tenant_invitations (tenant_id, status);
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tenant_invitations_token
-                  ON tenant_invitations (invite_token) WHERE status = 'pending';
-            """)
-            
-            # Migration: Add invited_name column if it doesn't exist
-            cur.execute("""
-                ALTER TABLE tenant_invitations 
-                ADD COLUMN IF NOT EXISTS invited_name text;
-            """)
-
-            # User profiles for additional info
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS user_profiles (
-                  user_id     uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                  display_name text,
-                  avatar_url  text,
-                  bio         text,
-                  phone       text,
+                # Send invitation email tailored for family creation
+                try:
+                    origin_url = request.headers.get("Origin")
+                    success = send_family_creation_invite_email(
+                        email=email,
+                        name=name,
+                        requesting_family_name=requesting_tenant['name'],
+                        invitation_token=invitation_token,
+                        origin=origin_url,
+                    )
+                    if not success:
+                        log.warning(f"Failed to send family creation invitation email to {email}")
+                except Exception:
+                    log.exception(f"Failed to send family creation invitation email to {email}")
                   updated_at  timestamptz NOT NULL DEFAULT now()
                 );
             """)
@@ -881,6 +856,89 @@ def send_invitation_email(email: str, name: str, family_name: str, invitation_to
     """Send an invitation email to a new family member"""
     if not SMTP_USERNAME or not SMTP_PASSWORD:
         log.warning(f"SMTP not configured, skipping email to {email}")
+        return False
+
+
+def send_family_creation_invite_email(email: str, name: str, requesting_family_name: str, invitation_token: str, origin: Optional[str] = None):
+    """Send an email inviting someone to create a new family (auto-connect flow)."""
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        log.warning(f"SMTP not configured, skipping email to {email}")
+        return False
+
+    try:
+        # Create the invitation URL (prefer request Origin when available)
+        base_url = origin or f"https://{ROOT_DOMAIN}"
+        invitation_url = f"{base_url}/auth/create-family?token={invitation_token}"
+
+        subject = f"Create your family on Kinjar and connect with {requesting_family_name}"
+
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <div style="text-align: center; margin-bottom: 30px;">
+                <h1 style="color: #3B82F6;">You're invited to Kinjar</h1>
+            </div>
+            <div style="background: #F8FAFC; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                <h2 style="color: #1F2937; margin-top: 0;">Hi {name}!</h2>
+                <p style="color: #4B5563; font-size: 16px; line-height: 1.5;">
+                    <strong>{requesting_family_name}</strong> invited you to create your own family space on Kinjar.
+                    When you finish, your families will be automatically connected so it's easy to share together.
+                </p>
+            </div>
+            <div style="text-align: center; margin: 30px 0;">
+                <a href="{invitation_url}"
+                   style="background: #3B82F6; color: white; padding: 14px 28px;
+                          text-decoration: none; border-radius: 6px; font-weight: bold;
+                          font-size: 16px; display: inline-block;">
+                    Create your family
+                </a>
+            </div>
+            <div style="border-top: 1px solid #E5E7EB; padding-top: 20px; margin-top: 30px;">
+                <p style="color: #6B7280; font-size: 14px;">
+                    If the button doesn't work, copy and paste this link into your browser:
+                </p>
+                <p style="color: #3B82F6; font-size: 14px; word-break: break-all;">
+                    {invitation_url}
+                </p>
+                <p style="color: #6B7280; font-size: 12px; margin-top: 20px;">
+                    This invitation will expire in 7 days.
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+
+        text_body = f"""
+Hi {name}!
+
+{requesting_family_name} invited you to create your own family on Kinjar.
+When you finish, your families will be automatically connected.
+
+Open this link to get started:
+{invitation_url}
+
+This invitation will expire in 7 days.
+"""
+
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+        msg['To'] = email
+
+        text_part = MIMEText(text_body, 'plain')
+        html_part = MIMEText(html_body, 'html')
+        msg.attach(text_part)
+        msg.attach(html_part)
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+
+        log.info(f"Family creation invitation email sent successfully to {email}")
+        return True
+    except Exception as e:
+        log.error(f"Failed to send family creation invitation email to {email}: {str(e)}")
         return False
     
     try:
