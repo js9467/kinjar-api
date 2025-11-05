@@ -7217,77 +7217,7 @@ def get_family_by_slug(family_slug: str):
         log.exception(f"Failed to get family {family_slug}")
         return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
 
-@app.post("/api/families/<family_id>/upload-photo")
-def upload_family_photo(family_id: str):
-    """Upload a family photo/avatar"""
-    origin = request.headers.get("Origin")
-    user, err = require_auth()
-    if err:
-        return corsify(err, origin)
-
-    try:
-        with_db()
-        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
-            # Verify user is admin of this family
-            cur.execute("""
-                SELECT role FROM tenant_users 
-                WHERE user_id = %s AND tenant_id = %s
-            """, (user["id"], family_id))
-            membership = cur.fetchone()
-            
-            if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
-                if user.get("global_role") != "ROOT":
-                    return corsify(jsonify({"ok": False, "error": "permission_denied"}), origin), 403
-
-            # Get tenant info
-            cur.execute("SELECT slug FROM tenants WHERE id = %s", (family_id,))
-            tenant = cur.fetchone()
-            if not tenant:
-                return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
-
-            # Check if file is in request
-            if "file" not in request.files:
-                return corsify(jsonify({"ok": False, "error": "no_file"}), origin), 400
-
-            file = request.files["file"]
-            if not file or file.filename == "":
-                return corsify(jsonify({"ok": False, "error": "empty_file"}), origin), 400
-
-            # Read file data
-            file_data = file.read()
-            content_type = file.mimetype or mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
-            
-            # Upload to Vercel Blob
-            blob_result = upload_to_vercel_blob(
-                file_data,
-                file.filename or f"family-{family_id}-photo",
-                content_type
-            )
-            
-            family_photo_url = blob_result.get("url")
-            if not family_photo_url:
-                return corsify(jsonify({"ok": False, "error": "upload_failed"}), origin), 500
-
-            # Update family settings
-            cur.execute("""
-                INSERT INTO family_settings (tenant_id, family_photo)
-                VALUES (%s, %s)
-                ON CONFLICT (tenant_id) DO UPDATE SET
-                    family_photo = EXCLUDED.family_photo,
-                    updated_at = now()
-            """, (family_id, family_photo_url))
-            con.commit()
-
-            audit("family_photo_uploaded", family_id=family_id, actor=user["email"])
-
-            return corsify(jsonify({
-                "ok": True,
-                "familyPhotoUrl": family_photo_url
-            }), origin)
-
-    except Exception as e:
-        log.exception("Failed to upload family photo")
-        return corsify(jsonify({"ok": False, "error": "upload_failed"}), origin), 500
+# Removed duplicate upload_family_photo function - using the version with <family_identifier> parameter
 
 @app.patch("/api/families/<family_id>")
 def update_family_details(family_id: str):
