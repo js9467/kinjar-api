@@ -5072,7 +5072,10 @@ def list_family_connections():
 
     except Exception as e:
         log.exception("Failed to list family connections")
-        return corsify(jsonify({"ok": False, "error": "list_connections_failed"}), origin), 500
+        import traceback
+        error_details = traceback.format_exc()
+        log.error(f"Full traceback: {error_details}")
+        return corsify(jsonify({"ok": False, "error": "list_connections_failed", "details": str(e)}), origin), 500
 
 @app.post("/api/families/connections/<connection_id>/respond")
 def respond_to_family_connection(connection_id: str):
