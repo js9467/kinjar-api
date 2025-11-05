@@ -6912,6 +6912,265 @@ def search_families():
         log.exception("Failed to search families")
         return corsify(jsonify({"ok": False, "error": "search_failed"}), origin), 500
 
+
+def _resolve_family(cur, family_identifier: str) -> Optional[Dict[str, Any]]:
+    """Resolve a family by UUID or slug."""
+    if not family_identifier:
+        return None
+
+    candidate = family_identifier.strip()
+
+    # Try direct UUID match first
+    if re.match(r"^[0-9a-fA-F-]{32,36}$", candidate):
+        cur.execute("SELECT id, slug, name, created_at FROM tenants WHERE id = %s", (candidate,))
+        tenant = cur.fetchone()
+        if tenant:
+            return tenant
+
+    # Fall back to slug lookup
+    sanitized_slug = sanitize_tenant(candidate)
+    if sanitized_slug:
+        cur.execute("SELECT id, slug, name, created_at FROM tenants WHERE slug = %s", (sanitized_slug,))
+        tenant = cur.fetchone()
+        if tenant:
+            return tenant
+
+    return None
+
+
+def _ensure_family_settings(cur, tenant_id: str) -> Dict[str, Any]:
+    """Ensure family_settings row exists and return current settings."""
+    cur.execute(
+        """
+        INSERT INTO family_settings (tenant_id)
+        VALUES (%s)
+        ON CONFLICT (tenant_id) DO NOTHING
+        """,
+        (tenant_id,),
+    )
+
+    cur.execute(
+        """
+        SELECT tenant_id, description, family_photo, theme_color, is_public
+        FROM family_settings
+        WHERE tenant_id = %s
+        """,
+        (tenant_id,),
+    )
+    return cur.fetchone() or {
+        "tenant_id": tenant_id,
+        "description": None,
+        "family_photo": None,
+        "theme_color": None,
+        "is_public": False,
+    }
+
+
+@app.patch("/api/families/<family_identifier>")
+def update_family_settings(family_identifier: str):
+    """Update core family settings (name, slug, description, theme, visibility)."""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    body = request.get_json(silent=True) or {}
+
+    if not body:
+        return corsify(jsonify({"ok": False, "error": "no_updates_provided"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                tenant = _resolve_family(cur, family_identifier)
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+
+                # Verify permissions (owner or admin of family)
+                cur.execute(
+                    """
+                    SELECT role FROM tenant_users
+                    WHERE user_id = %s AND tenant_id = %s AND role IN ('OWNER', 'ADMIN')
+                    """,
+                    (user["id"], tenant["id"]),
+                )
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                tenant_updates: List[str] = []
+                tenant_values: List[Any] = []
+
+                new_name = body.get("name")
+                if isinstance(new_name, str) and new_name.strip():
+                    tenant_updates.append("name = %s")
+                    tenant_values.append(new_name.strip())
+
+                new_slug_input = body.get("slug")
+                if isinstance(new_slug_input, str) and new_slug_input.strip():
+                    sanitized_slug = sanitize_tenant(new_slug_input)
+                    if not sanitized_slug:
+                        return corsify(jsonify({"ok": False, "error": "invalid_slug"}), origin), 400
+
+                    # Ensure slug is unique
+                    cur.execute(
+                        "SELECT id FROM tenants WHERE slug = %s AND id != %s",
+                        (sanitized_slug, tenant["id"]),
+                    )
+                    if cur.fetchone():
+                        return corsify(jsonify({"ok": False, "error": "slug_taken"}), origin), 409
+
+                    tenant_updates.append("slug = %s")
+                    tenant_values.append(sanitized_slug)
+
+                updated_tenant = tenant
+                if tenant_updates:
+                    tenant_values.append(tenant["id"])
+                    cur.execute(
+                        f"UPDATE tenants SET {', '.join(tenant_updates)} WHERE id = %s RETURNING id, slug, name, created_at",
+                        tenant_values,
+                    )
+                    updated_tenant = cur.fetchone()
+
+                # Ensure family_settings row exists
+                current_settings = _ensure_family_settings(cur, tenant["id"])
+
+                settings_updates: List[str] = []
+                settings_values: List[Any] = []
+
+                if "description" in body:
+                    description_val = body.get("description")
+                    settings_updates.append("description = %s")
+                    settings_values.append(description_val.strip() if isinstance(description_val, str) else None)
+
+                if "familyPhoto" in body:
+                    photo_val = body.get("familyPhoto")
+                    settings_updates.append("family_photo = %s")
+                    settings_values.append(photo_val.strip() if isinstance(photo_val, str) else None)
+
+                if "themeColor" in body:
+                    theme_val = body.get("themeColor")
+                    settings_updates.append("theme_color = %s")
+                    settings_values.append(theme_val.strip() if isinstance(theme_val, str) else None)
+
+                if "isPublic" in body:
+                    settings_updates.append("is_public = %s")
+                    settings_values.append(bool(body.get("isPublic")))
+
+                updated_settings = current_settings
+                if settings_updates:
+                    settings_values.append(tenant["id"])
+                    cur.execute(
+                        f"UPDATE family_settings SET {', '.join(settings_updates)} WHERE tenant_id = %s RETURNING tenant_id, description, family_photo, theme_color, is_public",
+                        settings_values,
+                    )
+                    updated_settings = cur.fetchone()
+
+            con.commit()
+
+            if isinstance(updated_settings, dict):
+                settings_dict = updated_settings
+            else:
+                settings_dict = dict(updated_settings or {})
+
+            family_response = {
+                "id": updated_tenant["id"],
+                "slug": updated_tenant["slug"],
+                "name": updated_tenant["name"],
+                "description": settings_dict.get("description"),
+                "familyPhoto": settings_dict.get("family_photo"),
+                "themeColor": settings_dict.get("theme_color"),
+                "isPublic": settings_dict.get("is_public"),
+                "createdAt": (updated_tenant["created_at"].isoformat() if updated_tenant.get("created_at") else None),
+            }
+
+            return corsify(jsonify({"ok": True, "family": family_response}), origin)
+
+    except Exception as e:
+        log.exception("Failed to update family settings")
+        return corsify(jsonify({"ok": False, "error": "update_failed"}), origin), 500
+
+
+@app.post("/api/families/<family_identifier>/upload-photo")
+def upload_family_photo(family_identifier: str):
+    """Upload or replace the family photo."""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    upload_file = request.files.get("file")
+    if not upload_file:
+        return corsify(jsonify({"ok": False, "error": "file_missing"}), origin), 400
+
+    file_data = upload_file.read()
+    if not file_data:
+        return corsify(jsonify({"ok": False, "error": "empty_file"}), origin), 400
+
+    content_type = upload_file.mimetype or mimetypes.guess_type(upload_file.filename)[0] or "application/octet-stream"
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                tenant = _resolve_family(cur, family_identifier)
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+
+                cur.execute(
+                    """
+                    SELECT role FROM tenant_users
+                    WHERE user_id = %s AND tenant_id = %s AND role IN ('OWNER', 'ADMIN')
+                    """,
+                    (user["id"], tenant["id"]),
+                )
+                membership = cur.fetchone()
+                if not membership:
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                try:
+                    upload_result = upload_to_vercel_blob(file_data, upload_file.filename or "family-photo", content_type)
+                except StorageNotConfigured as storage_error:
+                    log.error("Family photo upload failed: storage not configured")
+                    return corsify(jsonify({"ok": False, "error": "storage_not_configured", "detail": str(storage_error)}), origin), 500
+                except requests.HTTPError as http_error:
+                    log.error(f"Family photo upload failed: {http_error}")
+                    return corsify(jsonify({"ok": False, "error": "upload_failed", "detail": str(http_error)}), origin), 500
+
+                cur.execute(
+                    """
+                    INSERT INTO family_settings (tenant_id, family_photo)
+                    VALUES (%s, %s)
+                    ON CONFLICT (tenant_id) DO UPDATE SET family_photo = EXCLUDED.family_photo
+                    RETURNING tenant_id, description, family_photo, theme_color, is_public
+                    """,
+                    (tenant["id"], upload_result["url"]),
+                )
+                updated_settings = cur.fetchone()
+
+            con.commit()
+
+            response_payload = {
+                "ok": True,
+                "familyPhotoUrl": updated_settings["family_photo"],
+                "family": {
+                    "id": tenant["id"],
+                    "slug": tenant["slug"],
+                    "name": tenant["name"],
+                    "familyPhoto": updated_settings["family_photo"],
+                    "description": updated_settings["description"],
+                    "themeColor": updated_settings["theme_color"],
+                    "isPublic": updated_settings["is_public"],
+                },
+            }
+
+            return corsify(jsonify(response_payload), origin)
+
+    except Exception as e:
+        log.exception("Failed to upload family photo")
+        return corsify(jsonify({"ok": False, "error": "upload_failed"}), origin), 500
+
 @app.get("/families/check-subdomain/<subdomain>")
 def check_subdomain_availability(subdomain: str):
     """Check if a subdomain is available"""
