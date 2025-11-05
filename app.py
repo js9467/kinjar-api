@@ -4039,14 +4039,16 @@ def list_posts():
             else:
                 posts = get_tenant_posts(con, tenant["id"], limit, offset)
             
-            # Add signed URLs for media
+            # Add signed URLs for media and format properly
             try:
                 media_s3 = s3_client()
             except StorageNotConfigured as e:
                 media_s3 = None
                 log.warning("list_posts skipping media URL sign because storage is not configured: %s", e)
 
+            backend_host = request.host_url.rstrip('/')
             for post in posts:
+                # Generate signed URL if using R2/S3
                 if post.get("media_r2_key") and media_s3:
                     try:
                         signed_url = media_s3.generate_presigned_url(
@@ -4057,6 +4059,9 @@ def list_posts():
                         post["media_url"] = signed_url
                     except Exception:
                         log.exception(f"Failed to generate signed URL for {post['media_r2_key']}")
+                # If we have a media filename but no signed URL, use backend API endpoint
+                elif post.get("media_filename") and not post.get("media_url"):
+                    post["media_url"] = f"{backend_host}/api/media/{post['media_filename']}"
 
             return corsify(jsonify({"ok": True, "posts": posts}), origin)
 
