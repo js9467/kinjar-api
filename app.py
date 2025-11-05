@@ -4733,6 +4733,57 @@ def edit_comment(comment_id: str):
         log.exception("Failed to edit comment")
         return corsify(jsonify({"ok": False, "error": "edit_failed"}), origin), 500
 
+@app.delete("/api/comments/<comment_id>")
+def delete_comment_by_uuid(comment_id: str):
+    """Delete a comment by UUID"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get comment details with tenant info
+                cur.execute("""
+                    SELECT c.*, p.tenant_id, t.slug as tenant_slug
+                    FROM content_comments c
+                    JOIN content_posts p ON c.post_id = p.id
+                    JOIN tenants t ON p.tenant_id = t.id
+                    WHERE c.id = %s
+                """, (comment_id,))
+                comment = cur.fetchone()
+                
+                if not comment:
+                    return corsify(jsonify({"ok": False, "error": "comment_not_found"}), origin), 404
+
+                # Check if user is comment author, family admin, or root admin
+                is_author = comment["author_id"] == user["id"]
+                
+                cur.execute("""
+                    SELECT role FROM tenant_users
+                    WHERE tenant_id = %s AND user_id = %s
+                """, (comment["tenant_id"], user["id"]))
+                membership = cur.fetchone()
+                
+                is_admin = membership and membership["role"] in {"ADMIN", "OWNER"}
+                is_root_admin = user.get("is_root_admin", False)
+                
+                if not (is_author or is_admin or is_root_admin):
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                # Delete the comment
+                cur.execute("DELETE FROM content_comments WHERE id = %s", (comment_id,))
+                con.commit()
+
+                audit("comment_deleted", comment_id=comment_id, post_id=comment["post_id"], tenant=comment["tenant_slug"])
+                return corsify(jsonify({"ok": True}), origin)
+
+    except Exception as e:
+        log.exception("Failed to delete comment")
+        return corsify(jsonify({"ok": False, "error": "delete_failed"}), origin), 500
+
 
 @app.route("/api/comments/<int:comment_id>", methods=['DELETE', 'OPTIONS'])
 def delete_comment(comment_id):
