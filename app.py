@@ -4630,14 +4630,39 @@ def add_post_comment(post_id: str):
                 if not post:
                     return corsify(jsonify({"ok": False, "error": "post_not_found"}), origin), 404
 
-                # Check user is member of tenant
+                # Check user is member of post's tenant OR has a connected family
                 cur.execute("""
                     SELECT role FROM tenant_users 
                     WHERE user_id = %s AND tenant_id = %s
                 """, (user["id"], post["tenant_id"]))
                 membership = cur.fetchone()
+                
                 if not membership:
-                    return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+                    # Check if user's family is connected to post's family
+                    cur.execute("""
+                        SELECT tu.tenant_id as user_tenant_id
+                        FROM tenant_users tu
+                        WHERE tu.user_id = %s
+                        LIMIT 1
+                    """, (user["id"],))
+                    user_tenant = cur.fetchone()
+                    
+                    if user_tenant:
+                        cur.execute("""
+                            SELECT 1 FROM family_connections fc
+                            WHERE fc.status = 'accepted'
+                            AND (
+                                (fc.requesting_tenant_id = %s AND fc.target_tenant_id = %s)
+                                OR (fc.requesting_tenant_id = %s AND fc.target_tenant_id = %s)
+                            )
+                        """, (user_tenant["user_tenant_id"], post["tenant_id"], 
+                              post["tenant_id"], user_tenant["user_tenant_id"]))
+                        connection = cur.fetchone()
+                        
+                        if not connection:
+                            return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+                    else:
+                        return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
 
             comment = add_comment(con, post_id, user["id"], content, parent_id)
             
