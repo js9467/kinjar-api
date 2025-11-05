@@ -7655,7 +7655,7 @@ def get_pending_invitations():
             
             # Check if user has permission to view invitations for this family
             cur.execute("""
-                SELECT role FROM tenant_memberships 
+                SELECT role FROM tenant_users 
                 WHERE tenant_id = %s AND user_id = %s
             """, (tenant_id, user['id']))
             membership = cur.fetchone()
@@ -7676,9 +7676,10 @@ def get_pending_invitations():
                     ti.expires_at,
                     ti.status,
                     'member_invitation' as type,
-                    u.name as invited_by_name
+                    COALESCE(up.display_name, u.email) as invited_by_name
                 FROM tenant_invitations ti
                 LEFT JOIN users u ON ti.invited_by = u.id
+                LEFT JOIN user_profiles up ON u.id = up.user_id
                 WHERE ti.tenant_id = %s 
                 AND ti.status = 'pending'
                 AND ti.expires_at > NOW()
@@ -7710,9 +7711,10 @@ def get_pending_invitations():
                     fci.expires_at,
                     fci.status,
                     'family_creation' as type,
-                    u.name as invited_by_name
+                    COALESCE(up.display_name, u.email) as invited_by_name
                 FROM family_creation_invitations fci
                 LEFT JOIN users u ON fci.invited_by = u.id
+                LEFT JOIN user_profiles up ON u.id = up.user_id
                 WHERE fci.requesting_tenant_id = %s 
                 AND fci.status = 'pending'
                 AND fci.expires_at > NOW()
