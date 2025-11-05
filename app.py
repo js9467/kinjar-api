@@ -6430,29 +6430,46 @@ def create_family_with_invitation():
                 if invitation["email"].lower() != admin_email.lower():
                     return corsify(jsonify({"ok": False, "error": "Email doesn't match invitation"}), origin), 400
 
-                # Check if subdomain/email already exists
+                # Check if subdomain already exists
                 cur.execute("SELECT id FROM tenants WHERE slug = %s", (subdomain,))
                 if cur.fetchone():
                     return corsify(jsonify({"ok": False, "error": "Subdomain already taken"}), origin), 400
                 
-                cur.execute("SELECT id FROM users WHERE email = %s", (admin_email,))
-                if cur.fetchone():
-                    return corsify(jsonify({"ok": False, "error": "Email already registered"}), origin), 400
+                # Check if user already exists
+                cur.execute("SELECT id, password_hash FROM users WHERE email = %s", (admin_email,))
+                existing_user = cur.fetchone()
                 
-                # Create user
-                user_id = str(uuid4())
-                password_hash = ph.hash(password)
-                cur.execute("""
-                    INSERT INTO users (id, email, password_hash, global_role)
-                    VALUES (%s, %s, %s, 'USER') RETURNING *
-                """, (user_id, admin_email, password_hash))
-                user = cur.fetchone()
-                
-                # Create user profile
-                cur.execute("""
-                    INSERT INTO user_profiles (user_id, display_name)
-                    VALUES (%s, %s)
-                """, (user_id, admin_name))
+                if existing_user:
+                    # User exists - verify password
+                    try:
+                        ph.verify(existing_user["password_hash"], password)
+                    except Exception:
+                        return corsify(jsonify({"ok": False, "error": "Invalid password"}), origin), 401
+                    
+                    user_id = existing_user["id"]
+                    
+                    # Check if user profile exists, create if not
+                    cur.execute("SELECT user_id FROM user_profiles WHERE user_id = %s", (user_id,))
+                    if not cur.fetchone():
+                        cur.execute("""
+                            INSERT INTO user_profiles (user_id, display_name)
+                            VALUES (%s, %s)
+                        """, (user_id, admin_name))
+                else:
+                    # Create new user
+                    user_id = str(uuid4())
+                    password_hash = ph.hash(password)
+                    cur.execute("""
+                        INSERT INTO users (id, email, password_hash, global_role)
+                        VALUES (%s, %s, %s, 'USER') RETURNING *
+                    """, (user_id, admin_email, password_hash))
+                    user = cur.fetchone()
+                    
+                    # Create user profile
+                    cur.execute("""
+                        INSERT INTO user_profiles (user_id, display_name)
+                        VALUES (%s, %s)
+                    """, (user_id, admin_name))
                 
                 # Create family (tenant)
                 family_id = str(uuid4())
