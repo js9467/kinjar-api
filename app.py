@@ -1692,8 +1692,11 @@ def upload_avatar():
         file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
         avatar_filename = f"avatars/{user['id']}.{file_extension}"
         
-        # Upload to Vercel Blob
-        avatar_url = upload_to_vercel_blob(file_data, avatar_filename, content_type)
+        # Upload to Vercel Blob and capture the public URL
+        blob_result = upload_to_vercel_blob(file_data, avatar_filename, content_type)
+        avatar_url = blob_result.get("url")
+        if not avatar_url:
+            raise RuntimeError("avatar_upload_missing_url")
         
         # Update user profile with new avatar URL
         with_db()
@@ -1772,8 +1775,11 @@ def upload_member_avatar(family_id: str, member_id: str):
         file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
         avatar_filename = f"avatars/{member_id}.{file_extension}"
         
-        # Upload to Vercel Blob
-        avatar_url = upload_to_vercel_blob(file_data, avatar_filename, content_type)
+        # Upload to Vercel Blob and capture the public URL
+        blob_result = upload_to_vercel_blob(file_data, avatar_filename, content_type)
+        avatar_url = blob_result.get("url")
+        if not avatar_url:
+            raise RuntimeError("avatar_upload_missing_url")
         
         # Update member profile with new avatar URL
         with_db()
@@ -6971,6 +6977,133 @@ def get_family_by_slug(family_slug: str):
     except Exception as e:
         log.exception(f"Failed to get family {family_slug}")
         return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
+
+@app.patch("/api/families/<family_id>")
+def update_family_details(family_id: str):
+    """Update core family settings such as name, slug, and description."""
+    origin = request.headers.get("Origin")
+    user, err = require_auth()
+    if err:
+        return corsify(err, origin)
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return corsify(jsonify({"ok": False, "error": "invalid_payload"}), origin), 400
+
+    new_name = (data.get("name") or "").strip()
+    new_slug_input = (data.get("slug") or data.get("familySlug") or "").strip().lower()
+    description = data.get("description")
+
+    if not new_name and not new_slug_input and description is None:
+        return corsify(jsonify({"ok": False, "error": "no_updates_provided"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id, slug, name FROM tenants WHERE id = %s", (family_id,))
+            tenant = cur.fetchone()
+            if not tenant:
+                return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+
+            cur.execute(
+                """
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """,
+                (user["id"], family_id),
+            )
+            membership = cur.fetchone()
+            if not membership or membership["role"] not in ["OWNER", "ADMIN"]:
+                if user["global_role"] != "ROOT":
+                    return corsify(jsonify({"ok": False, "error": "permission_denied"}), origin), 403
+
+            updated_fields: Dict[str, Any] = {}
+            update_clauses = []
+            update_values: List[Any] = []
+            old_slug = tenant["slug"]
+
+            if new_name and new_name != tenant["name"]:
+                update_clauses.append("name = %s")
+                update_values.append(new_name)
+                updated_fields["name"] = new_name
+
+            sanitized_slug = None
+            if new_slug_input:
+                sanitized_slug = sanitize_tenant(new_slug_input)
+                if not sanitized_slug:
+                    return corsify(jsonify({"ok": False, "error": "invalid_slug"}), origin), 400
+
+            if sanitized_slug and sanitized_slug != tenant["slug"]:
+                cur.execute(
+                    "SELECT 1 FROM tenants WHERE slug = %s AND id <> %s",
+                    (sanitized_slug, family_id),
+                )
+                if cur.fetchone():
+                    return corsify(jsonify({"ok": False, "error": "slug_in_use"}), origin), 409
+                update_clauses.append("slug = %s")
+                update_values.append(sanitized_slug)
+                updated_fields["slug"] = sanitized_slug
+
+            if update_clauses:
+                update_values.append(family_id)
+                cur.execute(
+                    f"UPDATE tenants SET {', '.join(update_clauses)} WHERE id = %s RETURNING id, name, slug",
+                    update_values,
+                )
+                tenant = cur.fetchone()
+
+            if description is not None:
+                description_value = description.strip() if isinstance(description, str) else None
+                cur.execute(
+                    """
+                        INSERT INTO family_settings (tenant_id, description)
+                        VALUES (%s, %s)
+                        ON CONFLICT (tenant_id) DO UPDATE SET
+                            description = EXCLUDED.description,
+                            updated_at = now()
+                    """,
+                    (family_id, description_value),
+                )
+                updated_fields["description"] = description_value
+
+            if updated_fields.get("slug") and updated_fields["slug"] != old_slug:
+                cur.execute(
+                    "UPDATE media_objects SET tenant = %s WHERE tenant = %s",
+                    (updated_fields["slug"], old_slug),
+                )
+
+            cur.execute(
+                "SELECT description FROM family_settings WHERE tenant_id = %s",
+                (family_id,),
+            )
+            settings_row = cur.fetchone()
+
+            audit(
+                "family_updated",
+                family_id=family_id,
+                updated_fields=json.dumps(updated_fields),
+                actor=user["email"],
+            )
+
+            return corsify(
+                jsonify(
+                    {
+                        "ok": True,
+                        "family": {
+                            "id": str(tenant["id"]),
+                            "name": tenant["name"],
+                            "slug": tenant["slug"],
+                            "description": settings_row["description"] if settings_row else None,
+                            "updatedFields": updated_fields,
+                        },
+                    }
+                ),
+                origin,
+            )
+
+    except Exception as e:
+        log.exception("Failed to update family details")
+        return corsify(jsonify({"ok": False, "error": "family_update_failed"}), origin), 500
 
 @app.post("/families/invite")
 def invite_family_member_new():
