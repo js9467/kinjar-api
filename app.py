@@ -403,6 +403,15 @@ def db_connect_once():
                 WHERE visibility IS NULL;
             """)
             
+            # Add posted_as_id column for tracking when parents post on behalf of children
+            cur.execute("""
+                DO $$ BEGIN
+                    ALTER TABLE content_posts ADD COLUMN posted_as_id uuid REFERENCES users(id) ON DELETE SET NULL;
+                EXCEPTION
+                    WHEN duplicate_column THEN NULL;
+                END $$;
+            """)
+            
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_content_posts_tenant_published
                   ON content_posts (tenant_id, published_at DESC) WHERE status = 'published';
@@ -3527,7 +3536,7 @@ def upload_complete():
 # Helper functions for video blog features
 def create_content_post(con, tenant_id: str, author_id: str, title: str, content: str = "", 
                        media_id: str = None, media_url: str = None, content_type: str = "video_blog", 
-                       is_public: bool = True, visibility: str = "family") -> Dict[str, Any]:
+                       is_public: bool = True, visibility: str = "family", posted_as_id: str = None) -> Dict[str, Any]:
     """Create a new content post (video blog entry)"""
     post_id = str(uuid4())
     published_at = datetime.datetime.now(datetime.timezone.utc)
@@ -3588,19 +3597,19 @@ def create_content_post(con, tenant_id: str, author_id: str, title: str, content
         
         if has_visibility:
             cur.execute("""
-                INSERT INTO content_posts (id, tenant_id, author_id, media_id, title, content, 
+                INSERT INTO content_posts (id, tenant_id, author_id, posted_as_id, media_id, title, content, 
                                          content_type, is_public, visibility, status, published_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
-            """, (post_id, tenant_id, author_id, actual_media_id, title, content, content_type, is_public, visibility, status, published_at))
+            """, (post_id, tenant_id, author_id, posted_as_id, actual_media_id, title, content, content_type, is_public, visibility, status, published_at))
         else:
             # Fallback for databases without visibility column
             cur.execute("""
-                INSERT INTO content_posts (id, tenant_id, author_id, media_id, title, content, 
+                INSERT INTO content_posts (id, tenant_id, author_id, posted_as_id, media_id, title, content, 
                                          content_type, is_public, status, published_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
-            """, (post_id, tenant_id, author_id, actual_media_id, title, content, content_type, is_public, status, published_at))
+            """, (post_id, tenant_id, author_id, posted_as_id, actual_media_id, title, content, content_type, is_public, status, published_at))
         
         post = cur.fetchone()
         
@@ -3661,6 +3670,8 @@ def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> L
                         u.email as author_email,
                         up.display_name as author_name,
                         up.avatar_url as author_avatar,
+                        up2.display_name as posted_as_name,
+                        up2.avatar_url as posted_as_avatar,
                         m.filename as media_filename,
                         m.content_type as media_content_type,
                         m.r2_key as media_r2_key,
@@ -3670,6 +3681,8 @@ def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> L
                     FROM content_posts p
                     JOIN users u ON p.author_id = u.id
                     LEFT JOIN user_profiles up ON u.id = up.user_id
+                    LEFT JOIN users u2 ON p.posted_as_id = u2.id
+                    LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
                     LEFT JOIN media_objects m ON p.media_id = m.id
                     WHERE p.tenant_id = %s AND p.status = 'published'
                     ORDER BY p.published_at DESC
@@ -3683,6 +3696,8 @@ def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> L
                         u.email as author_email,
                         up.display_name as author_name,
                         up.avatar_url as author_avatar,
+                        up2.display_name as posted_as_name,
+                        up2.avatar_url as posted_as_avatar,
                         m.filename as media_filename,
                         m.content_type as media_content_type,
                         m.r2_key as media_r2_key,
@@ -3693,6 +3708,8 @@ def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> L
                     FROM content_posts p
                     JOIN users u ON p.author_id = u.id
                     LEFT JOIN user_profiles up ON u.id = up.user_id
+                    LEFT JOIN users u2 ON p.posted_as_id = u2.id
+                    LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
                     LEFT JOIN media_objects m ON p.media_id = m.id
                     WHERE p.tenant_id = %s AND p.status = 'published'
                     ORDER BY p.published_at DESC
@@ -3796,6 +3813,8 @@ def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset:
                 u.email as author_email,
                 up.display_name as author_name,
                 up.avatar_url as author_avatar,
+                up2.display_name as posted_as_name,
+                up2.avatar_url as posted_as_avatar,
                 m.filename as media_filename,
                 m.content_type as media_content_type,
                 m.r2_key as media_r2_key,
@@ -3809,6 +3828,8 @@ def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset:
             JOIN users u ON p.author_id = u.id
             JOIN tenants t ON p.tenant_id = t.id
             LEFT JOIN user_profiles up ON u.id = up.user_id
+            LEFT JOIN users u2 ON p.posted_as_id = u2.id
+            LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
             LEFT JOIN media_objects m ON p.media_id = m.id
             LEFT JOIN family_settings fs ON t.id = fs.tenant_id
             WHERE p.status = 'published' AND (
@@ -3918,11 +3939,13 @@ def create_post():
         is_public = False
     
     # Support "post as" feature - allow posting as another member (e.g., child)
-    # Frontend sends author_id when user selects a different member from dropdown
-    author_id = body.get("author_id", user["id"])
-    log.info(f"[DEBUG] Post author_id from request: {author_id}")
-    log.info(f"[DEBUG] Logged-in user ID: {user['id']}")
-    log.info(f"[DEBUG] Request body author_id field: {body.get('author_id')}")
+    # Frontend sends posted_as_id when user selects a different member from dropdown
+    # author_id is ALWAYS the logged-in user who actually created the post
+    author_id = user["id"]  # The actual logged-in user
+    posted_as_id = body.get("posted_as_id")  # The member being posted as (can be different)
+    
+    log.info(f"[DEBUG] Post author_id (logged-in user): {author_id}")
+    log.info(f"[DEBUG] Post posted_as_id (displayed author): {posted_as_id}")
 
     if not title and not content:
         return corsify(jsonify({"ok": False, "error": "content_required"}), origin), 400
@@ -3937,18 +3960,19 @@ def create_post():
                 if not tenant:
                     return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
 
-                # Verify author_id is a member of the tenant
-                cur.execute("""
-                    SELECT role FROM tenant_users 
-                    WHERE user_id = %s AND tenant_id = %s
-                """, (author_id, tenant["id"]))
-                author_membership = cur.fetchone()
-                if not author_membership:
-                    log.warning(f"[DEBUG] author_id {author_id} is not a member of tenant {tenant['id']}")
-                    return corsify(jsonify({"ok": False, "error": "author_not_tenant_member"}), origin), 403
+                # Verify posted_as_id is a member of the tenant if provided
+                if posted_as_id:
+                    cur.execute("""
+                        SELECT role FROM tenant_users 
+                        WHERE user_id = %s AND tenant_id = %s
+                    """, (posted_as_id, tenant["id"]))
+                    posted_as_membership = cur.fetchone()
+                    if not posted_as_membership:
+                        log.warning(f"[DEBUG] posted_as_id {posted_as_id} is not a member of tenant {tenant['id']}")
+                        return corsify(jsonify({"ok": False, "error": "posted_as_not_tenant_member"}), origin), 403
 
             post = create_content_post(con, tenant["id"], author_id, title, content, 
-                                     media_id, media_url, content_type, is_public, visibility)
+                                     media_id, media_url, content_type, is_public, visibility, posted_as_id)
             
             # Enrich post with author details for frontend
             with con.cursor(row_factory=dict_row) as cur:
@@ -3967,6 +3991,24 @@ def create_post():
                     post['author_name'] = author_info.get('author_name') or author_info.get('author_email', 'User')
                     post['author_avatar'] = author_info.get('author_avatar')
                     post['author_avatar_color'] = author_info.get('avatar_color')
+                
+                # If there's a posted_as_id, get that person's info too
+                if posted_as_id:
+                    cur.execute("""
+                        SELECT 
+                            u.email as posted_as_email,
+                            up.display_name as posted_as_name,
+                            up.avatar_url as posted_as_avatar,
+                            up.avatar_color as posted_as_avatar_color
+                        FROM users u
+                        LEFT JOIN user_profiles up ON u.id = up.user_id
+                        WHERE u.id = %s
+                    """, (posted_as_id,))
+                    posted_as_info = cur.fetchone()
+                    if posted_as_info:
+                        post['posted_as_name'] = posted_as_info.get('posted_as_name') or posted_as_info.get('posted_as_email', 'User')
+                        post['posted_as_avatar'] = posted_as_info.get('posted_as_avatar')
+                        post['posted_as_avatar_color'] = posted_as_info.get('posted_as_avatar_color')
             
             audit("post_created", tenant=tenant_slug, post_id=post["id"], title=title)
             return corsify(jsonify({"ok": True, "post": post}), origin)
