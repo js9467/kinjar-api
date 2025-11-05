@@ -3971,9 +3971,17 @@ def get_public_feed():
                 # Create media object if media exists
                 media = None
                 if post.get("media_filename"):
+                    # Use external URL if available, otherwise construct backend API URL
+                    if post["media_external_url"]:
+                        media_url = post["media_external_url"]
+                    else:
+                        # Use full backend URL for media endpoint
+                        backend_host = request.host_url.rstrip('/')
+                        media_url = f"{backend_host}/api/media/{post['media_filename']}"
+                    
                     media = {
                         "type": "image" if post["media_content_type"] and "image" in post["media_content_type"] else "video",
-                        "url": post["media_external_url"] or f"/media/{post['media_filename']}",
+                        "url": media_url,
                         "alt": post["title"]
                     }
 
