@@ -3843,8 +3843,11 @@ def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> L
                         u.email as author_email,
                         up.display_name as author_name,
                         up.avatar_url as author_avatar,
+                        up.avatar_color as author_avatar_color,
+                        up.avatar_color as author_avatar_color,
                         up2.display_name as posted_as_name,
                         up2.avatar_url as posted_as_avatar,
+                        up2.avatar_color as posted_as_avatar_color,
                         m.filename as media_filename,
                         m.content_type as media_content_type,
                         m.r2_key as media_r2_key,
@@ -3869,6 +3872,7 @@ def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> L
                         u.email as author_email,
                         up.display_name as author_name,
                         up.avatar_url as author_avatar,
+                        up.avatar_color as author_avatar_color,
                         m.filename as media_filename,
                         m.content_type as media_content_type,
                         m.r2_key as media_r2_key,
@@ -3891,6 +3895,7 @@ def get_tenant_posts(con, tenant_id: str, limit: int = 50, offset: int = 0) -> L
                         u.email as author_email,
                         up.display_name as author_name,
                         up.avatar_url as author_avatar,
+                        up.avatar_color as author_avatar_color,
                         m.filename as media_filename,
                         m.content_type as media_content_type,
                         m.r2_key as media_r2_key,
@@ -3922,7 +3927,8 @@ def get_post_comments(con, post_id: str) -> List[Dict[str, Any]]:
                 c.*,
                 u.email as author_email,
                 up.display_name as author_name,
-                up.avatar_url as author_avatar
+                up.avatar_url as author_avatar,
+                up.avatar_color as author_avatar_color
             FROM content_comments c
             JOIN users u ON c.author_id = u.id
             LEFT JOIN user_profiles up ON u.id = up.user_id
@@ -4011,8 +4017,10 @@ def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset:
                     u.email as author_email,
                     up.display_name as author_name,
                     up.avatar_url as author_avatar,
+                    up.avatar_color as author_avatar_color,
                     up2.display_name as posted_as_name,
                     up2.avatar_url as posted_as_avatar,
+                    up2.avatar_color as posted_as_avatar_color,
                     m.filename as media_filename,
                     m.content_type as media_content_type,
                     m.r2_key as media_r2_key,
@@ -4038,6 +4046,7 @@ def get_cross_family_posts(con, viewing_tenant_id: str, limit: int = 50, offset:
                     u.email as author_email,
                     up.display_name as author_name,
                     up.avatar_url as author_avatar,
+                    up.avatar_color as author_avatar_color,
                     m.filename as media_filename,
                     m.content_type as media_content_type,
                     m.r2_key as media_r2_key,
@@ -4317,7 +4326,8 @@ def get_public_feed():
                     "familyThemeColor": post["family_theme_color"] or "#2563eb",
                     "authorId": None,  # Don't expose user IDs in public feed
                     "authorName": post["author_name"] or post["author_email"].split("@")[0],
-                    "authorAvatarColor": post["avatar_color"] or "#3B82F6",
+                    "authorAvatarColor": post.get("avatar_color") or "#3B82F6",
+                    "authorAvatarUrl": post.get("author_avatar"),
                     "createdAt": post["published_at"].isoformat() if post["published_at"] else None,
                     "content": post["content"],
                     "title": post["title"],
@@ -5232,6 +5242,7 @@ def get_pending_posts():
                 SELECT p.id, p.title, p.content, p.is_public, p.created_at, p.author_id,
                        u.email as author_email,
                        up.display_name as author_name,
+                       up.avatar_url as author_avatar,
                        up.avatar_color,
                        tu.role as author_role
                 FROM content_posts p
@@ -5252,7 +5263,8 @@ def get_pending_posts():
                     "familyId": tenant["id"],
                     "authorId": post["author_id"] if "author_id" in post else "",
                     "authorName": post["author_name"] or post["author_email"].split("@")[0],
-                    "authorAvatarColor": post["avatar_color"] or "#3B82F6",
+                    "authorAvatarColor": post.get("avatar_color") or "#3B82F6",
+                    "authorAvatarUrl": post.get("author_avatar"),
                     "title": post["title"],
                     "content": post["content"],
                     "createdAt": post["created_at"].isoformat() if post["created_at"] else None,
