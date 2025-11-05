@@ -439,23 +439,6 @@ def db_connect_once():
                   ON content_comments (post_id, created_at ASC) WHERE status = 'published';
             """)
 
-                # Send invitation email tailored for family creation
-                try:
-                    origin_url = request.headers.get("Origin")
-                    success = send_family_creation_invite_email(
-                        email=email,
-                        name=name,
-                        requesting_family_name=requesting_tenant['name'],
-                        invitation_token=invitation_token,
-                        origin=origin_url,
-                    )
-                    if not success:
-                        log.warning(f"Failed to send family creation invitation email to {email}")
-                except Exception:
-                    log.exception(f"Failed to send family creation invitation email to {email}")
-                  updated_at  timestamptz NOT NULL DEFAULT now()
-                );
-            """)
 
             # Add new columns for enhanced user profiles
             try:
