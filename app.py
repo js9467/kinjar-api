@@ -4721,11 +4721,21 @@ def add_post_comment(post_id: str):
             # Verify post exists and user can comment
             with con.cursor(row_factory=dict_row) as cur:
                 cur.execute("""
-                    SELECT p.id, p.tenant_id, p.author_id, p.content, p.media_url, 
-                           p.created_at, p.updated_at, p.status, p.visibility, 
-                           t.slug as tenant_slug 
+                    SELECT 
+                        p.id,
+                        p.tenant_id,
+                        p.author_id,
+                        p.content,
+                        p.media_id,
+                        p.created_at,
+                        p.updated_at,
+                        p.status,
+                        p.visibility,
+                        mo.external_url AS media_url,
+                        t.slug AS tenant_slug
                     FROM content_posts p
                     JOIN tenants t ON p.tenant_id = t.id
+                    LEFT JOIN media_objects mo ON p.media_id = mo.id
                     WHERE p.id = %s AND p.status = 'published'
                 """, (post_id,))
                 post = cur.fetchone()
