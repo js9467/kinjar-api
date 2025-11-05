@@ -6950,6 +6950,22 @@ def get_family_by_slug(family_slug: str):
                     ]
                     family_data["userRole"] = membership["role"] if membership else user.get("global_role")
 
+                    # Include connected families for dashboard metrics
+                    connected_rows = get_connected_families(con, family["id"])
+                    family_data["connectedFamilies"] = [
+                        {
+                            "id": row["connection_id"],
+                            "familyId": row["family_id"],
+                            "familyName": row["family_name"],
+                            "familySlug": row["family_slug"],
+                            "connectedAt": row["connected_at"].isoformat() if row.get("connected_at") else None,
+                            "canShareContent": True,
+                        }
+                        for row in connected_rows
+                    ]
+                    # Provide a legacy list of slugs for older clients that used `connections`
+                    family_data["connections"] = [row["family_slug"] for row in connected_rows]
+
         return corsify(jsonify({"ok": True, "family": family_data}), origin)
 
     except Exception as e:
@@ -7689,7 +7705,7 @@ def get_pending_invitations():
             """, (tenant_id, user['id']))
             membership = cur.fetchone()
             
-            if not membership or membership['role'] not in ['ADMIN', 'ADULT']:
+            if not membership or membership['role'] not in ['OWNER', 'ADMIN', 'ADULT']:
                 return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
             
             invitations = []
@@ -7742,7 +7758,7 @@ def get_pending_invitations():
                     'family_creation' as type,
                     COALESCE(up.display_name, u.email) as invited_by_name
                 FROM family_creation_invitations fci
-                LEFT JOIN users u ON fci.invited_by = u.id
+                LEFT JOIN users u ON fci.invited_by_user_id = u.id
                 LEFT JOIN user_profiles up ON u.id = up.user_id
                 WHERE fci.requesting_tenant_id = %s 
                 AND fci.status = 'pending'
