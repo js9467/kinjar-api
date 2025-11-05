@@ -5529,36 +5529,12 @@ def invite_new_family():
 
                 # Send invitation email (after commit so we don't lose the invitation if email fails)
                 try:
-                    base_url = request.headers.get("Origin", "https://kinjar.com")
-                    invitation_url = f"{base_url}/auth/create-family?token={invitation_token}"
-                    
-                    email_subject = f"Join Kinjar and Connect with {requesting_tenant['name']}"
-                    email_body = f"""
-Hello {name},
-
-{user.get('display_name', user['email'])} from {requesting_tenant['name']} has invited you to join Kinjar, a safe family social platform.
-
-{message if message else f"We'd love to connect our families on Kinjar!"}
-
-Kinjar is a private social platform designed for families to share memories and stay connected safely. When you create your family space, you'll automatically be connected with {requesting_tenant['name']}.
-
-To accept this invitation and create your family space:
-{invitation_url}
-
-This invitation expires in 7 days.
-
-Welcome to the Kinjar family!
-
-Best regards,
-The Kinjar Team
-                    """
-                    
-                    success = send_invitation_email(
+                    success = send_family_creation_invite_email(
                         email=email,
                         name=name,
-                        family_name=requesting_tenant['name'],
+                        requesting_family_name=requesting_tenant['name'],
                         invitation_token=invitation_token,
-                        family_slug=requesting_tenant['slug']
+                        origin=request.headers.get("Origin")
                     )
                     
                     if not success:
