@@ -5461,16 +5461,17 @@ def invite_new_family():
                 if not membership:
                     return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
 
-                # Check if email is already registered
+                # Allow inviting an email even if it's already registered.
+                # This supports inviting existing users to create a new family that will auto-connect.
+                # We still proceed to create an invitation and send an email.
                 cur.execute("SELECT id FROM users WHERE email = %s", (email,))
                 existing_user = cur.fetchone()
-                if existing_user:
-                    return corsify(jsonify({"ok": False, "error": "email_already_registered"}), origin), 409
 
                 # Create family creation invitation
                 invitation_id = str(uuid4())
                 invitation_token = str(uuid4())
-                expires_at = datetime.utcnow() + timedelta(days=7)  # 7 days to accept
+                # Use datetime.datetime.utcnow (module import is `import datetime`)
+                expires_at = datetime.datetime.utcnow() + timedelta(days=7)  # 7 days to accept
                 
                 cur.execute("""
                     INSERT INTO family_creation_invitations 
@@ -6261,29 +6262,46 @@ def create_family():
         with_db()
         with pool.connection() as con:
             with con.cursor(row_factory=dict_row) as cur:
-                # Check if subdomain/email already exists
+                # Check if subdomain already exists
                 cur.execute("SELECT id FROM tenants WHERE slug = %s", (subdomain,))
                 if cur.fetchone():
                     return corsify(jsonify({"ok": False, "error": "Subdomain already taken"}), origin), 400
                 
-                cur.execute("SELECT id FROM users WHERE email = %s", (admin_email,))
-                if cur.fetchone():
-                    return corsify(jsonify({"ok": False, "error": "Email already registered"}), origin), 400
-                
-                # Create user
-                user_id = str(uuid4())
-                password_hash = ph.hash(password)
-                cur.execute("""
-                    INSERT INTO users (id, email, password_hash, global_role)
-                    VALUES (%s, %s, %s, 'USER') RETURNING *
-                """, (user_id, admin_email, password_hash))
-                user = cur.fetchone()
+                # Determine user context: reuse existing account or create a new one
+                cur.execute("SELECT id, password_hash FROM users WHERE email = %s", (admin_email,))
+                existing_user = cur.fetchone()
+                if existing_user:
+                    # Verify password for existing account
+                    try:
+                        ph.verify(existing_user["password_hash"], password)
+                    except Exception:
+                        return corsify(jsonify({"ok": False, "error": "Invalid credentials"}), origin), 401
+                    user_id = existing_user["id"]
+                else:
+                    # Create user
+                    user_id = str(uuid4())
+                    password_hash = ph.hash(password)
+                    cur.execute("""
+                        INSERT INTO users (id, email, password_hash, global_role)
+                        VALUES (%s, %s, %s, 'USER') RETURNING *
+                    """, (user_id, admin_email, password_hash))
+                    user = cur.fetchone()
                 
                 # Create user profile
-                cur.execute("""
-                    INSERT INTO user_profiles (user_id, display_name)
-                    VALUES (%s, %s)
-                """, (user_id, admin_name))
+                # If profile exists, optionally update missing display_name; else create
+                cur.execute("SELECT user_id FROM user_profiles WHERE user_id = %s", (user_id,))
+                has_profile = cur.fetchone()
+                if has_profile:
+                    cur.execute("""
+                        UPDATE user_profiles
+                        SET display_name = COALESCE(NULLIF(display_name, ''), %s)
+                        WHERE user_id = %s
+                    """, (admin_name, user_id))
+                else:
+                    cur.execute("""
+                        INSERT INTO user_profiles (user_id, display_name)
+                        VALUES (%s, %s)
+                    """, (user_id, admin_name))
                 
                 # Create family (tenant)
                 family_id = str(uuid4())
