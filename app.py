@@ -5799,84 +5799,7 @@ def get_family_settings():
         log.exception("Failed to get family settings")
         return corsify(jsonify({"ok": False, "error": "settings_failed"}), origin), 500
 
-@app.put("/api/families/settings")
-def update_family_settings():
-    """Update family settings (admin/owner only)"""
-    origin = request.headers.get("Origin")
-    user = current_user_row()
-    if not user:
-        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
-
-    tenant_slug = request.headers.get("x-tenant-slug", "").strip()
-    if not tenant_slug:
-        return corsify(jsonify({"ok": False, "error": "tenant_required"}), origin), 400
-
-    body = request.get_json(silent=True) or {}
-
-    try:
-        with_db()
-        with pool.connection() as con:
-            with con.cursor(row_factory=dict_row) as cur:
-                # Get tenant ID
-                cur.execute("SELECT id FROM tenants WHERE slug = %s", (tenant_slug,))
-                tenant = cur.fetchone()
-                if not tenant:
-                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
-
-                # Check user is admin/owner of tenant
-                cur.execute("""
-                    SELECT role FROM tenant_users 
-                    WHERE user_id = %s AND tenant_id = %s AND role IN ('ADMIN', 'OWNER')
-                """, (user["id"], tenant["id"]))
-                membership = cur.fetchone()
-                if not membership:
-                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
-
-                # Update settings (only provided fields)
-                update_fields = []
-                update_values = []
-                
-                if "family_photo" in body:
-                    update_fields.append("family_photo = %s")
-                    update_values.append(body["family_photo"])
-                if "theme_color" in body:
-                    update_fields.append("theme_color = %s")
-                    update_values.append(body["theme_color"])
-                if "banner_image" in body:
-                    update_fields.append("banner_image = %s")
-                    update_values.append(body["banner_image"])
-                if "description" in body:
-                    update_fields.append("description = %s")
-                    update_values.append(body["description"])
-                if "is_public" in body:
-                    update_fields.append("is_public = %s")
-                    update_values.append(body["is_public"])
-                if "allow_connections" in body:
-                    update_fields.append("allow_connections = %s")
-                    update_values.append(body["allow_connections"])
-
-                if not update_fields:
-                    return corsify(jsonify({"ok": False, "error": "no_fields_to_update"}), origin), 400
-
-                update_fields.append("updated_at = now()")
-                update_fields.append("updated_by = %s")
-                update_values.extend([user["id"], tenant["id"]])
-
-                # Upsert settings
-                cur.execute(f"""
-                    INSERT INTO family_settings (tenant_id, updated_by) VALUES (%s, %s)
-                    ON CONFLICT (tenant_id) DO UPDATE SET {', '.join(update_fields)}
-                    RETURNING *
-                """, [tenant["id"], user["id"]] + update_values)
-                
-                settings = cur.fetchone()
-
-            audit("family_settings_updated", tenant=tenant_slug, updated_by=user["email"])
-            return corsify(jsonify({"ok": True, "settings": dict(settings)}), origin)
-
-    except Exception as e:
-        log.exception("Failed to update family settings")
-        return corsify(jsonify({"ok": False, "error": "update_failed"}), origin), 500
+# Removed duplicate update_family_settings function - consolidated into PATCH /api/families/<family_identifier>
 
 @app.get("/api/families/members")
 def list_family_members():
@@ -7330,11 +7253,15 @@ def upload_family_photo(family_id: str):
             if not file or file.filename == "":
                 return corsify(jsonify({"ok": False, "error": "empty_file"}), origin), 400
 
+            # Read file data
+            file_data = file.read()
+            content_type = file.mimetype or mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
+            
             # Upload to Vercel Blob
             blob_result = upload_to_vercel_blob(
-                file,
-                tenant_slug=tenant["slug"],
-                user_email=user["email"]
+                file_data,
+                file.filename or f"family-{family_id}-photo",
+                content_type
             )
             
             family_photo_url = blob_result.get("url")
