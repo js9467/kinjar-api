@@ -5272,13 +5272,10 @@ def edit_comment(comment_id: str):
                             f"Adult {user['id']} can edit child comment authored by role {author_role}"
                         )
                 elif current_role and _is_child_role(current_role):
-                    # Children can edit their own comments OR comments posted as them
+                    # Children can only edit their own comments
                     if comment['author_id'] == user['id']:
                         can_edit = True
                         reason = f"Child {user['id']} can edit their own comment"
-                    elif has_posted_as_id and comment.get('posted_as_id') == user['id']:
-                        can_edit = True
-                        reason = f"Child {user['id']} can edit comment posted as them"
                     # Children CANNOT edit other children's comments
                     else:
                         can_edit = False
@@ -5428,13 +5425,10 @@ def delete_comment_by_uuid(comment_id: str):
                             f"Adult {user['id']} can delete child comment authored by role {author_role}"
                         )
                 elif current_role and _is_child_role(current_role):
-                    # Children can delete their own comments OR comments posted as them
+                    # Children can only delete their own comments
                     if comment['author_id'] == user['id']:
                         can_delete = True
                         reason = f"Child {user['id']} can delete their own comment"
-                    elif has_posted_as_id and comment.get('posted_as_id') == user['id']:
-                        can_delete = True
-                        reason = f"Child {user['id']} can delete comment posted as them"
                     else:
                         # Children CANNOT delete other users' comments
                         can_delete = False
