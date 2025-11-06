@@ -5240,6 +5240,7 @@ def edit_comment(comment_id: str):
                 # 1. Root admins and tenant ADMINs/OWNERs can edit any comment
                 # 2. Adults can edit their own comments OR child comments (posted_as_id refers to a CHILD)
                 # 3. Children can ONLY edit their own comments (not other children's)
+                # Updated: 2025-11-06 - Fixed child permission isolation
                 
                 can_edit = False
                 reason = ""
