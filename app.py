@@ -97,6 +97,85 @@ def handle_preflight():
                 response.headers['Access-Control-Allow-Credentials'] = 'true'
                 return response
 
+# Child profile update endpoint
+@app.route('/api/child-profiles/<child_id>', methods=['PATCH'])
+def update_child_profile(child_id):
+    """Update a child's profile information when acting as that child"""
+    try:
+        # Get current user info
+        user_id = get_user_id_from_token()
+        if not user_id:
+            return corsify(jsonify({"error": "Not authenticated"}), None, 401)
+
+        # Verify that user has permission to update this child's profile
+        acting_as_child = request.headers.get('x-acting-as-child') == 'true'
+        if not acting_as_child:
+            return corsify(jsonify({"error": "Must be in child mode to update child profile"}), None, 403)
+
+        # Get request data
+        data = request.get_json()
+        if not data:
+            return corsify(jsonify({"error": "No data provided"}), None, 400)
+
+        # Get database connection
+        with get_db().connection() as conn:
+            # Verify the child belongs to the user's family
+            cursor = conn.execute("""
+                SELECT m.id, m.family_id, m.role, f.admin_id
+                FROM family_members m
+                JOIN families f ON m.family_id = f.id
+                WHERE m.id = %s
+            """, (child_id,))
+            member = cursor.fetchone()
+
+            if not member:
+                return corsify(jsonify({"error": "Child not found"}), None, 404)
+
+            # Check if user has permission (either family admin or adult member)
+            cursor = conn.execute("""
+                SELECT role
+                FROM family_members
+                WHERE family_id = %s AND user_id = %s
+            """, (member['family_id'], user_id))
+            user_role = cursor.fetchone()
+
+            if not user_role or user_role['role'] not in ['ADMIN', 'ADULT']:
+                return corsify(jsonify({"error": "Permission denied"}), None, 403)
+
+            # Process updates
+            updates = {}
+            if 'bio' in data:
+                updates['bio'] = data['bio'].strip()[:500] if data['bio'] else None
+            if 'theme' in data and isinstance(data['theme'], dict):
+                updates['theme'] = json.dumps(data['theme'])
+            if 'avatarColor' in data:
+                updates['avatar_color'] = data['avatarColor']
+
+            if updates:
+                # Build update query
+                set_clauses = [f"{k} = %s" for k in updates.keys()]
+                values = list(updates.values()) + [child_id]
+                
+                query = f"""
+                    UPDATE family_members 
+                    SET {', '.join(set_clauses)}
+                    WHERE id = %s
+                    RETURNING id
+                """
+                conn.execute(query, values)
+
+            return corsify(jsonify({
+                "ok": True,
+                "message": "Child profile updated successfully"
+            }), None)
+
+    except Exception as e:
+        logging.error(f"Error updating child profile: {str(e)}", exc_info=True)
+        return corsify(jsonify({
+            "error": "Failed to update child profile",
+            "detail": str(e)
+        }), None, 500)
+
 # Configure Flask for larger file uploads. Some iOS Live Photos and newer
 # devices can easily exceed 50MB even when they appear "small" in the photo
 # picker, so allow up to 150MB to avoid spurious 413 errors while still
