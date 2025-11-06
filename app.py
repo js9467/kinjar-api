@@ -5252,48 +5252,22 @@ def edit_comment(comment_id: str):
                 reason = ""
                 
                 if is_root_admin or current_role in ['ADMIN', 'OWNER']:
-                    # ADMINS: Can edit their own OR children's comments, but NOT other adults
-                    if comment['author_id'] == user['id']:
-                        can_edit = True
-                        reason = f"Admin/Owner {user['id']} can edit their own comment"
-                    # Can edit comments authored by children
-                    elif author_role and _is_child_role(author_role):
-                        can_edit = True
-                        reason = f"Admin/Owner {user['id']} can edit child comment authored by role {author_role}"
-                    # Cannot edit other adults' comments
-                    else:
-                        can_edit = False
-                        reason = f"Admin/Owner {user['id']} cannot edit other adult's comment (author role: {author_role})"
+                    # ADMINS: Can edit any comment in their family
+                    can_edit = True
+                    reason = f"Admin/Owner {user['id']} can edit any comment in the family"
                 elif current_role in ['ADULT', 'MEMBER']:
-                    # Adults can ONLY edit their own comments
-                    if comment['author_id'] == user['id']:
-                        can_edit = True
-                        reason = f"Adult {user['id']} can edit their own comment"
-                    # Adults can ONLY edit comments posted_as their children (not authored by children)
-                    # This means the adult posted the comment under a child's name
-                    elif has_posted_as_id and comment.get('posted_as_id') and comment['author_id'] == user['id'] and _is_child_role(posted_as_role):
-                        can_edit = True
-                        reason = (
-                            f"Adult {user['id']} can edit comment they authored and posted_as child {comment.get('posted_as_id')}"
-                        )
-                    else:
-                        can_edit = False
-                        reason = (
-                            f"Adult {user['id']} cannot edit this comment (author: {comment['author_id']}, "
-                            f"posted_as: {comment.get('posted_as_id', 'None')}, author_role: {author_role})"
-                        )
+                    # Adults: Can edit any comment in their family
+                    can_edit = True
+                    reason = f"Adult {user['id']} can edit any comment in the family"
                 elif current_role and _is_child_role(current_role):
-                    # Children can only edit their own comments
-                    if comment['author_id'] == user['id']:
+                    # Children accounts: Can only edit comments posted AS them
+                    # (i.e., comments where posted_as_id = their ID or author_id = their ID)
+                    if comment['author_id'] == user['id'] or comment.get('posted_as_id') == user['id']:
                         can_edit = True
-                        reason = f"Child {user['id']} can edit their own comment"
+                        reason = f"Child {user['id']} can edit comments posted as them"
                     else:
-                        # Children CANNOT edit anyone else's comments
                         can_edit = False
-                        reason = (
-                            f"Child {user['id']} cannot edit other users' comments (author: {comment['author_id']}, "
-                            f"posted_as: {comment.get('posted_as_id', 'None')})"
-                        )
+                        reason = f"Child {user['id']} cannot edit comments not posted as them"
                 
                 log.info(f"Edit permission check: {reason}")
                 log.info(f"DEBUG EDIT: user_id={user['id']}, comment_author_id={comment['author_id']}, current_role={current_role}, is_root_admin={is_root_admin}")
@@ -5435,48 +5409,22 @@ def delete_comment_by_uuid(comment_id: str):
                 reason = ""
                 
                 if is_root_admin or current_role in ['ADMIN', 'OWNER']:
-                    # ADMINS: Can delete their own OR children's comments, but NOT other adults
-                    if comment['author_id'] == user['id']:
-                        can_delete = True
-                        reason = f"Admin/Owner {user['id']} can delete their own comment"
-                    # Can delete comments authored by children
-                    elif author_role and _is_child_role(author_role):
-                        can_delete = True
-                        reason = f"Admin/Owner {user['id']} can delete child comment authored by {author_name}"
-                    # Cannot delete other adults' comments
-                    else:
-                        can_delete = False
-                        reason = f"Admin/Owner {user['id']} cannot delete other adult's comment (author: {author_name}, role: {author_role})"
+                    # ADMINS: Can delete any comment in their family
+                    can_delete = True
+                    reason = f"Admin/Owner {user['id']} can delete any comment in the family"
                 elif current_role in ['ADULT', 'MEMBER']:
-                    # Adults can ONLY delete their own comments
-                    if comment['author_id'] == user['id']:
-                        can_delete = True
-                        reason = f"Adult {user['id']} can delete their own comment"
-                    # Adults can ONLY delete comments posted_as their children (not authored by children)
-                    # This means the adult posted the comment under a child's name
-                    elif has_posted_as_id and comment.get('posted_as_id') and comment['author_id'] == user['id'] and _is_child_role(posted_as_role):
-                        can_delete = True
-                        reason = (
-                            f"Adult {user['id']} can delete comment they authored and posted_as child {comment.get('posted_as_id')}"
-                        )
-                    else:
-                        can_delete = False
-                        reason = (
-                            f"Adult {user['id']} cannot delete this comment (author: {comment['author_id']}, "
-                            f"posted_as: {comment.get('posted_as_id', 'None')}, author_role: {author_role})"
-                        )
+                    # Adults: Can delete any comment in their family
+                    can_delete = True
+                    reason = f"Adult {user['id']} can delete any comment in the family"
                 elif current_role and _is_child_role(current_role):
-                    # Children can only delete their own comments
-                    if comment['author_id'] == user['id']:
+                    # Children accounts: Can only delete comments posted AS them
+                    # (i.e., comments where posted_as_id = their ID or author_id = their ID)
+                    if comment['author_id'] == user['id'] or comment.get('posted_as_id') == user['id']:
                         can_delete = True
-                        reason = f"Child {user['id']} can delete their own comment"
+                        reason = f"Child {user['id']} can delete comments posted as them"
                     else:
-                        # Children CANNOT delete anyone else's comments
                         can_delete = False
-                        reason = (
-                            f"Child {user['id']} cannot delete other users' comments (author: {comment['author_id']}, "
-                            f"posted_as: {comment.get('posted_as_id', 'None')})"
-                        )
+                        reason = f"Child {user['id']} cannot delete comments not posted as them"
                 
                 log.info(f"Permission check: {reason}")
                 log.info(f"DEBUG DELETE: user_id={user['id']}, comment_author_id={comment['author_id']}, current_role={current_role}, is_root_admin={is_root_admin}")
