@@ -5242,11 +5242,18 @@ def delete_comment_by_uuid(comment_id: str):
         with_db()
         with pool.connection() as con:
             with con.cursor(row_factory=dict_row) as cur:
+                # Clear any cached plans that might be causing issues
+                try:
+                    cur.execute("DISCARD PLANS")
+                except:
+                    pass  # Ignore if not supported
+                
                 log.info(f"Attempting to delete comment {comment_id} by user {user['id']}")
                 
-                # Get comment details with tenant info
+                # Get comment details with explicit column selection to avoid schema issues
                 cur.execute("""
-                    SELECT c.*, p.tenant_id, t.slug as tenant_slug
+                    SELECT c.id, c.post_id, c.author_id, c.content, c.status, c.created_at, c.updated_at,
+                           p.tenant_id, t.slug as tenant_slug
                     FROM content_comments c
                     JOIN content_posts p ON c.post_id = p.id
                     JOIN tenants t ON p.tenant_id = t.id
@@ -5274,7 +5281,7 @@ def delete_comment_by_uuid(comment_id: str):
                 
                 log.info(f"Permission check: is_author={is_author}, is_admin={is_admin}, is_root_admin={is_root_admin}")
                 
-                # Simplified permission check for now - just allow author, admin, or root admin
+                # Allow author, admin, or root admin to delete
                 if not (is_author or is_admin or is_root_admin):
                     log.warning(f"Permission denied for user {user['id']} to delete comment {comment_id}")
                     return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
