@@ -68,7 +68,7 @@ def after_request(response):
         
         if is_allowed:
             response.headers['Access-Control-Allow-Origin'] = origin
-            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-tenant-slug, x-acting-as-child'
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-tenant-slug, x-acting-as-child, x-posted-as-id'
             response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS'
             response.headers['Access-Control-Allow-Credentials'] = 'true'
     return response
@@ -92,7 +92,7 @@ def handle_preflight():
             if is_allowed:
                 response = make_response()
                 response.headers['Access-Control-Allow-Origin'] = origin
-                response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-tenant-slug, x-acting-as-child'
+                response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-tenant-slug, x-acting-as-child, x-posted-as-id'
                 response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS'
                 response.headers['Access-Control-Allow-Credentials'] = 'true'
                 return response
