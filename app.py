@@ -4842,7 +4842,7 @@ def get_post(post_id: str):
 
 @app.get("/api/users/<user_id>/posts")
 def get_user_posts(user_id: str):
-    """Get posts created by a specific user (including posts made as children)"""
+    """Get posts created by a specific user that are visible to the requesting tenant"""
     origin = request.headers.get("Origin")
     
     tenant_slug = request.args.get("tenant", "")
@@ -4856,11 +4856,21 @@ def get_user_posts(user_id: str):
         with_db()
         with pool.connection() as con:
             with con.cursor(row_factory=dict_row) as cur:
-                # Get tenant
+                # Get viewing tenant
                 cur.execute("SELECT * FROM tenants WHERE slug = %s", (tenant_slug,))
-                tenant = cur.fetchone()
-                if not tenant:
+                viewing_tenant = cur.fetchone()
+                if not viewing_tenant:
                     return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+                
+                viewing_tenant_id = viewing_tenant["id"]
+                
+                # Check if the user is a member of the viewing tenant
+                cur.execute("""
+                    SELECT tu.tenant_id 
+                    FROM tenant_users tu
+                    WHERE tu.user_id = %s AND tu.tenant_id = %s
+                """, (user_id, viewing_tenant_id))
+                is_same_family = cur.fetchone() is not None
                 
                 # Check if visibility and posted_as_id columns exist
                 cur.execute("""
@@ -4872,60 +4882,139 @@ def get_user_posts(user_id: str):
                 has_visibility = 'visibility' in existing_columns
                 has_posted_as = 'posted_as_id' in existing_columns
                 
-                # Get posts where user is the author OR posted_as
-                if has_visibility and has_posted_as:
-                    cur.execute("""
-                        SELECT 
-                            p.*,
-                            u.email as author_email,
-                            up.display_name as author_name,
-                            up.avatar_url as author_avatar,
-                            up.avatar_color as author_avatar_color,
-                            up2.display_name as posted_as_name,
-                            up2.avatar_url as posted_as_avatar,
-                            up2.avatar_color as posted_as_avatar_color,
-                            m.filename as media_filename,
-                            m.content_type as media_content_type,
-                            m.r2_key as media_r2_key,
-                            m.external_url as media_external_url,
-                            m.thumbnail_url as media_thumbnail,
-                            m.duration_seconds as media_duration
-                        FROM content_posts p
-                        JOIN users u ON p.author_id = u.id
-                        LEFT JOIN user_profiles up ON u.id = up.user_id
-                        LEFT JOIN users u2 ON p.posted_as_id = u2.id
-                        LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
-                        LEFT JOIN media_objects m ON p.media_id = m.id
-                        WHERE p.tenant_id = %s 
-                        AND p.status = 'published'
-                        AND (p.author_id = %s OR p.posted_as_id = %s)
-                        ORDER BY p.published_at DESC
-                        LIMIT %s OFFSET %s
-                    """, (tenant["id"], user_id, user_id, limit, offset))
+                # Build the query based on whether user is in same family or not
+                if is_same_family:
+                    # Same family - show all their posts in this family
+                    if has_visibility and has_posted_as:
+                        cur.execute("""
+                            SELECT 
+                                p.*,
+                                u.email as author_email,
+                                up.display_name as author_name,
+                                up.avatar_url as author_avatar,
+                                up.avatar_color as author_avatar_color,
+                                up2.display_name as posted_as_name,
+                                up2.avatar_url as posted_as_avatar,
+                                up2.avatar_color as posted_as_avatar_color,
+                                m.filename as media_filename,
+                                m.content_type as media_content_type,
+                                m.r2_key as media_r2_key,
+                                m.external_url as media_external_url,
+                                m.thumbnail_url as media_thumbnail,
+                                m.duration_seconds as media_duration
+                            FROM content_posts p
+                            JOIN users u ON p.author_id = u.id
+                            LEFT JOIN user_profiles up ON u.id = up.user_id
+                            LEFT JOIN users u2 ON p.posted_as_id = u2.id
+                            LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
+                            LEFT JOIN media_objects m ON p.media_id = m.id
+                            WHERE p.tenant_id = %s 
+                            AND p.status = 'published'
+                            AND (p.author_id = %s OR p.posted_as_id = %s)
+                            ORDER BY p.published_at DESC
+                            LIMIT %s OFFSET %s
+                        """, (viewing_tenant_id, user_id, user_id, limit, offset))
+                    else:
+                        cur.execute("""
+                            SELECT 
+                                p.*,
+                                u.email as author_email,
+                                up.display_name as author_name,
+                                up.avatar_url as author_avatar,
+                                up.avatar_color as author_avatar_color,
+                                m.filename as media_filename,
+                                m.content_type as media_content_type,
+                                m.r2_key as media_r2_key,
+                                m.external_url as media_external_url,
+                                m.thumbnail_url as media_thumbnail,
+                                m.duration_seconds as media_duration
+                            FROM content_posts p
+                            JOIN users u ON p.author_id = u.id
+                            LEFT JOIN user_profiles up ON u.id = up.user_id
+                            LEFT JOIN media_objects m ON p.media_id = m.id
+                            WHERE p.tenant_id = %s 
+                            AND p.status = 'published'
+                            AND p.author_id = %s
+                            ORDER BY p.published_at DESC
+                            LIMIT %s OFFSET %s
+                        """, (viewing_tenant_id, user_id, limit, offset))
                 else:
+                    # Different family - only show posts marked as visible to connections
+                    # First, check if families are connected
                     cur.execute("""
-                        SELECT 
-                            p.*,
-                            u.email as author_email,
-                            up.display_name as author_name,
-                            up.avatar_url as author_avatar,
-                            up.avatar_color as author_avatar_color,
-                            m.filename as media_filename,
-                            m.content_type as media_content_type,
-                            m.r2_key as media_r2_key,
-                            m.external_url as media_external_url,
-                            m.thumbnail_url as media_thumbnail,
-                            m.duration_seconds as media_duration
-                        FROM content_posts p
-                        JOIN users u ON p.author_id = u.id
-                        LEFT JOIN user_profiles up ON u.id = up.user_id
-                        LEFT JOIN media_objects m ON p.media_id = m.id
-                        WHERE p.tenant_id = %s 
-                        AND p.status = 'published'
-                        AND p.author_id = %s
-                        ORDER BY p.published_at DESC
-                        LIMIT %s OFFSET %s
-                    """, (tenant["id"], user_id, limit, offset))
+                        SELECT 1 FROM family_connections fc1
+                        JOIN tenant_users tu ON tu.user_id = %s
+                        WHERE fc1.status = 'accepted'
+                        AND (
+                            (fc1.from_tenant_id = %s AND fc1.to_tenant_id = tu.tenant_id)
+                            OR (fc1.to_tenant_id = %s AND fc1.from_tenant_id = tu.tenant_id)
+                        )
+                        LIMIT 1
+                    """, (user_id, viewing_tenant_id, viewing_tenant_id))
+                    
+                    if not cur.fetchone():
+                        # Not connected, return empty list
+                        return corsify(jsonify({"ok": True, "posts": []}), origin)
+                    
+                    # Families are connected, get posts with visibility = 'family_and_connections'
+                    if has_visibility and has_posted_as:
+                        cur.execute("""
+                            SELECT 
+                                p.*,
+                                u.email as author_email,
+                                up.display_name as author_name,
+                                up.avatar_url as author_avatar,
+                                up.avatar_color as author_avatar_color,
+                                up2.display_name as posted_as_name,
+                                up2.avatar_url as posted_as_avatar,
+                                up2.avatar_color as posted_as_avatar_color,
+                                m.filename as media_filename,
+                                m.content_type as media_content_type,
+                                m.r2_key as media_r2_key,
+                                m.external_url as media_external_url,
+                                m.thumbnail_url as media_thumbnail,
+                                m.duration_seconds as media_duration,
+                                t.slug as tenant_slug
+                            FROM content_posts p
+                            JOIN users u ON p.author_id = u.id
+                            JOIN tenants t ON p.tenant_id = t.id
+                            LEFT JOIN user_profiles up ON u.id = up.user_id
+                            LEFT JOIN users u2 ON p.posted_as_id = u2.id
+                            LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
+                            LEFT JOIN media_objects m ON p.media_id = m.id
+                            WHERE p.status = 'published'
+                            AND (p.author_id = %s OR p.posted_as_id = %s)
+                            AND p.visibility = 'family_and_connections'
+                            ORDER BY p.published_at DESC
+                            LIMIT %s OFFSET %s
+                        """, (user_id, user_id, limit, offset))
+                    else:
+                        # No visibility column, fall back to is_public
+                        cur.execute("""
+                            SELECT 
+                                p.*,
+                                u.email as author_email,
+                                up.display_name as author_name,
+                                up.avatar_url as author_avatar,
+                                up.avatar_color as author_avatar_color,
+                                m.filename as media_filename,
+                                m.content_type as media_content_type,
+                                m.r2_key as media_r2_key,
+                                m.external_url as media_external_url,
+                                m.thumbnail_url as media_thumbnail,
+                                m.duration_seconds as media_duration,
+                                t.slug as tenant_slug
+                            FROM content_posts p
+                            JOIN users u ON p.author_id = u.id
+                            JOIN tenants t ON p.tenant_id = t.id
+                            LEFT JOIN user_profiles up ON u.id = up.user_id
+                            LEFT JOIN media_objects m ON p.media_id = m.id
+                            WHERE p.status = 'published'
+                            AND p.author_id = %s
+                            AND p.is_public = true
+                            ORDER BY p.published_at DESC
+                            LIMIT %s OFFSET %s
+                        """, (user_id, limit, offset))
                 
                 posts = cur.fetchall()
                 
