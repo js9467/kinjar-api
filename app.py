@@ -5406,14 +5406,20 @@ def delete_comment_by_uuid(comment_id: str):
                         can_delete = True
                         reason = f"Adult {user['id']} can delete child comment (posted_as child with role {posted_as_role})"
                 elif current_role == 'CHILD':
-                    # Children can ONLY delete their own comments
+                    # Children can delete their own comments OR comments posted as them
                     if comment['author_id'] == user['id']:
                         can_delete = True
                         reason = f"Child {user['id']} can delete their own comment"
-                    # Children CANNOT delete other children's comments
+                    elif has_posted_as_id and comment.get('posted_as_id') == user['id']:
+                        can_delete = True
+                        reason = f"Child {user['id']} can delete comment posted as them"
                     else:
+                        # Children CANNOT delete other users' comments
                         can_delete = False
-                        reason = f"Child {user['id']} cannot delete other users' comments (author: {comment['author_id']}, author_role: {author_role})"
+                        reason = (
+                            f"Child {user['id']} cannot delete other users' comments "
+                            f"(author: {comment['author_id']}, posted_as: {comment.get('posted_as_id', 'None')})"
+                        )
                 
                 log.info(f"Permission check: {reason}")
                 
