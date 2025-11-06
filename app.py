@@ -5252,8 +5252,18 @@ def edit_comment(comment_id: str):
                 reason = ""
                 
                 if is_root_admin or current_role in ['ADMIN', 'OWNER']:
-                    can_edit = True
-                    reason = f"Admin/Owner {user['id']} can edit any comment"
+                    # ADMINS: Can edit their own OR children's comments, but NOT other adults
+                    if comment['author_id'] == user['id']:
+                        can_edit = True
+                        reason = f"Admin/Owner {user['id']} can edit their own comment"
+                    # Can edit comments authored by children
+                    elif author_role and _is_child_role(author_role):
+                        can_edit = True
+                        reason = f"Admin/Owner {user['id']} can edit child comment authored by role {author_role}"
+                    # Cannot edit other adults' comments
+                    else:
+                        can_edit = False
+                        reason = f"Admin/Owner {user['id']} cannot edit other adult's comment (author role: {author_role})"
                 elif current_role in ['ADULT', 'MEMBER']:
                     # Adults can ONLY edit their own comments
                     if comment['author_id'] == user['id']:
@@ -5425,8 +5435,18 @@ def delete_comment_by_uuid(comment_id: str):
                 reason = ""
                 
                 if is_root_admin or current_role in ['ADMIN', 'OWNER']:
-                    can_delete = True
-                    reason = f"Admin/Owner {user['id']} can delete any comment"
+                    # ADMINS: Can delete their own OR children's comments, but NOT other adults
+                    if comment['author_id'] == user['id']:
+                        can_delete = True
+                        reason = f"Admin/Owner {user['id']} can delete their own comment"
+                    # Can delete comments authored by children
+                    elif author_role and _is_child_role(author_role):
+                        can_delete = True
+                        reason = f"Admin/Owner {user['id']} can delete child comment authored by {author_name}"
+                    # Cannot delete other adults' comments
+                    else:
+                        can_delete = False
+                        reason = f"Admin/Owner {user['id']} cannot delete other adult's comment (author: {author_name}, role: {author_role})"
                 elif current_role in ['ADULT', 'MEMBER']:
                     # Adults can ONLY delete their own comments
                     if comment['author_id'] == user['id']:
