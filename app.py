@@ -4868,55 +4868,76 @@ def delete_post(post_id: str):
                     (post_id,),
                 )
                 post = cur.fetchone()
-                if not post or post["tenant_slug"] != tenant_slug:
+                if not post:
                     return corsify(jsonify({"ok": False, "error": "post_not_found"}), origin), 404
 
+                # Get user's tenant (their own family) and role
+                cur.execute("""
+                    SELECT tu.tenant_id as user_tenant_id, tu.role as user_role, t.slug as user_tenant_slug
+                    FROM tenant_users tu
+                    JOIN tenants t ON tu.tenant_id = t.id
+                    WHERE tu.user_id = %s
+                    LIMIT 1
+                """, (user['id'],))
+                user_tenant_info = cur.fetchone()
+                
+                if not user_tenant_info:
+                    log.error(f"User {user['id']} has no tenant membership")
+                    return corsify(jsonify({"ok": False, "error": "no_family_membership"}), origin), 403
+                
+                user_role = user_tenant_info['user_role']
+                user_tenant_id = user_tenant_info['user_tenant_id']
+                
                 is_author = post["author_id"] == user["id"]
-                if not is_author:
-                    # Check user's role in this tenant
-                    cur.execute(
-                        """
-                            SELECT role FROM tenant_users
-                            WHERE user_id = %s AND tenant_id = %s
-                        """,
-                        (user["id"], post["tenant_id"]),
-                    )
-                    membership = cur.fetchone()
-                    
-                    if not membership:
-                        return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
-                    
-                    # Check post author's role
-                    cur.execute(
-                        """
-                            SELECT role FROM tenant_users
-                            WHERE tenant_id = %s AND user_id = %s
-                        """,
-                        (post["tenant_id"], post["author_id"]),
-                    )
+                
+                # Check if the post author is in the user's family
+                author_in_users_family = False
+                author_role = None
+                if post["author_id"]:
+                    cur.execute("""
+                        SELECT role FROM tenant_users
+                        WHERE tenant_id = %s AND user_id = %s
+                    """, (user_tenant_id, post["author_id"]))
                     author_membership = cur.fetchone()
-                    
-                    # Permission rules:
-                    # 1. ADMIN can delete any post
-                    # 2. ADULT can delete child posts (or posts by non-existent users from "post as" feature)
-                    # 3. ADULT cannot delete other adult posts
-                    has_delete_permission = False
-                    
-                    if membership["role"] in {"ADMIN", "OWNER"}:
+                    if author_membership:
+                        author_in_users_family = True
+                        author_role = author_membership['role']
+                
+                log.info(f"Delete permission check - User: {user['id']} (role: {user_role}), Post author: {post['author_id']} (in user's family: {author_in_users_family}, role: {author_role}), Is author: {is_author}")
+                
+                # Permission rules:
+                # 1. User can delete their own posts
+                # 2. Admins/Owners can delete posts by children in their family (even on connected family posts)
+                # 3. Adults can delete posts by children in their family (even on connected family posts)
+                # 4. Children can only delete their own posts
+                has_delete_permission = False
+                
+                if is_author:
+                    has_delete_permission = True
+                    log.info(f"Delete permission - User is author, can delete")
+                elif user_role in {"ADMIN", "OWNER"}:
+                    # Admins/Owners can delete any post in their family, or children's posts on connected families
+                    if post["tenant_id"] == user_tenant_id:
                         has_delete_permission = True
-                        log.info(f"Delete permission - Admin/Owner can delete any post")
-                    elif membership["role"] == "ADULT":
-                        # Adults can delete child posts or posts by non-existent users
-                        if not author_membership or author_membership["role"] != "ADULT":
-                            has_delete_permission = True
-                            author_role = author_membership["role"] if author_membership else "No membership found (post as feature)"
-                            log.info(f"Delete permission - Adult can delete child/post-as post. Author role: {author_role}")
-                        else:
-                            log.info(f"Delete permission - Adult cannot delete other adult post. Author role: {author_membership['role']}")
-                    
-                    if not has_delete_permission:
-                        log.info(f"Delete permission - DENIED. User role: {membership['role']}")
-                        return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+                        log.info(f"Delete permission - Admin/Owner deleting post in their own family")
+                    elif author_in_users_family and author_role and author_role.startswith("CHILD"):
+                        has_delete_permission = True
+                        log.info(f"Delete permission - Admin/Owner deleting their child's post on connected family")
+                    else:
+                        log.info(f"Delete permission - Admin/Owner cannot delete other family's adult posts")
+                elif user_role == "ADULT":
+                    # Adults can delete posts by children in their family
+                    if author_in_users_family and author_role and author_role.startswith("CHILD"):
+                        has_delete_permission = True
+                        log.info(f"Delete permission - Adult deleting their child's post")
+                    else:
+                        log.info(f"Delete permission - Adult cannot delete other's posts")
+                else:
+                    log.info(f"Delete permission - Child can only delete their own posts")
+                
+                if not has_delete_permission:
+                    log.info(f"Delete permission - DENIED")
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
 
                 cur.execute(
                     "DELETE FROM content_posts WHERE id = %s RETURNING media_id",
@@ -4994,53 +5015,67 @@ def edit_post(post_id: str):
                 )
                 post = cur.fetchone()
 
-                if not post or post["tenant_slug"] != tenant_slug:
+                if not post:
                     return corsify(jsonify({"ok": False, "error": "post_not_found"}), origin), 404
 
-                # Check if user is the author or has admin permissions
-                user_is_author = post["author_id"] == user["id"]
-                log.info(f"Edit permission check - Post ID: {post_id}, Post author_id: {post['author_id']}, User ID: {user['id']}, User is author: {user_is_author}")
+                # Get user's tenant (their own family) and role
+                cur.execute("""
+                    SELECT tu.tenant_id as user_tenant_id, tu.role as user_role, t.slug as user_tenant_slug
+                    FROM tenant_users tu
+                    JOIN tenants t ON tu.tenant_id = t.id
+                    WHERE tu.user_id = %s
+                    LIMIT 1
+                """, (user['id'],))
+                user_tenant_info = cur.fetchone()
                 
-                if not user_is_author:
-                    # Check user's role in this tenant
-                    cur.execute(
-                        """
-                            SELECT role FROM tenant_users
-                            WHERE tenant_id = %s AND user_id = %s
-                        """,
-                        (post["tenant_id"], user["id"]),
-                    )
-                    membership = cur.fetchone()
-                    log.info(f"Edit permission check - Tenant ID: {post['tenant_id']}, User ID: {user['id']}, Membership: {membership}")
-                    
-                    # Check post author's role
-                    cur.execute(
-                        """
-                            SELECT role FROM tenant_users
-                            WHERE tenant_id = %s AND user_id = %s
-                        """,
-                        (post["tenant_id"], post["author_id"]),
-                    )
+                if not user_tenant_info:
+                    log.error(f"User {user['id']} has no tenant membership")
+                    return corsify(jsonify({"ok": False, "error": "no_family_membership"}), origin), 403
+                
+                user_role = user_tenant_info['user_role']
+                user_tenant_id = user_tenant_info['user_tenant_id']
+                
+                # Check if user is the author
+                user_is_author = post["author_id"] == user["id"]
+                log.info(f"Edit permission check - Post ID: {post_id}, Post author_id: {post['author_id']}, User ID: {user['id']}, User is author: {user_is_author}, User role: {user_role}")
+                
+                # Check if the post author is in the user's family
+                author_in_users_family = False
+                author_role = None
+                if post["author_id"]:
+                    cur.execute("""
+                        SELECT role FROM tenant_users
+                        WHERE tenant_id = %s AND user_id = %s
+                    """, (user_tenant_id, post["author_id"]))
                     author_membership = cur.fetchone()
-                    log.info(f"Edit permission check - Post author membership: {author_membership}")
-                    
-                    # Permission rules:
-                    # 1. Only original poster can edit adult/admin posts
-                    # 2. Adults/admins can edit child posts (or posts by non-existent users from "post as" feature)
-                    has_edit_permission = False
-                    
-                    if membership and membership["role"] in {"ADMIN", "OWNER", "ADULT"}:
-                        # If author doesn't exist (post as feature) or is a child, allow editing
-                        if not author_membership or author_membership["role"].startswith("CHILD"):
-                            has_edit_permission = True
-                            author_role = author_membership["role"] if author_membership else "No membership found (post as feature)"
-                            log.info(f"Edit permission check - Adult/Admin can edit child/post-as post. Author role: {author_role}")
-                        else:
-                            log.info(f"Edit permission check - Cannot edit adult/admin post. Author role: {author_membership['role']}")
-                    
-                    if not has_edit_permission:
-                        log.info(f"Edit permission check - DENIED. User role: {membership['role'] if membership else 'No membership'}")
-                        return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+                    if author_membership:
+                        author_in_users_family = True
+                        author_role = author_membership['role']
+                
+                log.info(f"Edit permission check - Author in user's family: {author_in_users_family}, Author role: {author_role}")
+                
+                # Permission rules:
+                # 1. User can edit their own posts
+                # 2. Adults/Admins can edit posts by children in their family (even on connected family posts)
+                # 3. Children can only edit their own posts
+                has_edit_permission = False
+                
+                if user_is_author:
+                    has_edit_permission = True
+                    log.info(f"Edit permission - User is author, can edit")
+                elif user_role in {"ADMIN", "OWNER", "ADULT"}:
+                    # Adults/Admins can edit posts by children in their family
+                    if author_in_users_family and author_role and author_role.startswith("CHILD"):
+                        has_edit_permission = True
+                        log.info(f"Edit permission - Adult/Admin editing child's post from their family")
+                    else:
+                        log.info(f"Edit permission - Adult/Admin cannot edit other adult's posts")
+                else:
+                    log.info(f"Edit permission - Child can only edit their own posts")
+                
+                if not has_edit_permission:
+                    log.info(f"Edit permission check - DENIED")
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
 
                 # Update the post content
                 cur.execute(
