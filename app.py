@@ -311,7 +311,7 @@ def db_connect_once():
                 CREATE TABLE IF NOT EXISTS tenant_users (
                   user_id   uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                   tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-                  role      text NOT NULL DEFAULT 'OWNER',
+                  role      text NOT NULL DEFAULT 'ADMIN',
                   PRIMARY KEY (user_id, tenant_id)
                 );
             """)
@@ -960,6 +960,91 @@ The Kinjar Team
         log.error(f"Failed to send invitation email to {email}: {str(e)}")
         return False
 
+def send_invitation_accepted_email(inviter_email: str, inviter_name: str, invitee_name: str, family_name: str):
+    """Send notification email to the person who sent the invitation when it's accepted"""
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        log.warning(f"SMTP not configured, skipping acceptance notification to {inviter_email}")
+        return False
+    
+    try:
+        subject = f"{invitee_name} has joined {family_name} on Kinjar!"
+        
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <div style="text-align: center; margin-bottom: 30px;">
+                <h1 style="color: #3B82F6;">Great News!</h1>
+            </div>
+            
+            <div style="background: #F0FDF4; padding: 20px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #10B981;">
+                <h2 style="color: #1F2937; margin-top: 0;">Hi {inviter_name}!</h2>
+                <p style="color: #4B5563; font-size: 16px; line-height: 1.5;">
+                    <strong>{invitee_name}</strong> has accepted your invitation and joined 
+                    <strong>{family_name}</strong> on Kinjar!
+                </p>
+                <p style="color: #4B5563; font-size: 16px; line-height: 1.5;">
+                    They can now see family posts, share photos and videos, and connect with everyone in the family.
+                </p>
+            </div>
+            
+            <div style="text-align: center; margin: 30px 0;">
+                <a href="https://{ROOT_DOMAIN}" 
+                   style="background: #3B82F6; color: white; padding: 14px 28px; 
+                          text-decoration: none; border-radius: 6px; font-weight: bold; 
+                          font-size: 16px; display: inline-block;">
+                    Visit Your Family
+                </a>
+            </div>
+            
+            <div style="border-top: 1px solid #E5E7EB; padding-top: 20px; margin-top: 30px;">
+                <p style="color: #6B7280; font-size: 12px;">
+                    You're receiving this email because you invited {invitee_name} to join your family on Kinjar.
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        text_body = f"""
+Hi {inviter_name}!
+
+Great news! {invitee_name} has accepted your invitation and joined {family_name} on Kinjar!
+
+They can now see family posts, share photos and videos, and connect with everyone in the family.
+
+Visit your family at: https://{ROOT_DOMAIN}
+
+The Kinjar Team
+
+---
+You're receiving this email because you invited {invitee_name} to join your family on Kinjar.
+        """
+        
+        # Create message
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+        msg['To'] = inviter_email
+        
+        # Attach text and HTML versions
+        text_part = MIMEText(text_body, 'plain')
+        html_part = MIMEText(html_body, 'html')
+        msg.attach(text_part)
+        msg.attach(html_part)
+        
+        # Send email
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+            
+        log.info(f"Invitation acceptance notification sent successfully to {inviter_email}")
+        return True
+        
+    except Exception as e:
+        log.error(f"Failed to send acceptance notification to {inviter_email}: {str(e)}")
+        return False
+
 def send_family_creation_invite_email(email: str, name: str, requesting_family_name: str, invitation_token: str, origin: Optional[str] = None):
     """Send an email inviting someone to create a new family (auto-connect flow)."""
     if not SMTP_USERNAME or not SMTP_PASSWORD:
@@ -1546,6 +1631,25 @@ def auth_register():
                     SET status = 'accepted', accepted_at = now()
                     WHERE id = %s
                 """, (invitation["id"],))
+                
+                # Get inviter information to send notification
+                cur.execute("""
+                    SELECT u.email, up.display_name
+                    FROM users u
+                    LEFT JOIN user_profiles up ON u.id = up.user_id
+                    WHERE u.id = %s
+                """, (invitation["invited_by"],))
+                inviter = cur.fetchone()
+                
+                if inviter and inviter["email"]:
+                    inviter_name = inviter.get("display_name") or inviter["email"].split('@')[0]
+                    # Send notification email to the person who sent the invitation
+                    send_invitation_accepted_email(
+                        inviter_email=inviter["email"],
+                        inviter_name=inviter_name,
+                        invitee_name=display_name,
+                        family_name=invitation["family_name"]
+                    )
                 
                 log.info(f"User {email} registered and added to family {invitation['family_name']} with role {invitation['role']}")
             
