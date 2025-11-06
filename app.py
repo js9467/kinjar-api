@@ -5049,18 +5049,19 @@ def get_post_comments_endpoint(post_id: str):
         log.exception("Failed to get comments")
         return corsify(jsonify({"ok": False, "error": "get_comments_failed"}), origin), 500
 
-@app.post("/api/posts/<post_id>/comments")
 def _is_child_role(role_value: Optional[str]) -> bool:
     # Treat any age-bracketed child role as a child role for permission checks
     return bool(role_value) and role_value.startswith("CHILD")
 
 
+@app.post("/api/posts/<post_id>/comments")
 def add_post_comment(post_id: str):
     """Add a comment to a post"""
     origin = request.headers.get("Origin")
     user = current_user_row()
     if not user:
         return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+    user = dict(user)
 
     body = request.get_json(silent=True) or {}
     content = body.get("content", "").strip()
