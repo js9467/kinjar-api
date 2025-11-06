@@ -4910,7 +4910,7 @@ def get_user_posts(user_id: str):
                             LEFT JOIN media_objects m ON p.media_id = m.id
                             WHERE p.tenant_id = %s 
                             AND p.status = 'published'
-                            AND (p.author_id = %s OR p.posted_as_id = %s)
+                            AND (p.author_id = %s OR (p.posted_as_id IS NOT NULL AND p.posted_as_id = %s))
                             ORDER BY p.published_at DESC
                             LIMIT %s OFFSET %s
                         """, (viewing_tenant_id, user_id, user_id, limit, offset))
@@ -4983,7 +4983,7 @@ def get_user_posts(user_id: str):
                             LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
                             LEFT JOIN media_objects m ON p.media_id = m.id
                             WHERE p.status = 'published'
-                            AND (p.author_id = %s OR p.posted_as_id = %s)
+                            AND (p.author_id = %s OR (p.posted_as_id IS NOT NULL AND p.posted_as_id = %s))
                             AND p.visibility = 'family_and_connections'
                             ORDER BY p.published_at DESC
                             LIMIT %s OFFSET %s
