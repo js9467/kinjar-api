@@ -5235,12 +5235,15 @@ def delete_comment_by_uuid(comment_id: str):
     origin = request.headers.get("Origin")
     user = current_user_row()
     if not user:
+        log.warning("No user found for comment deletion")
         return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
 
     try:
         with_db()
         with pool.connection() as con:
             with con.cursor(row_factory=dict_row) as cur:
+                log.info(f"Attempting to delete comment {comment_id} by user {user['id']}")
+                
                 # Get comment details with tenant info
                 cur.execute("""
                     SELECT c.*, p.tenant_id, t.slug as tenant_slug
@@ -5252,74 +5255,47 @@ def delete_comment_by_uuid(comment_id: str):
                 comment = cur.fetchone()
                 
                 if not comment:
+                    log.warning(f"Comment {comment_id} not found")
                     return corsify(jsonify({"ok": False, "error": "comment_not_found"}), origin), 404
 
-                # Check user's role in this tenant
+                log.info(f"Comment found: author={comment['author_id']}, tenant={comment['tenant_id']}")
+
+                # Check if user is comment author, family admin, or root admin
+                is_author = comment["author_id"] == user["id"]
+                
                 cur.execute("""
-                    SELECT role, family_id FROM tenant_users
+                    SELECT role FROM tenant_users
                     WHERE tenant_id = %s AND user_id = %s
                 """, (comment["tenant_id"], user["id"]))
                 membership = cur.fetchone()
                 
-                if not membership:
-                    return corsify(jsonify({"ok": False, "error": "not_member"}), origin), 403
-                
-                current_role = membership['role']
-                current_family = membership['family_id']
+                is_admin = membership and membership["role"] in {"ADMIN", "OWNER"}
                 is_root_admin = user.get("is_root_admin", False)
                 
-                # Permission logic:
-                # 1. Root admins and tenant ADMINs can delete any comment
-                # 2. Adults can delete their own comments or child comments from their family
-                # 3. Children can only delete their own comments
+                log.info(f"Permission check: is_author={is_author}, is_admin={is_admin}, is_root_admin={is_root_admin}")
                 
-                can_delete = False
-                
-                if is_root_admin or current_role in ['ADMIN', 'OWNER']:
-                    can_delete = True
-                    log.info(f"Admin {user['id']} can delete comment {comment_id}")
-                elif current_role in ['ADULT', 'MEMBER']:
-                    # Can delete own comments
-                    if comment['author_id'] == user['id']:
-                        can_delete = True
-                        log.info(f"User {user['id']} can delete their own comment {comment_id}")
-                    # Can delete child comments from same family (if posted as child)
-                    elif comment.get('posted_as_id'):
-                        # Get the posted_as user's info
-                        cur.execute("""
-                            SELECT tu.family_id, tu.role 
-                            FROM tenant_users tu
-                            WHERE tu.tenant_id = %s AND tu.user_id = %s
-                        """, (comment["tenant_id"], comment['posted_as_id']))
-                        posted_as_info = cur.fetchone()
-                        
-                        if (posted_as_info and 
-                            posted_as_info['role'] == 'CHILD' and 
-                            posted_as_info['family_id'] == current_family):
-                            can_delete = True
-                            log.info(f"Adult {user['id']} can delete child comment {comment_id} from their family")
-                elif current_role == 'CHILD':
-                    # Children can only delete their own comments
-                    if comment['author_id'] == user['id']:
-                        can_delete = True
-                        log.info(f"Child {user['id']} can delete their own comment {comment_id}")
-                
-                if not can_delete:
-                    log.warning(f"User {user['id']} (role: {current_role}, family: {current_family}) "
-                              f"cannot delete comment {comment_id} (author: {comment['author_id']}, "
-                              f"posted_as: {comment.get('posted_as_id', 'None')})")
+                # Simplified permission check for now - just allow author, admin, or root admin
+                if not (is_author or is_admin or is_root_admin):
+                    log.warning(f"Permission denied for user {user['id']} to delete comment {comment_id}")
                     return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
 
                 # Delete the comment
+                log.info(f"Deleting comment {comment_id}")
                 cur.execute("DELETE FROM content_comments WHERE id = %s", (comment_id,))
+                
+                if cur.rowcount == 0:
+                    log.warning(f"No rows affected when deleting comment {comment_id}")
+                    return corsify(jsonify({"ok": False, "error": "comment_not_found"}), origin), 404
+                
                 con.commit()
+                log.info(f"Comment {comment_id} successfully deleted")
 
                 audit("comment_deleted", comment_id=comment_id, post_id=comment["post_id"], tenant=comment["tenant_slug"])
                 return corsify(jsonify({"ok": True}), origin)
 
     except Exception as e:
-        log.exception("Failed to delete comment")
-        return corsify(jsonify({"ok": False, "error": "delete_failed"}), origin), 500
+        log.exception(f"Failed to delete comment {comment_id}: {str(e)}")
+        return corsify(jsonify({"ok": False, "error": "delete_failed", "details": str(e)}), origin), 500
 
 
 @app.route("/api/comments/<int:comment_id>", methods=['DELETE', 'OPTIONS'])
