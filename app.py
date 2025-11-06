@@ -5341,10 +5341,41 @@ def edit_comment(comment_id: str):
                 membership = cur.fetchone()
                 
                 if not membership:
-                    log.warning(f"User {user['id']} is not a member of tenant {comment['tenant_id']}")
-                    return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
-                
-                current_role = membership['role']
+                    # Check if user's family is connected to comment's post family
+                    log.info(f"User {user['id']} is not a direct member of tenant {comment['tenant_id']}, checking for family connection")
+                    cur.execute("""
+                        SELECT tu.tenant_id as user_tenant_id, tu.role
+                        FROM tenant_users tu
+                        WHERE tu.user_id = %s
+                        LIMIT 1
+                    """, (user["id"],))
+                    user_tenant = cur.fetchone()
+                    
+                    if user_tenant:
+                        cur.execute("""
+                            SELECT 1 FROM family_connections fc
+                            WHERE fc.status = 'accepted'
+                            AND (
+                                (fc.requesting_tenant_id = %s AND fc.target_tenant_id = %s)
+                                OR (fc.requesting_tenant_id = %s AND fc.target_tenant_id = %s)
+                            )
+                        """, (user_tenant["user_tenant_id"], comment["tenant_id"], 
+                              comment["tenant_id"], user_tenant["user_tenant_id"]))
+                        connection = cur.fetchone()
+                        
+                        if connection:
+                            log.info(f"User {user['id']} family is connected to comment's family")
+                            # Use the user's role from their own family
+                            current_role = user_tenant["role"]
+                            membership = user_tenant  # Set membership so the rest of the logic works
+                        else:
+                            log.warning(f"User {user['id']} is not a member of tenant {comment['tenant_id']} and no family connection found")
+                            return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+                    else:
+                        log.warning(f"User {user['id']} has no tenant membership at all")
+                        return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
+                else:
+                    current_role = membership['role']
                 is_root_admin = (user.get("global_role") == "ROOT") if hasattr(user, "get") else False
                 
                 # Get comment author's role in this tenant (family)
@@ -5544,10 +5575,41 @@ def delete_comment_by_uuid(comment_id: str):
                 membership = cur.fetchone()
                 
                 if not membership:
-                    log.warning(f"User {user['id']} is not a member of tenant {comment['tenant_id']}")
-                    return corsify(jsonify({"ok": False, "error": "not_member"}), origin), 403
-                
-                current_role = membership['role']
+                    # Check if user's family is connected to comment's post family
+                    log.info(f"User {user['id']} is not a direct member of tenant {comment['tenant_id']}, checking for family connection")
+                    cur.execute("""
+                        SELECT tu.tenant_id as user_tenant_id, tu.role
+                        FROM tenant_users tu
+                        WHERE tu.user_id = %s
+                        LIMIT 1
+                    """, (user["id"],))
+                    user_tenant = cur.fetchone()
+                    
+                    if user_tenant:
+                        cur.execute("""
+                            SELECT 1 FROM family_connections fc
+                            WHERE fc.status = 'accepted'
+                            AND (
+                                (fc.requesting_tenant_id = %s AND fc.target_tenant_id = %s)
+                                OR (fc.requesting_tenant_id = %s AND fc.target_tenant_id = %s)
+                            )
+                        """, (user_tenant["user_tenant_id"], comment["tenant_id"], 
+                              comment["tenant_id"], user_tenant["user_tenant_id"]))
+                        connection = cur.fetchone()
+                        
+                        if connection:
+                            log.info(f"User {user['id']} family is connected to comment's family")
+                            # Use the user's role from their own family
+                            current_role = user_tenant["role"]
+                            membership = user_tenant  # Set membership so the rest of the logic works
+                        else:
+                            log.warning(f"User {user['id']} is not a member of tenant {comment['tenant_id']} and no family connection found")
+                            return corsify(jsonify({"ok": False, "error": "not_member"}), origin), 403
+                    else:
+                        log.warning(f"User {user['id']} has no tenant membership at all")
+                        return corsify(jsonify({"ok": False, "error": "not_member"}), origin), 403
+                else:
+                    current_role = membership['role']
                 is_root_admin = (user.get("global_role") == "ROOT") if hasattr(user, "get") else False
                 
                 # Get comment author's role in this tenant (family)
