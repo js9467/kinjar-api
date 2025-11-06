@@ -160,9 +160,9 @@ def update_child_profile(child_id):
                     UPDATE family_members 
                     SET {', '.join(set_clauses)}
                     WHERE id = %s
-                    RETURNING id
                 """
                 conn.execute(query, values)
+                conn.commit()
 
             return corsify(jsonify({
                 "ok": True,
