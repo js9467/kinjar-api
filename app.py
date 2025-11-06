@@ -4860,7 +4860,7 @@ def delete_post(post_id: str):
             with con.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     """
-                        SELECT p.id, p.tenant_id, p.author_id, p.media_id, t.slug AS tenant_slug
+                        SELECT p.id, p.tenant_id, p.author_id, p.posted_as_id, p.media_id, t.slug AS tenant_slug
                         FROM content_posts p
                         JOIN tenants t ON p.tenant_id = t.id
                         WHERE p.id = %s
@@ -4888,7 +4888,16 @@ def delete_post(post_id: str):
                 user_role = user_tenant_info['user_role']
                 user_tenant_id = user_tenant_info['user_tenant_id']
                 
+                # Get the current request's posted_as context (when user is acting as a child)
+                request_posted_as_id = request.headers.get('x-posted-as-id')
+                
                 is_author = post["author_id"] == user["id"]
+                
+                # For children acting as children, check if they're acting as the same child who created the post
+                is_same_child_author = False
+                if request_posted_as_id and post["posted_as_id"]:
+                    is_same_child_author = request_posted_as_id == post["posted_as_id"]
+                    log.info(f"Delete permission check - Posted as ID match: request={request_posted_as_id}, post={post['posted_as_id']}, match={is_same_child_author}")
                 
                 # Check if the post author is in the user's family
                 author_in_users_family = False
@@ -4903,18 +4912,37 @@ def delete_post(post_id: str):
                         author_in_users_family = True
                         author_role = author_membership['role']
                 
-                log.info(f"Delete permission check - User: {user['id']} (role: {user_role}), Post author: {post['author_id']} (in user's family: {author_in_users_family}, role: {author_role}), Is author: {is_author}")
+                log.info(f"Delete permission check - User: {user['id']} (role: {user_role}), Post author: {post['author_id']} (in user's family: {author_in_users_family}, role: {author_role}), Is author: {is_author}, Posted as match: {is_same_child_author}")
                 
                 # Permission rules:
-                # 1. User can delete their own posts
+                # 1. User can delete their own posts (considering posted_as context for children)
                 # 2. Admins/Owners can delete posts by children in their family (even on connected family posts)
                 # 3. Adults can delete posts by children in their family (even on connected family posts)
-                # 4. Children can only delete their own posts
+                # 4. Children can only delete their own posts (must match both author_id AND posted_as_id)
+                # 5. Adults can delete their own posts but NOT other adults' posts
                 has_delete_permission = False
                 
-                if is_author:
+                if user_role and user_role.startswith("CHILD"):
+                    # Children can only delete posts they created themselves
+                    # Must match both: logged-in user is author AND posted_as matches (if applicable)
+                    if is_author:
+                        if post["posted_as_id"]:
+                            # Post was made as a child - must match the posted_as_id
+                            has_delete_permission = is_same_child_author
+                            if has_delete_permission:
+                                log.info(f"Delete permission - Child can delete own post (posted_as matches)")
+                            else:
+                                log.info(f"Delete permission - Child cannot delete - posted_as_id mismatch")
+                        else:
+                            # Post was made by child but not as another child (shouldn't happen, but allow)
+                            has_delete_permission = True
+                            log.info(f"Delete permission - Child can delete own post (no posted_as)")
+                    else:
+                        log.info(f"Delete permission - Child cannot delete other's posts")
+                elif is_author and not post.get("posted_as_id"):
+                    # User (adult/admin) deleting their own post (not posted as child)
                     has_delete_permission = True
-                    log.info(f"Delete permission - User is author, can delete")
+                    log.info(f"Delete permission - User is author, can delete own post")
                 elif user_role in {"ADMIN", "OWNER"}:
                     # Admins/Owners can delete any post in their family, or children's posts on connected families
                     if post["tenant_id"] == user_tenant_id:
@@ -5006,7 +5034,7 @@ def edit_post(post_id: str):
                 # Check if post exists and user has permission
                 cur.execute(
                     """
-                        SELECT p.id, p.tenant_id, p.author_id, p.content, t.slug AS tenant_slug
+                        SELECT p.id, p.tenant_id, p.author_id, p.posted_as_id, p.content, t.slug AS tenant_slug
                         FROM content_posts p
                         JOIN tenants t ON p.tenant_id = t.id
                         WHERE p.id = %s
@@ -5035,9 +5063,18 @@ def edit_post(post_id: str):
                 user_role = user_tenant_info['user_role']
                 user_tenant_id = user_tenant_info['user_tenant_id']
                 
+                # Get the current request's posted_as context (when user is acting as a child)
+                request_posted_as_id = request.headers.get('x-posted-as-id')
+                
                 # Check if user is the author
                 user_is_author = post["author_id"] == user["id"]
                 log.info(f"Edit permission check - Post ID: {post_id}, Post author_id: {post['author_id']}, User ID: {user['id']}, User is author: {user_is_author}, User role: {user_role}")
+                
+                # For children acting as children, check if they're acting as the same child who created the post
+                is_same_child_author = False
+                if request_posted_as_id and post.get("posted_as_id"):
+                    is_same_child_author = request_posted_as_id == post["posted_as_id"]
+                    log.info(f"Edit permission check - Posted as ID match: request={request_posted_as_id}, post={post.get('posted_as_id')}, match={is_same_child_author}")
                 
                 # Check if the post author is in the user's family
                 author_in_users_family = False
@@ -5055,14 +5092,33 @@ def edit_post(post_id: str):
                 log.info(f"Edit permission check - Author in user's family: {author_in_users_family}, Author role: {author_role}")
                 
                 # Permission rules:
-                # 1. User can edit their own posts
+                # 1. User can edit their own posts (considering posted_as context for children)
                 # 2. Adults/Admins can edit posts by children in their family (even on connected family posts)
-                # 3. Children can only edit their own posts
+                # 3. Children can only edit their own posts (must match both author_id AND posted_as_id)
+                # 4. Adults can edit their own posts but NOT other adults' posts
                 has_edit_permission = False
                 
-                if user_is_author:
+                if user_role and user_role.startswith("CHILD"):
+                    # Children can only edit posts they created themselves
+                    # Must match both: logged-in user is author AND posted_as matches (if applicable)
+                    if user_is_author:
+                        if post.get("posted_as_id"):
+                            # Post was made as a child - must match the posted_as_id
+                            has_edit_permission = is_same_child_author
+                            if has_edit_permission:
+                                log.info(f"Edit permission - Child can edit own post (posted_as matches)")
+                            else:
+                                log.info(f"Edit permission - Child cannot edit - posted_as_id mismatch")
+                        else:
+                            # Post was made by child but not as another child (shouldn't happen, but allow)
+                            has_edit_permission = True
+                            log.info(f"Edit permission - Child can edit own post (no posted_as)")
+                    else:
+                        log.info(f"Edit permission - Child cannot edit other's posts")
+                elif user_is_author and not post.get("posted_as_id"):
+                    # User (adult/admin) editing their own post (not posted as child)
                     has_edit_permission = True
-                    log.info(f"Edit permission - User is author, can edit")
+                    log.info(f"Edit permission - User is author, can edit own post")
                 elif user_role in {"ADMIN", "OWNER", "ADULT"}:
                     # Adults/Admins can edit posts by children in their family
                     if author_in_users_family and author_role and author_role.startswith("CHILD"):
