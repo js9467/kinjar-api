@@ -5515,23 +5515,27 @@ def delete_comment(comment_id):
                 current_family = membership['family_id']
                 is_root_admin = (user.get("global_role") == "ROOT") if hasattr(user, "get") else False
                 
-                # Permission logic:
-                # 1. Root admins and tenant ADMINs can delete any comment
-                # 2. Adults can delete their own comments or child comments from their family
-                # 3. Children can only delete their own comments
+                # Permission logic (UPDATED: 2025-11-06):
+                # 1. Root admins and tenant ADMINs/OWNERs can delete any comment
+                # 2. Adults/Members can ONLY delete their own comments OR comments posted_as their children
+                # 3. Children can ONLY delete their own comments (not other children's or adults')
                 
                 can_delete = False
+                reason = ""
                 
                 if is_root_admin or current_role in ['ADMIN', 'OWNER']:
                     can_delete = True
-                    log.info(f"Admin {user['id']} can delete comment {comment_id}")
+                    reason = f"Admin/Owner {user['id']} can delete any comment"
+                    log.info(reason)
                 elif current_role in ['ADULT', 'MEMBER']:
-                    # Can delete own comments
+                    # Adults can ONLY delete their own comments
                     if comment['author_id'] == user['id']:
                         can_delete = True
-                        log.info(f"User {user['id']} can delete their own comment {comment_id}")
-                    # Can delete child comments from same family (if posted as child)
-                    elif comment.get('posted_as_id'):
+                        reason = f"Adult {user['id']} can delete their own comment"
+                        log.info(reason)
+                    # Adults can ONLY delete comments they authored but posted_as a child
+                    # CRITICAL: Must verify author_id == user['id']
+                    elif comment.get('posted_as_id') and comment['author_id'] == user['id']:
                         # Get the posted_as user's info
                         cur.execute("""
                             SELECT tu.family_id, tu.role 
@@ -5546,18 +5550,25 @@ def delete_comment(comment_id):
                             and posted_as_info['family_id'] == current_family
                         ):
                             can_delete = True
-                            log.info(f"Adult {user['id']} can delete child comment {comment_id} from their family")
+                            reason = f"Adult {user['id']} can delete comment they authored and posted_as child {comment.get('posted_as_id')}"
+                            log.info(reason)
+                    
+                    if not can_delete:
+                        reason = f"Adult {user['id']} cannot delete this comment (author: {comment['author_id']}, posted_as: {comment.get('posted_as_id', 'None')})"
                 elif current_role and _is_child_role(current_role):
-                    # Children can only delete their own comments
+                    # Children can ONLY delete their own comments
                     if comment['author_id'] == user['id']:
                         can_delete = True
-                        log.info(f"Child {user['id']} can delete their own comment {comment_id}")
+                        reason = f"Child {user['id']} can delete their own comment"
+                        log.info(reason)
+                    else:
+                        # Children CANNOT delete anyone else's comments
+                        reason = f"Child {user['id']} cannot delete other users' comments (author: {comment['author_id']}, posted_as: {comment.get('posted_as_id', 'None')})"
+
                 
                 if not can_delete:
-                    log.warning(f"User {user['id']} (role: {current_role}, family: {current_family}) "
-                              f"cannot delete comment {comment_id} (author: {comment['author_id']}, "
-                              f"posted_as: {comment.get('posted_as_id', 'None')})")
-                    return corsify(jsonify({"ok": False, "error": "permission_denied"}), origin), 403
+                    log.warning(f"Permission denied: {reason}")
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
                 
                 # Delete the comment
                 cur.execute("DELETE FROM content_comments WHERE id = %s", (comment_id,))
