@@ -117,11 +117,11 @@ def update_child_profile(child_id):
         if not data:
             return corsify(jsonify({"error": "No data provided"}), None, 400)
 
-    # Ensure database pool is ready before accessing it
-    with_db()
+        # Ensure database pool is ready before accessing it
+        with_db()
 
-    # Get database connection
-    with pool.connection() as conn:
+        # Get database connection
+        with pool.connection() as conn:
             # Verify the child belongs to the user's family
             cursor = conn.execute("""
                 SELECT m.id, m.family_id, m.role, f.admin_id
