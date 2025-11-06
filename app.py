@@ -5286,6 +5286,8 @@ def edit_comment(comment_id: str):
                         )
                 
                 log.info(f"Edit permission check: {reason}")
+                log.info(f"DEBUG EDIT: user_id={user['id']}, comment_author_id={comment['author_id']}, current_role={current_role}, is_root_admin={is_root_admin}")
+                log.info(f"DEBUG EDIT: can_edit={can_edit}, role_match={comment['author_id'] == user['id']}, _is_child_role={_is_child_role(current_role) if current_role else 'N/A'}")
                 
                 if not can_edit:
                     log.warning(f"Edit permission denied: {reason}")
@@ -5444,6 +5446,8 @@ def delete_comment_by_uuid(comment_id: str):
                         )
                 
                 log.info(f"Permission check: {reason}")
+                log.info(f"DEBUG DELETE: user_id={user['id']}, comment_author_id={comment['author_id']}, current_role={current_role}, is_root_admin={is_root_admin}")
+                log.info(f"DEBUG DELETE: can_delete={can_delete}, role_match={comment['author_id'] == user['id']}, _is_child_role={_is_child_role(current_role) if current_role else 'N/A'}")
                 
                 if not can_delete:
                     log.warning(f"Permission denied: {reason}")
