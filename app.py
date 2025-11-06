@@ -7784,7 +7784,7 @@ def get_family_by_slug(family_slug: str):
                     # User is a member or global admin, include private details
                     cur.execute("""
                         SELECT u.id, up.display_name as name, u.email, tu.role,
-                               up.avatar_url, up.bio, up.quote
+                               up.avatar_url, up.avatar_color, up.birthdate, up.bio, up.quote
                         FROM tenant_users tu
                         JOIN users u ON tu.user_id = u.id
                         LEFT JOIN user_profiles up ON u.id = up.user_id
@@ -7800,6 +7800,8 @@ def get_family_by_slug(family_slug: str):
                             "role": m["role"],
                             "joinedAt": None,
                             "avatarUrl": m["avatar_url"],
+                            "avatarColor": m.get("avatar_color") or "#3B82F6",
+                            "birthdate": m.get("birthdate").isoformat() if m.get("birthdate") else None,
                             "bio": m.get("bio"),
                             "quote": m.get("quote")
                         }
