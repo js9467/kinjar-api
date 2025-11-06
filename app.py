@@ -4951,8 +4951,8 @@ def get_user_posts(user_id: str):
                         SELECT 1 FROM family_connections fc
                         WHERE fc.status = 'accepted'
                         AND (
-                            (fc.from_tenant_id = %s AND fc.to_tenant_id = %s)
-                            OR (fc.to_tenant_id = %s AND fc.from_tenant_id = %s)
+                            (fc.requesting_tenant_id = %s AND fc.target_tenant_id = %s)
+                            OR (fc.target_tenant_id = %s AND fc.requesting_tenant_id = %s)
                         )
                         LIMIT 1
                     """, (viewing_tenant_id, user_tenant_id, viewing_tenant_id, user_tenant_id))
