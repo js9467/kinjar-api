@@ -3258,6 +3258,7 @@ def prepare_media_upload():
     user = current_user_row()
     if not user:
         return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+    user = dict(user)
 
     tenant_slug = request.headers.get("x-tenant-slug", "").strip()
     if not tenant_slug:
@@ -5049,6 +5050,11 @@ def get_post_comments_endpoint(post_id: str):
         return corsify(jsonify({"ok": False, "error": "get_comments_failed"}), origin), 500
 
 @app.post("/api/posts/<post_id>/comments")
+def _is_child_role(role_value: Optional[str]) -> bool:
+    # Treat any age-bracketed child role as a child role for permission checks
+    return bool(role_value) and role_value.startswith("CHILD")
+
+
 def add_post_comment(post_id: str):
     """Add a comment to a post"""
     origin = request.headers.get("Origin")
@@ -5216,7 +5222,7 @@ def edit_comment(comment_id: str):
                     return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
                 
                 current_role = membership['role']
-                is_root_admin = user.get("is_root_admin", False)
+                is_root_admin = (user.get("global_role") == "ROOT") if hasattr(user, "get") else False
                 
                 # Get comment author's role in this tenant (family)
                 cur.execute("""
@@ -5254,10 +5260,17 @@ def edit_comment(comment_id: str):
                         can_edit = True
                         reason = f"Adult {user['id']} can edit their own comment"
                     # Adults can edit child comments (where posted_as_id refers to a child)
-                    elif has_posted_as_id and comment.get('posted_as_id') and posted_as_role == 'CHILD':
+                    elif has_posted_as_id and comment.get('posted_as_id') and _is_child_role(posted_as_role):
                         can_edit = True
-                        reason = f"Adult {user['id']} can edit child comment (posted_as child with role {posted_as_role})"
-                elif current_role == 'CHILD':
+                        reason = (
+                            f"Adult {user['id']} can edit child comment (posted_as child role {posted_as_role})"
+                        )
+                    elif author_role and _is_child_role(author_role):
+                        can_edit = True
+                        reason = (
+                            f"Adult {user['id']} can edit child comment authored by role {author_role}"
+                        )
+                elif current_role and _is_child_role(current_role):
                     # Children can edit their own comments OR comments posted as them
                     if comment['author_id'] == user['id']:
                         can_edit = True
@@ -5305,6 +5318,7 @@ def delete_comment_by_uuid(comment_id: str):
     if not user:
         log.warning("No user found for comment deletion")
         return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+    user = dict(user)
 
     try:
         with_db()
@@ -5365,7 +5379,7 @@ def delete_comment_by_uuid(comment_id: str):
                     return corsify(jsonify({"ok": False, "error": "not_member"}), origin), 403
                 
                 current_role = membership['role']
-                is_root_admin = user.get("is_root_admin", False)
+                is_root_admin = (user.get("global_role") == "ROOT") if hasattr(user, "get") else False
                 
                 # Get comment author's role in this tenant (family)
                 cur.execute("""
@@ -5402,10 +5416,17 @@ def delete_comment_by_uuid(comment_id: str):
                         can_delete = True
                         reason = f"Adult {user['id']} can delete their own comment"
                     # Adults can delete child comments (where posted_as_id refers to a child)
-                    elif has_posted_as_id and comment.get('posted_as_id') and posted_as_role == 'CHILD':
+                    elif has_posted_as_id and comment.get('posted_as_id') and _is_child_role(posted_as_role):
                         can_delete = True
-                        reason = f"Adult {user['id']} can delete child comment (posted_as child with role {posted_as_role})"
-                elif current_role == 'CHILD':
+                        reason = (
+                            f"Adult {user['id']} can delete child comment (posted_as child role {posted_as_role})"
+                        )
+                    elif author_role and _is_child_role(author_role):
+                        can_delete = True
+                        reason = (
+                            f"Adult {user['id']} can delete child comment authored by role {author_role}"
+                        )
+                elif current_role and _is_child_role(current_role):
                     # Children can delete their own comments OR comments posted as them
                     if comment['author_id'] == user['id']:
                         can_delete = True
@@ -5456,6 +5477,7 @@ def delete_comment(comment_id):
     user = current_user_row()
     if not user:
         return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+    user = dict(user)
 
     try:
         with_db()
@@ -5486,7 +5508,7 @@ def delete_comment(comment_id):
                 
                 current_role = membership['role']
                 current_family = membership['family_id']
-                is_root_admin = user.get("is_root_admin", False)
+                is_root_admin = (user.get("global_role") == "ROOT") if hasattr(user, "get") else False
                 
                 # Permission logic:
                 # 1. Root admins and tenant ADMINs can delete any comment
@@ -5513,12 +5535,14 @@ def delete_comment(comment_id):
                         """, (comment["tenant_id"], comment['posted_as_id']))
                         posted_as_info = cur.fetchone()
                         
-                        if (posted_as_info and 
-                            posted_as_info['role'] == 'CHILD' and 
-                            posted_as_info['family_id'] == current_family):
+                        if (
+                            posted_as_info
+                            and _is_child_role(posted_as_info['role'])
+                            and posted_as_info['family_id'] == current_family
+                        ):
                             can_delete = True
                             log.info(f"Adult {user['id']} can delete child comment {comment_id} from their family")
-                elif current_role == 'CHILD':
+                elif current_role and _is_child_role(current_role):
                     # Children can only delete their own comments
                     if comment['author_id'] == user['id']:
                         can_delete = True
