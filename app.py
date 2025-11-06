@@ -8272,5 +8272,223 @@ def get_pending_invitations():
         log.error(f"Failed to get pending invitations: {e}")
         return corsify(jsonify({"ok": False, "error": "server_error"}), origin), 500
 
+@app.delete("/api/families/invitations/<invitation_id>")
+def cancel_invitation(invitation_id: str):
+    """Cancel/delete a pending invitation"""
+    origin = request.headers.get("Origin")
+    
+    # Check authentication
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+    
+    # Get tenant slug from header
+    tenant_slug = request.headers.get('x-tenant-slug')
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "Missing tenant slug"}), origin), 400
+    
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Get tenant_id for the current family
+            cur.execute("""
+                SELECT id FROM tenants WHERE slug = %s
+            """, (tenant_slug,))
+            tenant = cur.fetchone()
+            
+            if not tenant:
+                return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+            
+            tenant_id = tenant['id']
+            
+            # Check if user has permission to manage invitations for this family
+            cur.execute("""
+                SELECT role FROM tenant_users 
+                WHERE tenant_id = %s AND user_id = %s
+            """, (tenant_id, user['id']))
+            membership = cur.fetchone()
+            
+            if not membership or membership['role'] not in ['OWNER', 'ADMIN', 'ADULT']:
+                return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+            
+            # Try to find and delete from tenant_invitations first
+            cur.execute("""
+                DELETE FROM tenant_invitations 
+                WHERE id = %s AND tenant_id = %s AND status = 'pending'
+                RETURNING id, email, invited_name
+            """, (invitation_id, tenant_id))
+            deleted = cur.fetchone()
+            
+            if deleted:
+                con.commit()
+                log.info(f"Cancelled member invitation {invitation_id} for {deleted['email']}")
+                return corsify(jsonify({
+                    "ok": True,
+                    "message": "Invitation cancelled successfully",
+                    "type": "member_invitation"
+                }), origin)
+            
+            # If not found, try family_creation_invitations
+            cur.execute("""
+                DELETE FROM family_creation_invitations 
+                WHERE id = %s AND requesting_tenant_id = %s AND status = 'pending'
+                RETURNING id, email, invited_name
+            """, (invitation_id, tenant_id))
+            deleted = cur.fetchone()
+            
+            if deleted:
+                con.commit()
+                log.info(f"Cancelled family creation invitation {invitation_id} for {deleted['email']}")
+                return corsify(jsonify({
+                    "ok": True,
+                    "message": "Invitation cancelled successfully",
+                    "type": "family_creation"
+                }), origin)
+            
+            # Invitation not found or already accepted/expired
+            return corsify(jsonify({
+                "ok": False,
+                "error": "Invitation not found or already processed"
+            }), origin), 404
+            
+    except Exception as e:
+        log.error(f"Failed to cancel invitation {invitation_id}: {e}")
+        return corsify(jsonify({"ok": False, "error": "server_error"}), origin), 500
+
+@app.post("/api/families/invitations/<invitation_id>/resend")
+def resend_invitation(invitation_id: str):
+    """Resend a pending invitation with a new token and expiry"""
+    origin = request.headers.get("Origin")
+    
+    # Check authentication
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+    
+    # Get tenant slug from header
+    tenant_slug = request.headers.get('x-tenant-slug')
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "Missing tenant slug"}), origin), 400
+    
+    try:
+        with_db()
+        with pool.connection() as con, con.cursor(row_factory=dict_row) as cur:
+            # Get tenant_id for the current family
+            cur.execute("""
+                SELECT id, name, slug FROM tenants WHERE slug = %s
+            """, (tenant_slug,))
+            tenant = cur.fetchone()
+            
+            if not tenant:
+                return corsify(jsonify({"ok": False, "error": "family_not_found"}), origin), 404
+            
+            tenant_id = tenant['id']
+            family_name = tenant['name']
+            family_slug = tenant['slug']
+            
+            # Check if user has permission to manage invitations for this family
+            cur.execute("""
+                SELECT role FROM tenant_users 
+                WHERE tenant_id = %s AND user_id = %s
+            """, (tenant_id, user['id']))
+            membership = cur.fetchone()
+            
+            if not membership or membership['role'] not in ['OWNER', 'ADMIN', 'ADULT']:
+                return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+            
+            # Try to find and update tenant_invitations first
+            cur.execute("""
+                SELECT id, email, invited_name, role
+                FROM tenant_invitations 
+                WHERE id = %s AND tenant_id = %s AND status = 'pending'
+            """, (invitation_id, tenant_id))
+            invitation = cur.fetchone()
+            
+            if invitation:
+                # Generate new token and expiry
+                new_token = str(uuid4()).replace('-', '')
+                new_expiry = datetime.now() + timedelta(days=7)
+                
+                # Update invitation with new token and expiry
+                cur.execute("""
+                    UPDATE tenant_invitations 
+                    SET invite_token = %s, expires_at = %s
+                    WHERE id = %s
+                """, (new_token, new_expiry, invitation_id))
+                
+                con.commit()
+                
+                # Resend invitation email
+                email_sent = send_invitation_email(
+                    email=invitation['email'],
+                    name=invitation['invited_name'],
+                    family_name=family_name,
+                    invitation_token=new_token,
+                    family_slug=family_slug
+                )
+                
+                log.info(f"Resent member invitation {invitation_id} to {invitation['email']}")
+                return corsify(jsonify({
+                    "ok": True,
+                    "message": "Invitation resent successfully",
+                    "type": "member_invitation",
+                    "emailSent": email_sent,
+                    "expiresAt": new_expiry.isoformat()
+                }), origin)
+            
+            # If not found, try family_creation_invitations
+            cur.execute("""
+                SELECT fci.id, fci.email, fci.invited_name, fci.message,
+                       t.name as requesting_family_name
+                FROM family_creation_invitations fci
+                JOIN tenants t ON fci.requesting_tenant_id = t.id
+                WHERE fci.id = %s AND fci.requesting_tenant_id = %s AND fci.status = 'pending'
+            """, (invitation_id, tenant_id))
+            invitation = cur.fetchone()
+            
+            if invitation:
+                # Generate new token and expiry
+                new_token = str(uuid4())
+                new_expiry = datetime.datetime.utcnow() + timedelta(days=7)
+                
+                # Update invitation with new token and expiry
+                cur.execute("""
+                    UPDATE family_creation_invitations 
+                    SET token = %s, expires_at = %s
+                    WHERE id = %s
+                """, (new_token, new_expiry, invitation_id))
+                
+                con.commit()
+                
+                # Resend family creation invitation email
+                email_sent = send_family_creation_invite_email(
+                    email=invitation['email'],
+                    name=invitation['invited_name'],
+                    requesting_family_name=invitation['requesting_family_name'],
+                    invitation_token=new_token,
+                    origin=origin
+                )
+                
+                log.info(f"Resent family creation invitation {invitation_id} to {invitation['email']}")
+                return corsify(jsonify({
+                    "ok": True,
+                    "message": "Invitation resent successfully",
+                    "type": "family_creation",
+                    "emailSent": email_sent,
+                    "expiresAt": new_expiry.isoformat()
+                }), origin)
+            
+            # Invitation not found or already accepted/expired
+            return corsify(jsonify({
+                "ok": False,
+                "error": "Invitation not found or already processed"
+            }), origin), 404
+            
+    except Exception as e:
+        log.error(f"Failed to resend invitation {invitation_id}: {e}")
+        import traceback
+        log.error(f"Traceback: {traceback.format_exc()}")
+        return corsify(jsonify({"ok": False, "error": "server_error"}), origin), 500
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
