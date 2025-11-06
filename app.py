@@ -7778,9 +7778,34 @@ def get_family_by_slug(family_slug: str):
                     WHERE user_id = %s AND tenant_id = %s
                 """, (user["id"], family["id"]))
                 membership = cur.fetchone()
+                
                 # Check if user is a global admin
                 is_global_admin = user.get("global_role") in ["ROOT", "ADMIN"]
-                if membership or is_global_admin:
+                
+                # Check if user's family is connected to this family
+                is_connected_family = False
+                if not membership and not is_global_admin:
+                    # Get user's families
+                    cur.execute("""
+                        SELECT tenant_id FROM tenant_users WHERE user_id = %s
+                    """, (user["id"],))
+                    user_families = [row["tenant_id"] for row in cur.fetchall()]
+                    
+                    if user_families:
+                        # Check if any of user's families are connected to the requested family
+                        cur.execute("""
+                            SELECT 1 FROM family_connections
+                            WHERE status = 'accepted'
+                              AND (
+                                (requesting_tenant_id = %s AND target_tenant_id = ANY(%s))
+                                OR
+                                (target_tenant_id = %s AND requesting_tenant_id = ANY(%s))
+                              )
+                            LIMIT 1
+                        """, (family["id"], user_families, family["id"], user_families))
+                        is_connected_family = cur.fetchone() is not None
+                
+                if membership or is_global_admin or is_connected_family:
                     # User is a member or global admin, include private details
                     cur.execute("""
                         SELECT u.id, up.display_name as name, u.email, tu.role,
