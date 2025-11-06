@@ -5245,7 +5245,7 @@ def edit_comment(comment_id: str):
 
                 # Permission logic (UPDATED: 2025-11-06):
                 # 1. Root admins and tenant ADMINs/OWNERs can edit any comment
-                # 2. Adults/Members can ONLY edit their own comments OR comments posted_as their children
+                # 2. Adults/Members can ONLY edit their own comments OR any child's comments
                 # 3. Children can ONLY edit their own comments (not other children's or adults')
                 
                 can_edit = False
@@ -5256,18 +5256,27 @@ def edit_comment(comment_id: str):
                     can_edit = True
                     reason = f"Admin/Owner {user['id']} can edit any comment in the family"
                 elif current_role in ['ADULT', 'MEMBER']:
-                    # Adults: Can edit any comment in their family
-                    can_edit = True
-                    reason = f"Adult {user['id']} can edit any comment in the family"
-                elif current_role and _is_child_role(current_role):
-                    # Children accounts: Can only edit comments posted AS them
-                    # (i.e., comments where posted_as_id = their ID or author_id = their ID)
-                    if comment['author_id'] == user['id'] or comment.get('posted_as_id') == user['id']:
+                    # Adults can edit their own comments OR any child's comments
+                    if comment['author_id'] == user['id']:
                         can_edit = True
-                        reason = f"Child {user['id']} can edit comments posted as them"
+                        reason = f"Adult {user['id']} can edit their own comment"
                     else:
-                        can_edit = False
-                        reason = f"Child {user['id']} cannot edit comments not posted as them"
+                        # Check if comment author is a child
+                        cur.execute("""
+                            SELECT role FROM tenant_users 
+                            WHERE user_id = %s AND tenant_id = %s
+                        """, (comment['author_id'], comment["tenant_id"]))
+                        author_info = cur.fetchone()
+                        if author_info and _is_child_role(author_info['role']):
+                            can_edit = True
+                            reason = f"Adult {user['id']} can edit child's comment (author role: {author_info['role']})"
+                elif current_role and _is_child_role(current_role):
+                    # Children can ONLY edit their own comments
+                    if comment['author_id'] == user['id']:
+                        can_edit = True
+                        reason = f"Child {user['id']} can edit their own comment"
+                    else:
+                        reason = f"Child {user['id']} cannot edit other users' comments"
                 
                 log.info(f"Edit permission check: {reason}")
                 log.info(f"DEBUG EDIT: user_id={user['id']}, comment_author_id={comment['author_id']}, current_role={current_role}, is_root_admin={is_root_admin}")
@@ -5402,7 +5411,7 @@ def delete_comment_by_uuid(comment_id: str):
                 
                 # Permission logic (UPDATED: 2025-11-06):
                 # 1. Root admins and tenant ADMINs/OWNERs can delete any comment
-                # 2. Adults/Members can ONLY delete their own comments OR comments posted_as their children
+                # 2. Adults/Members can ONLY delete their own comments OR any child's comments
                 # 3. Children can ONLY delete their own comments (not other children's or adults')
                 
                 can_delete = False
@@ -5413,18 +5422,27 @@ def delete_comment_by_uuid(comment_id: str):
                     can_delete = True
                     reason = f"Admin/Owner {user['id']} can delete any comment in the family"
                 elif current_role in ['ADULT', 'MEMBER']:
-                    # Adults: Can delete any comment in their family
-                    can_delete = True
-                    reason = f"Adult {user['id']} can delete any comment in the family"
-                elif current_role and _is_child_role(current_role):
-                    # Children accounts: Can only delete comments posted AS them
-                    # (i.e., comments where posted_as_id = their ID or author_id = their ID)
-                    if comment['author_id'] == user['id'] or comment.get('posted_as_id') == user['id']:
+                    # Adults can delete their own comments OR any child's comments
+                    if comment['author_id'] == user['id']:
                         can_delete = True
-                        reason = f"Child {user['id']} can delete comments posted as them"
+                        reason = f"Adult {user['id']} can delete their own comment"
                     else:
-                        can_delete = False
-                        reason = f"Child {user['id']} cannot delete comments not posted as them"
+                        # Check if comment author is a child
+                        cur.execute("""
+                            SELECT role FROM tenant_users 
+                            WHERE user_id = %s AND tenant_id = %s
+                        """, (comment['author_id'], comment["tenant_id"]))
+                        author_info = cur.fetchone()
+                        if author_info and _is_child_role(author_info['role']):
+                            can_delete = True
+                            reason = f"Adult {user['id']} can delete child's comment (author role: {author_info['role']})"
+                elif current_role and _is_child_role(current_role):
+                    # Children can ONLY delete their own comments
+                    if comment['author_id'] == user['id']:
+                        can_delete = True
+                        reason = f"Child {user['id']} can delete their own comment"
+                    else:
+                        reason = f"Child {user['id']} cannot delete other users' comments"
                 
                 log.info(f"Permission check: {reason}")
                 log.info(f"DEBUG DELETE: user_id={user['id']}, comment_author_id={comment['author_id']}, current_role={current_role}, is_root_admin={is_root_admin}")
