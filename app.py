@@ -5236,8 +5236,33 @@ def add_post_comment(post_id: str):
                         WHERE user_id = %s AND tenant_id = %s
                     """, (posted_as_id, post["tenant_id"]))
                     posted_as_membership = cur.fetchone()
+                    
+                    # If not a direct member, check if posted_as belongs to a connected family
                     if not posted_as_membership:
-                        return corsify(jsonify({"ok": False, "error": "posted_as_not_tenant_member"}), origin), 403
+                        cur.execute("""
+                            SELECT tu.tenant_id as posted_as_tenant_id
+                            FROM tenant_users tu
+                            WHERE tu.user_id = %s
+                            LIMIT 1
+                        """, (posted_as_id,))
+                        posted_as_tenant = cur.fetchone()
+                        
+                        if posted_as_tenant:
+                            cur.execute("""
+                                SELECT 1 FROM family_connections fc
+                                WHERE fc.status = 'accepted'
+                                AND (
+                                    (fc.requesting_tenant_id = %s AND fc.target_tenant_id = %s)
+                                    OR (fc.requesting_tenant_id = %s AND fc.target_tenant_id = %s)
+                                )
+                            """, (posted_as_tenant["posted_as_tenant_id"], post["tenant_id"], 
+                                  post["tenant_id"], posted_as_tenant["posted_as_tenant_id"]))
+                            posted_as_connection = cur.fetchone()
+                            
+                            if not posted_as_connection:
+                                return corsify(jsonify({"ok": False, "error": "posted_as_not_tenant_member"}), origin), 403
+                        else:
+                            return corsify(jsonify({"ok": False, "error": "posted_as_not_tenant_member"}), origin), 403
 
             comment = add_comment(con, post_id, user["id"], content, parent_id, posted_as_id)
             
