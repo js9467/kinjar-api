@@ -412,6 +412,15 @@ def db_connect_once():
                 END $$;
             """)
             
+            # Add posted_as_id column for comments - tracking when parents comment as children
+            cur.execute("""
+                DO $$ BEGIN
+                    ALTER TABLE content_comments ADD COLUMN posted_as_id uuid REFERENCES users(id) ON DELETE SET NULL;
+                EXCEPTION
+                    WHEN duplicate_column THEN NULL;
+                END $$;
+            """)
+            
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_content_posts_tenant_published
                   ON content_posts (tenant_id, published_at DESC) WHERE status = 'published';
@@ -4032,25 +4041,30 @@ def get_post_comments(con, post_id: str) -> List[Dict[str, Any]]:
                 u.email as author_email,
                 up.display_name as author_name,
                 up.avatar_url as author_avatar,
-                up.avatar_color as author_avatar_color
+                up.avatar_color as author_avatar_color,
+                up2.display_name as posted_as_name,
+                up2.avatar_url as posted_as_avatar,
+                up2.avatar_color as posted_as_avatar_color
             FROM content_comments c
             JOIN users u ON c.author_id = u.id
             LEFT JOIN user_profiles up ON u.id = up.user_id
+            LEFT JOIN users u2 ON c.posted_as_id = u2.id
+            LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
             WHERE c.post_id = %s AND c.status = 'published'
             ORDER BY c.created_at ASC
         """, (post_id,))
         return cur.fetchall()
 
-def add_comment(con, post_id: str, author_id: str, content: str, parent_id: str = None) -> Dict[str, Any]:
+def add_comment(con, post_id: str, author_id: str, content: str, parent_id: str = None, posted_as_id: str = None) -> Dict[str, Any]:
     """Add a comment to a post"""
     comment_id = str(uuid4())
     
     with con.cursor(row_factory=dict_row) as cur:
         cur.execute("""
-            INSERT INTO content_comments (id, post_id, author_id, parent_id, content)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO content_comments (id, post_id, author_id, parent_id, content, posted_as_id)
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING *
-        """, (comment_id, post_id, author_id, parent_id, content))
+        """, (comment_id, post_id, author_id, parent_id, content, posted_as_id))
         comment = cur.fetchone()
         
         # Get tenant_id for activity feed
@@ -5021,7 +5035,11 @@ def get_post_comments_endpoint(post_id: str):
                     "content": comment["content"],
                     "createdAt": comment.get("created_at").isoformat() if comment.get("created_at") else None,
                     "parentId": comment.get("parent_id"),
-                    "status": comment.get("status", "published")
+                    "status": comment.get("status", "published"),
+                    # Include posted_as fields for child posting support
+                    "posted_as_name": comment.get("posted_as_name"),
+                    "posted_as_avatar_color": comment.get("posted_as_avatar_color"),
+                    "posted_as_avatar": comment.get("posted_as_avatar")
                 })
             
             return corsify(jsonify({"ok": True, "comments": formatted_comments}), origin)
@@ -5041,6 +5059,7 @@ def add_post_comment(post_id: str):
     body = request.get_json(silent=True) or {}
     content = body.get("content", "").strip()
     parent_id = body.get("parent_id")
+    posted_as_id = body.get("posted_as_id")  # Support for child posting
 
     if not content:
         return corsify(jsonify({"ok": False, "error": "content_required"}), origin), 400
@@ -5106,7 +5125,17 @@ def add_post_comment(post_id: str):
                     else:
                         return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
 
-            comment = add_comment(con, post_id, user["id"], content, parent_id)
+                # Verify posted_as_id is a member of the tenant if provided
+                if posted_as_id:
+                    cur.execute("""
+                        SELECT role FROM tenant_users
+                        WHERE user_id = %s AND tenant_id = %s
+                    """, (posted_as_id, post["tenant_id"]))
+                    posted_as_membership = cur.fetchone()
+                    if not posted_as_membership:
+                        return corsify(jsonify({"ok": False, "error": "posted_as_not_tenant_member"}), origin), 403
+
+            comment = add_comment(con, post_id, user["id"], content, parent_id, posted_as_id)
             
             audit("comment_added", post_id=post_id, comment_id=comment["id"], tenant=post["tenant_slug"])
             return corsify(jsonify({"ok": True, "comment": comment}), origin)
