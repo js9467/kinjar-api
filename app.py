@@ -4840,6 +4840,128 @@ def get_post(post_id: str):
         log.exception("Failed to get post")
         return corsify(jsonify({"ok": False, "error": "get_failed"}), origin), 500
 
+@app.get("/api/users/<user_id>/posts")
+def get_user_posts(user_id: str):
+    """Get posts created by a specific user (including posts made as children)"""
+    origin = request.headers.get("Origin")
+    
+    tenant_slug = request.args.get("tenant", "")
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "missing_tenant"}), origin), 400
+    
+    limit = min(max(int(request.args.get("limit", "20")), 1), 100)
+    offset = max(int(request.args.get("offset", "0")), 0)
+    
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get tenant
+                cur.execute("SELECT * FROM tenants WHERE slug = %s", (tenant_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+                
+                # Check if visibility and posted_as_id columns exist
+                cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'content_posts' AND column_name IN ('visibility', 'posted_as_id')
+                """)
+                existing_columns = {row['column_name'] for row in cur.fetchall()}
+                has_visibility = 'visibility' in existing_columns
+                has_posted_as = 'posted_as_id' in existing_columns
+                
+                # Get posts where user is the author OR posted_as
+                if has_visibility and has_posted_as:
+                    cur.execute("""
+                        SELECT 
+                            p.*,
+                            u.email as author_email,
+                            up.display_name as author_name,
+                            up.avatar_url as author_avatar,
+                            up.avatar_color as author_avatar_color,
+                            up2.display_name as posted_as_name,
+                            up2.avatar_url as posted_as_avatar,
+                            up2.avatar_color as posted_as_avatar_color,
+                            m.filename as media_filename,
+                            m.content_type as media_content_type,
+                            m.r2_key as media_r2_key,
+                            m.external_url as media_external_url,
+                            m.thumbnail_url as media_thumbnail,
+                            m.duration_seconds as media_duration
+                        FROM content_posts p
+                        JOIN users u ON p.author_id = u.id
+                        LEFT JOIN user_profiles up ON u.id = up.user_id
+                        LEFT JOIN users u2 ON p.posted_as_id = u2.id
+                        LEFT JOIN user_profiles up2 ON u2.id = up2.user_id
+                        LEFT JOIN media_objects m ON p.media_id = m.id
+                        WHERE p.tenant_id = %s 
+                        AND p.status = 'published'
+                        AND (p.author_id = %s OR p.posted_as_id = %s)
+                        ORDER BY p.published_at DESC
+                        LIMIT %s OFFSET %s
+                    """, (tenant["id"], user_id, user_id, limit, offset))
+                else:
+                    cur.execute("""
+                        SELECT 
+                            p.*,
+                            u.email as author_email,
+                            up.display_name as author_name,
+                            up.avatar_url as author_avatar,
+                            up.avatar_color as author_avatar_color,
+                            m.filename as media_filename,
+                            m.content_type as media_content_type,
+                            m.r2_key as media_r2_key,
+                            m.external_url as media_external_url,
+                            m.thumbnail_url as media_thumbnail,
+                            m.duration_seconds as media_duration
+                        FROM content_posts p
+                        JOIN users u ON p.author_id = u.id
+                        LEFT JOIN user_profiles up ON u.id = up.user_id
+                        LEFT JOIN media_objects m ON p.media_id = m.id
+                        WHERE p.tenant_id = %s 
+                        AND p.status = 'published'
+                        AND p.author_id = %s
+                        ORDER BY p.published_at DESC
+                        LIMIT %s OFFSET %s
+                    """, (tenant["id"], user_id, limit, offset))
+                
+                posts = cur.fetchall()
+                
+                # Add signed URLs for media
+                try:
+                    media_s3 = s3_client()
+                except StorageNotConfigured as e:
+                    media_s3 = None
+                    log.warning("get_user_posts skipping media URL sign because storage is not configured: %s", e)
+                
+                proto = request.headers.get('X-Forwarded-Proto', 'https')
+                backend_host = request.headers.get('X-Forwarded-Host', request.host)
+                backend_base = f"{proto}://{backend_host}"
+                
+                for post in posts:
+                    if media_s3 and post.get("media_r2_key"):
+                        try:
+                            signed_url = media_s3.generate_presigned_url(
+                                ClientMethod="get_object",
+                                Params={"Bucket": S3_BUCKET, "Key": post["media_r2_key"]},
+                                ExpiresIn=3600,
+                            )
+                            post["media_url"] = signed_url
+                        except Exception:
+                            log.exception(f"Failed to generate signed URL for {post['media_r2_key']}")
+                    elif post.get("media_external_url"):
+                        post["media_url"] = post["media_external_url"]
+                    elif post.get("media_id"):
+                        post["media_url"] = f"{backend_base}/api/media/{post['media_id']}"
+                
+                return corsify(jsonify({"ok": True, "posts": [dict(p) for p in posts]}), origin)
+                
+    except Exception as e:
+        log.exception("Failed to get user posts")
+        return corsify(jsonify({"ok": False, "error": "get_failed"}), origin), 500
+
 @app.delete("/api/posts/<post_id>")
 def delete_post(post_id: str):
     """Delete a post and associated media/comments."""
