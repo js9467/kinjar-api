@@ -101,29 +101,31 @@ def handle_preflight():
 @app.route('/api/child-profiles/<child_id>', methods=['PATCH'])
 def update_child_profile(child_id):
     """Update a child's profile information when acting as that child"""
+    origin = request.headers.get("Origin")
     try:
         # Get current user info
-        user_id = get_user_id_from_token()
-        if not user_id:
-            return corsify(jsonify({"error": "Not authenticated"}), None, 401)
+        user, err = require_auth()
+        if err:
+            return corsify(err, origin)
+        user_id = user["id"]
 
         # Verify that user has permission to update this child's profile
         acting_as_child = request.headers.get('x-acting-as-child') == 'true'
         if not acting_as_child:
-            return corsify(jsonify({"error": "Must be in child mode to update child profile"}), None, 403)
+            return corsify(jsonify({"error": "Must be in child mode to update child profile"}), origin, 403)
 
         # Get request data
         data = request.get_json()
         if not data:
-            return corsify(jsonify({"error": "No data provided"}), None, 400)
+            return corsify(jsonify({"error": "No data provided"}), origin, 400)
 
         # Ensure database pool is ready before accessing it
         with_db()
 
         # Get database connection
-        with pool.connection() as conn:
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cursor:
             # Verify the child belongs to the user's family
-            cursor = conn.execute("""
+            cursor.execute("""
                 SELECT m.id, m.family_id, m.role, f.admin_id
                 FROM family_members m
                 JOIN families f ON m.family_id = f.id
@@ -132,10 +134,10 @@ def update_child_profile(child_id):
             member = cursor.fetchone()
 
             if not member:
-                return corsify(jsonify({"error": "Child not found"}), None, 404)
+                return corsify(jsonify({"error": "Child not found"}), origin, 404)
 
             # Check if user has permission (either family admin or adult member)
-            cursor = conn.execute("""
+            cursor.execute("""
                 SELECT role
                 FROM family_members
                 WHERE family_id = %s AND user_id = %s
@@ -143,7 +145,7 @@ def update_child_profile(child_id):
             user_role = cursor.fetchone()
 
             if not user_role or user_role['role'] not in ['ADMIN', 'ADULT']:
-                return corsify(jsonify({"error": "Permission denied"}), None, 403)
+                return corsify(jsonify({"error": "Permission denied"}), origin, 403)
 
             # Process updates
             updates = {}
@@ -164,20 +166,20 @@ def update_child_profile(child_id):
                     SET {', '.join(set_clauses)}
                     WHERE id = %s
                 """
-                conn.execute(query, values)
+                cursor.execute(query, values)
                 conn.commit()
 
             return corsify(jsonify({
                 "ok": True,
                 "message": "Child profile updated successfully"
-            }), None)
+            }), origin)
 
     except Exception as e:
         logging.error(f"Error updating child profile: {str(e)}", exc_info=True)
         return corsify(jsonify({
             "error": "Failed to update child profile",
             "detail": str(e)
-        }), None, 500)
+        }), origin, 500)
 
 # Configure Flask for larger file uploads. Some iOS Live Photos and newer
 # devices can easily exceed 50MB even when they appear "small" in the photo
