@@ -5753,6 +5753,103 @@ def respond_to_family_connection(connection_id: str):
         log.exception("Failed to respond to family connection")
         return corsify(jsonify({"ok": False, "error": "response_failed"}), origin), 500
 
+@app.delete("/api/families/connections/<connection_id>")
+def disconnect_family(connection_id: str):
+    """Disconnect from a family by deleting the connection"""
+    origin = request.headers.get("Origin")
+    user = current_user_row()
+    if not user:
+        return corsify(jsonify({"ok": False, "error": "unauthorized"}), origin), 401
+
+    tenant_slug = request.headers.get("x-tenant-slug")
+    if not tenant_slug:
+        return corsify(jsonify({"ok": False, "error": "Missing tenant slug"}), origin), 400
+
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get current tenant
+                cur.execute("SELECT id FROM tenants WHERE slug = %s", (tenant_slug,))
+                tenant = cur.fetchone()
+                if not tenant:
+                    return corsify(jsonify({"ok": False, "error": "tenant_not_found"}), origin), 404
+                
+                tenant_id = tenant["id"]
+
+                # Check user permissions (ADMIN or OWNER can disconnect)
+                cur.execute("""
+                    SELECT role FROM tenant_users 
+                    WHERE user_id = %s AND tenant_id = %s
+                """, (user["id"], tenant_id))
+                membership = cur.fetchone()
+                
+                if not membership or membership["role"] not in ["ADMIN", "OWNER"]:
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+
+                # Get connection details before deletion
+                cur.execute("""
+                    SELECT fc.*, 
+                           requesting_t.name as requesting_family_name, requesting_t.slug as requesting_family_slug,
+                           target_t.name as target_family_name, target_t.slug as target_family_slug
+                    FROM family_connections fc
+                    JOIN tenants requesting_t ON fc.requesting_tenant_id = requesting_t.id
+                    JOIN tenants target_t ON fc.target_tenant_id = target_t.id
+                    WHERE fc.id = %s 
+                      AND (fc.requesting_tenant_id = %s OR fc.target_tenant_id = %s)
+                """, (connection_id, tenant_id, tenant_id))
+                
+                connection = cur.fetchone()
+                if not connection:
+                    return corsify(jsonify({"ok": False, "error": "connection_not_found"}), origin), 404
+
+                # Only allow disconnecting from accepted connections
+                if connection["status"] != "accepted":
+                    return corsify(jsonify({"ok": False, "error": "can_only_disconnect_accepted_connections"}), origin), 400
+
+                # Determine which family is being disconnected from
+                if connection["requesting_tenant_id"] == tenant_id:
+                    other_family_name = connection["target_family_name"]
+                    other_family_slug = connection["target_family_slug"]
+                else:
+                    other_family_name = connection["requesting_family_name"]
+                    other_family_slug = connection["requesting_family_slug"]
+
+                # Delete the connection
+                cur.execute("""
+                    DELETE FROM family_connections 
+                    WHERE id = %s
+                    RETURNING id
+                """, (connection_id,))
+                
+                deleted = cur.fetchone()
+                if not deleted:
+                    return corsify(jsonify({"ok": False, "error": "deletion_failed"}), origin), 500
+
+                con.commit()
+
+                # Log the disconnection
+                log.info(f"Family {tenant_slug} disconnected from {other_family_slug} (connection {connection_id})")
+                
+                audit("family_disconnected",
+                      connection_id=connection_id,
+                      disconnecting_family=tenant_slug,
+                      other_family=other_family_slug,
+                      disconnected_by=user["email"])
+
+                return corsify(jsonify({
+                    "ok": True,
+                    "message": f"Successfully disconnected from {other_family_name}",
+                    "disconnected_family": {
+                        "name": other_family_name,
+                        "slug": other_family_slug
+                    }
+                }), origin)
+
+    except Exception as e:
+        log.exception(f"Failed to disconnect from family connection {connection_id}")
+        return corsify(jsonify({"ok": False, "error": "disconnect_failed"}), origin), 500
+
 @app.post("/api/families/invite-new-family")
 def invite_new_family():
     """Invite someone to create a new family with automatic connection"""
