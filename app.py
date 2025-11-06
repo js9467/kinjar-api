@@ -4864,13 +4864,19 @@ def get_user_posts(user_id: str):
                 
                 viewing_tenant_id = viewing_tenant["id"]
                 
-                # Check if the user is a member of the viewing tenant
+                # Get the user's home tenant
                 cur.execute("""
                     SELECT tu.tenant_id 
                     FROM tenant_users tu
-                    WHERE tu.user_id = %s AND tu.tenant_id = %s
-                """, (user_id, viewing_tenant_id))
-                is_same_family = cur.fetchone() is not None
+                    WHERE tu.user_id = %s
+                    LIMIT 1
+                """, (user_id,))
+                user_tenant_row = cur.fetchone()
+                if not user_tenant_row:
+                    return corsify(jsonify({"ok": True, "posts": []}), origin)
+                
+                user_tenant_id = user_tenant_row["tenant_id"]
+                is_same_family = (user_tenant_id == viewing_tenant_id)
                 
                 # Check if visibility and posted_as_id columns exist
                 cur.execute("""
@@ -4942,15 +4948,14 @@ def get_user_posts(user_id: str):
                     # Different family - only show posts marked as visible to connections
                     # First, check if families are connected
                     cur.execute("""
-                        SELECT 1 FROM family_connections fc1
-                        JOIN tenant_users tu ON tu.user_id = %s
-                        WHERE fc1.status = 'accepted'
+                        SELECT 1 FROM family_connections fc
+                        WHERE fc.status = 'accepted'
                         AND (
-                            (fc1.from_tenant_id = %s AND fc1.to_tenant_id = tu.tenant_id)
-                            OR (fc1.to_tenant_id = %s AND fc1.from_tenant_id = tu.tenant_id)
+                            (fc.from_tenant_id = %s AND fc.to_tenant_id = %s)
+                            OR (fc.to_tenant_id = %s AND fc.from_tenant_id = %s)
                         )
                         LIMIT 1
-                    """, (user_id, viewing_tenant_id, viewing_tenant_id))
+                    """, (viewing_tenant_id, user_tenant_id, viewing_tenant_id, user_tenant_id))
                     
                     if not cur.fetchone():
                         # Not connected, return empty list
