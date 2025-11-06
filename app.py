@@ -5251,39 +5251,100 @@ def delete_comment_by_uuid(comment_id: str):
                 log.info(f"Attempting to delete comment {comment_id} by user {user['id']}")
                 
                 # Get comment details with explicit column selection to avoid schema issues
+                # Also check if posted_as_id column exists
                 cur.execute("""
-                    SELECT c.id, c.post_id, c.author_id, c.content, c.status, c.created_at, c.updated_at,
-                           p.tenant_id, t.slug as tenant_slug
-                    FROM content_comments c
-                    JOIN content_posts p ON c.post_id = p.id
-                    JOIN tenants t ON p.tenant_id = t.id
-                    WHERE c.id = %s
-                """, (comment_id,))
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'content_comments' AND column_name = 'posted_as_id'
+                """)
+                has_posted_as_id = cur.fetchone() is not None
+                
+                if has_posted_as_id:
+                    cur.execute("""
+                        SELECT c.id, c.post_id, c.author_id, c.posted_as_id, c.content, c.status, c.created_at, c.updated_at,
+                               p.tenant_id, t.slug as tenant_slug
+                        FROM content_comments c
+                        JOIN content_posts p ON c.post_id = p.id
+                        JOIN tenants t ON p.tenant_id = t.id
+                        WHERE c.id = %s
+                    """, (comment_id,))
+                else:
+                    cur.execute("""
+                        SELECT c.id, c.post_id, c.author_id, c.content, c.status, c.created_at, c.updated_at,
+                               p.tenant_id, t.slug as tenant_slug, NULL as posted_as_id
+                        FROM content_comments c
+                        JOIN content_posts p ON c.post_id = p.id
+                        JOIN tenants t ON p.tenant_id = t.id
+                        WHERE c.id = %s
+                    """, (comment_id,))
+                
                 comment = cur.fetchone()
                 
                 if not comment:
                     log.warning(f"Comment {comment_id} not found")
                     return corsify(jsonify({"ok": False, "error": "comment_not_found"}), origin), 404
 
-                log.info(f"Comment found: author={comment['author_id']}, tenant={comment['tenant_id']}")
+                log.info(f"Comment found: author={comment['author_id']}, tenant={comment['tenant_id']}, posted_as={comment.get('posted_as_id')}")
 
-                # Check if user is comment author, family admin, or root admin
-                is_author = comment["author_id"] == user["id"]
-                
+                # Get current user's role and family in this tenant
                 cur.execute("""
-                    SELECT role FROM tenant_users
+                    SELECT role, family_id FROM tenant_users
                     WHERE tenant_id = %s AND user_id = %s
                 """, (comment["tenant_id"], user["id"]))
                 membership = cur.fetchone()
                 
-                is_admin = membership and membership["role"] in {"ADMIN", "OWNER"}
+                if not membership:
+                    log.warning(f"User {user['id']} is not a member of tenant {comment['tenant_id']}")
+                    return corsify(jsonify({"ok": False, "error": "not_member"}), origin), 403
+                
+                current_role = membership['role']
+                current_family = membership['family_id']
                 is_root_admin = user.get("is_root_admin", False)
                 
-                log.info(f"Permission check: is_author={is_author}, is_admin={is_admin}, is_root_admin={is_root_admin}")
+                # Permission logic:
+                # 1. Root admins and tenant ADMINs/OWNERs can delete any comment
+                # 2. Adults can delete their own comments OR child comments from their family
+                # 3. Children can ONLY delete their own comments (not other children's)
                 
-                # Allow author, admin, or root admin to delete
-                if not (is_author or is_admin or is_root_admin):
-                    log.warning(f"Permission denied for user {user['id']} to delete comment {comment_id}")
+                can_delete = False
+                reason = ""
+                
+                if is_root_admin or current_role in ['ADMIN', 'OWNER']:
+                    can_delete = True
+                    reason = f"Admin/Owner {user['id']} can delete any comment"
+                elif current_role in ['ADULT', 'MEMBER']:
+                    # Adults can delete their own comments
+                    if comment['author_id'] == user['id']:
+                        can_delete = True
+                        reason = f"Adult {user['id']} can delete their own comment"
+                    # Adults can delete child comments from their family (if posted as child)
+                    elif has_posted_as_id and comment.get('posted_as_id'):
+                        # Get the posted_as user's info
+                        cur.execute("""
+                            SELECT tu.family_id, tu.role 
+                            FROM tenant_users tu
+                            WHERE tu.tenant_id = %s AND tu.user_id = %s
+                        """, (comment["tenant_id"], comment['posted_as_id']))
+                        posted_as_info = cur.fetchone()
+                        
+                        if (posted_as_info and 
+                            posted_as_info['role'] == 'CHILD' and 
+                            posted_as_info['family_id'] == current_family):
+                            can_delete = True
+                            reason = f"Adult {user['id']} can delete child comment from their family"
+                elif current_role == 'CHILD':
+                    # Children can ONLY delete their own comments
+                    if comment['author_id'] == user['id']:
+                        can_delete = True
+                        reason = f"Child {user['id']} can delete their own comment"
+                    # Children CANNOT delete other children's comments
+                    else:
+                        can_delete = False
+                        reason = f"Child {user['id']} cannot delete other users' comments"
+                
+                log.info(f"Permission check: {reason}")
+                
+                if not can_delete:
+                    log.warning(f"Permission denied: {reason}")
                     return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
 
                 # Delete the comment
