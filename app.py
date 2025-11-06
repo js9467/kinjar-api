@@ -5258,14 +5258,17 @@ def edit_comment(comment_id: str):
                         can_edit = True
                         reason = f"Adult {user['id']} can edit child comment (posted_as child with role {posted_as_role})"
                 elif current_role == 'CHILD':
-                    # Children can ONLY edit their own comments
+                    # Children can edit their own comments OR comments posted as them
                     if comment['author_id'] == user['id']:
                         can_edit = True
                         reason = f"Child {user['id']} can edit their own comment"
+                    elif has_posted_as_id and comment.get('posted_as_id') == user['id']:
+                        can_edit = True
+                        reason = f"Child {user['id']} can edit comment posted as them"
                     # Children CANNOT edit other children's comments
                     else:
                         can_edit = False
-                        reason = f"Child {user['id']} cannot edit other users' comments (author: {comment['author_id']}, author_role: {author_role})"
+                        reason = f"Child {user['id']} cannot edit other users' comments (author: {comment['author_id']}, posted_as: {comment.get('posted_as_id', 'None')})"
                 
                 log.info(f"Edit permission check: {reason}")
                 
