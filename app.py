@@ -5163,20 +5163,48 @@ def edit_comment(comment_id: str):
         with_db()
         with pool.connection() as con:
             with con.cursor(row_factory=dict_row) as cur:
-                # Get comment and post info
+                # Clear any cached plans that might be causing issues
+                try:
+                    cur.execute("DISCARD PLANS")
+                except:
+                    pass  # Ignore if not supported
+                
+                log.info(f"Attempting to edit comment {comment_id} by user {user['id']}")
+                
+                # Check if posted_as_id column exists
                 cur.execute("""
-                    SELECT c.*, p.tenant_id, t.slug as tenant_slug
-                    FROM content_comments c
-                    JOIN content_posts p ON c.post_id = p.id
-                    JOIN tenants t ON p.tenant_id = t.id
-                    WHERE c.id = %s AND c.status = 'published'
-                """, (comment_id,))
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'content_comments' AND column_name = 'posted_as_id'
+                """)
+                has_posted_as_id = cur.fetchone() is not None
+                
+                # Get comment and post info
+                if has_posted_as_id:
+                    cur.execute("""
+                        SELECT c.*, p.tenant_id, t.slug as tenant_slug
+                        FROM content_comments c
+                        JOIN content_posts p ON c.post_id = p.id
+                        JOIN tenants t ON p.tenant_id = t.id
+                        WHERE c.id = %s AND c.status = 'published'
+                    """, (comment_id,))
+                else:
+                    cur.execute("""
+                        SELECT c.id, c.post_id, c.author_id, c.content, c.status, c.created_at, c.updated_at,
+                               p.tenant_id, t.slug as tenant_slug, NULL as posted_as_id
+                        FROM content_comments c
+                        JOIN content_posts p ON c.post_id = p.id
+                        JOIN tenants t ON p.tenant_id = t.id
+                        WHERE c.id = %s AND c.status = 'published'
+                    """, (comment_id,))
+                
                 comment = cur.fetchone()
                 
                 if not comment:
                     return corsify(jsonify({"ok": False, "error": "comment_not_found"}), origin), 404
 
-                # Check user's role in this tenant
+                log.info(f"Comment found: author={comment['author_id']}, tenant={comment['tenant_id']}, posted_as={comment.get('posted_as_id')}")
+
+                # Get current user's role in this tenant (family)
                 cur.execute("""
                     SELECT role FROM tenant_users
                     WHERE tenant_id = %s AND user_id = %s
@@ -5184,30 +5212,65 @@ def edit_comment(comment_id: str):
                 membership = cur.fetchone()
                 
                 if not membership:
+                    log.warning(f"User {user['id']} is not a member of tenant {comment['tenant_id']}")
                     return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
-
-                # Permission check: same as posts
-                # 1. Original commenter can edit their own comment
-                # 2. Adults/admins can edit child comments
-                # 3. Adults/admins cannot edit other adults' comments
-                user_is_author = comment["author_id"] == user["id"]
                 
-                if not user_is_author:
-                    # Check comment author's role
+                current_role = membership['role']
+                is_root_admin = user.get("is_root_admin", False)
+                
+                # Get comment author's role in this tenant (family)
+                cur.execute("""
+                    SELECT role FROM tenant_users
+                    WHERE tenant_id = %s AND user_id = %s
+                """, (comment["tenant_id"], comment['author_id']))
+                author_membership = cur.fetchone()
+                author_role = author_membership['role'] if author_membership else None
+                
+                # Get posted_as user's role if applicable
+                posted_as_role = None
+                if has_posted_as_id and comment.get('posted_as_id'):
                     cur.execute("""
                         SELECT role FROM tenant_users
                         WHERE tenant_id = %s AND user_id = %s
-                    """, (comment["tenant_id"], comment["author_id"]))
-                    author_membership = cur.fetchone()
-                    
-                    # Only allow editing if user is adult/admin and comment author is child (or doesn't exist)
-                    has_edit_permission = False
-                    if membership["role"] in {"ADMIN", "OWNER", "ADULT"}:
-                        if not author_membership or author_membership["role"].startswith("CHILD"):
-                            has_edit_permission = True
-                    
-                    if not has_edit_permission:
-                        return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+                    """, (comment["tenant_id"], comment['posted_as_id']))
+                    posted_as_membership = cur.fetchone()
+                    posted_as_role = posted_as_membership['role'] if posted_as_membership else None
+
+                # Permission logic (same as delete):
+                # 1. Root admins and tenant ADMINs/OWNERs can edit any comment
+                # 2. Adults can edit their own comments OR child comments (posted_as_id refers to a CHILD)
+                # 3. Children can ONLY edit their own comments (not other children's)
+                
+                can_edit = False
+                reason = ""
+                
+                if is_root_admin or current_role in ['ADMIN', 'OWNER']:
+                    can_edit = True
+                    reason = f"Admin/Owner {user['id']} can edit any comment"
+                elif current_role in ['ADULT', 'MEMBER']:
+                    # Adults can edit their own comments
+                    if comment['author_id'] == user['id']:
+                        can_edit = True
+                        reason = f"Adult {user['id']} can edit their own comment"
+                    # Adults can edit child comments (where posted_as_id refers to a child)
+                    elif has_posted_as_id and comment.get('posted_as_id') and posted_as_role == 'CHILD':
+                        can_edit = True
+                        reason = f"Adult {user['id']} can edit child comment (posted_as child with role {posted_as_role})"
+                elif current_role == 'CHILD':
+                    # Children can ONLY edit their own comments
+                    if comment['author_id'] == user['id']:
+                        can_edit = True
+                        reason = f"Child {user['id']} can edit their own comment"
+                    # Children CANNOT edit other children's comments
+                    else:
+                        can_edit = False
+                        reason = f"Child {user['id']} cannot edit other users' comments (author: {comment['author_id']}, author_role: {author_role})"
+                
+                log.info(f"Edit permission check: {reason}")
+                
+                if not can_edit:
+                    log.warning(f"Edit permission denied: {reason}")
+                    return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
 
                 # Update comment
                 cur.execute("""
@@ -5222,12 +5285,13 @@ def edit_comment(comment_id: str):
                 if not updated_comment:
                     return corsify(jsonify({"ok": False, "error": "update_failed"}), origin), 500
 
+                log.info(f"Comment {comment_id} successfully edited")
                 audit("comment_edited", comment_id=comment_id, post_id=comment["post_id"], tenant=comment["tenant_slug"])
                 return corsify(jsonify({"ok": True, "comment": dict(updated_comment)}), origin)
 
     except Exception as e:
-        log.exception("Failed to edit comment")
-        return corsify(jsonify({"ok": False, "error": "edit_failed"}), origin), 500
+        log.exception(f"Failed to edit comment {comment_id}: {str(e)}")
+        return corsify(jsonify({"ok": False, "error": "edit_failed", "details": str(e)}), origin), 500
 
 @app.delete("/api/comments/<comment_id>")
 def delete_comment_by_uuid(comment_id: str):
