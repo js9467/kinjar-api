@@ -5399,68 +5399,98 @@ def edit_comment(comment_id: str):
                 # Permission logic for Child Mode (UPDATED: 2025-11-06):
                 # In child mode, adults are logged in but can post/act as children
                 # Comments have both author_id (the logged-in adult) and posted_as_id (the child being acted as)
+                # ALSO: Adults/Admins from user's OWN family should be able to edit/delete their children's comments
+                # even on posts from connected families
                 
                 can_edit = False
                 reason = ""
                 acting_as_child_id = request.headers.get("x-acting-as-child")
                 
-                # First get all relevant role information
+                # Get the user's tenant (their own family) and role there
                 cur.execute("""
-                    SELECT 
-                        tu_current.role as current_role,
-                        tu_current.user_id as current_user_id,
-                        up_current.display_name as current_name,
-                        c.posted_as_id,
-                        c.author_id as comment_author_id,
-                        tu_posted.role as posted_as_role,
-                        up_posted.display_name as posted_as_name
-                    FROM tenant_users tu_current
-                    LEFT JOIN user_profiles up_current ON up_current.user_id = tu_current.user_id
-                    LEFT JOIN content_comments c ON c.id = %s
-                    LEFT JOIN tenant_users tu_posted ON tu_posted.user_id = c.posted_as_id 
-                        AND tu_posted.tenant_id = tu_current.tenant_id
-                    LEFT JOIN user_profiles up_posted ON up_posted.user_id = c.posted_as_id
-                    WHERE tu_current.user_id = %s AND tu_current.tenant_id = %s
-                """, (comment_id, user['id'], comment['tenant_id']))
+                    SELECT tu.tenant_id as user_tenant_id, tu.role as user_role, t.slug as user_tenant_slug
+                    FROM tenant_users tu
+                    JOIN tenants t ON tu.tenant_id = t.id
+                    WHERE tu.user_id = %s
+                    LIMIT 1
+                """, (user['id'],))
+                user_tenant_info = cur.fetchone()
                 
-                roles = cur.fetchone()
-                if not roles:
-                    log.error(f"Failed to fetch roles for edit permission check - user: {user['id']}, comment: {comment_id}")
-                    return corsify(jsonify({"ok": False, "error": "permission_check_failed"}), origin), 500
+                if not user_tenant_info:
+                    log.error(f"User {user['id']} has no tenant membership")
+                    return corsify(jsonify({"ok": False, "error": "no_family_membership"}), origin), 403
                 
-                # Detailed logging for debugging
-                log.info(f"Child Mode Edit Check - Roles: {roles}")
-                log.info(f"Comment author_id: {roles['comment_author_id']}, posted_as_id: {roles['posted_as_id']}")
-                log.info(f"Current user role: {roles['current_role']}, Acting as child: {acting_as_child_id}")
+                user_role = user_tenant_info['user_role']
+                user_tenant_id = user_tenant_info['user_tenant_id']
                 
-                if is_root_admin or roles['current_role'] in ['ADMIN', 'OWNER']:
-                    # Admins can edit any comment regardless of child mode
+                # Check if the child (posted_as) belongs to the user's family
+                child_in_users_family = False
+                if has_posted_as_id and comment.get('posted_as_id'):
+                    cur.execute("""
+                        SELECT role FROM tenant_users
+                        WHERE tenant_id = %s AND user_id = %s
+                    """, (user_tenant_id, comment['posted_as_id']))
+                    child_membership = cur.fetchone()
+                    if child_membership:
+                        child_in_users_family = True
+                        child_role = child_membership['role']
+                
+                # Get profile info for logging
+                cur.execute("SELECT display_name FROM user_profiles WHERE user_id = %s", (user['id'],))
+                user_profile = cur.fetchone()
+                user_name = user_profile['display_name'] if user_profile else 'User'
+                
+                log.info(f"Edit permission check - User: {user_name} (role: {user_role}), Comment author: {comment['author_id']}, Posted as: {comment.get('posted_as_id')}, Child in user's family: {child_in_users_family}")
+                
+                # Permission logic
+                if is_root_admin:
                     can_edit = True
-                    reason = f"Admin/Owner {roles['current_name']} can edit any comment"
-                    log.info(f"✓ Admin permission granted: {reason}")
+                    reason = f"Root admin can edit any comment"
+                    log.info(f"✓ Root admin permission granted")
                 
-                elif roles['current_role'] in ['ADULT', 'MEMBER']:
+                elif user_role in ['ADMIN', 'OWNER']:
+                    # Admins/Owners can edit:
+                    # 1. Their own comments
+                    # 2. Any comment in their own family's posts
+                    # 3. Comments made by their family's children (even on connected family posts)
+                    if comment['author_id'] == user['id']:
+                        can_edit = True
+                        reason = f"Admin/Owner editing their own comment"
+                    elif comment['tenant_id'] == user_tenant_id:
+                        can_edit = True
+                        reason = f"Admin/Owner editing comment in their own family"
+                    elif child_in_users_family:
+                        can_edit = True
+                        reason = f"Admin/Owner editing their child's comment on connected family post"
+                    else:
+                        reason = f"Admin/Owner cannot edit other family's adult comments"
+                    log.info(f"Admin check: {reason}")
+                
+                elif user_role in ['ADULT', 'MEMBER']:
                     if acting_as_child_id:
                         # Adult is in child mode
-                        if str(roles['posted_as_id']) == acting_as_child_id:
-                            # Can edit if the comment was made as this child
+                        if str(comment.get('posted_as_id')) == acting_as_child_id:
                             can_edit = True
-                            reason = f"Adult acting as child {roles['posted_as_name']} can edit their own comment"
-                            log.info(f"✓ Child mode self-edit permission granted: {reason}")
+                            reason = f"Adult acting as child can edit their own comment"
+                            log.info(f"✓ Child mode self-edit permission granted")
                         else:
-                            reason = f"Adult acting as child {acting_as_child_id} cannot edit comment made as {roles['posted_as_id']}"
+                            reason = f"Adult in child mode cannot edit other's comments"
                             log.warning(f"✗ Permission denied: {reason}")
                     else:
-                        # Adult in normal mode can edit their own comments or any child's comments
-                        if roles['comment_author_id'] == user['id'] or _is_child_role(roles['posted_as_role']):
+                        # Adult in normal mode can edit:
+                        # 1. Their own comments
+                        # 2. Comments made by children in their family (even on connected family posts)
+                        if comment['author_id'] == user['id']:
                             can_edit = True
-                            reason = f"Adult {roles['current_name']} can edit their own or child's comment"
-                            log.info(f"✓ Adult edit permission granted: {reason}")
+                            reason = f"Adult editing their own comment"
+                        elif child_in_users_family and _is_child_role(child_role):
+                            can_edit = True
+                            reason = f"Adult editing their child's comment"
                         else:
-                            reason = f"Adult {roles['current_name']} cannot edit other adult's comments"
-                            log.warning(f"✗ Permission denied: {reason}")
+                            reason = f"Adult cannot edit other's comments"
+                        log.info(f"Adult check: {reason}")
                 else:
-                    reason = f"User {roles['current_name']} has invalid role: {roles['current_role']}"
+                    reason = f"User has invalid role: {user_role}"
                     log.error(f"✗ Invalid role: {reason}")
 
                 log.info(f"Final edit permission decision: {can_edit} - {reason}")
@@ -5633,68 +5663,98 @@ def delete_comment_by_uuid(comment_id: str):
                 # Permission logic for Child Mode (UPDATED: 2025-11-06):
                 # In child mode, adults are logged in but can post/act as children
                 # Comments have both author_id (the logged-in adult) and posted_as_id (the child being acted as)
+                # ALSO: Adults/Admins from user's OWN family should be able to edit/delete their children's comments
+                # even on posts from connected families
                 
                 can_delete = False
                 reason = ""
                 acting_as_child_id = request.headers.get("x-acting-as-child")
                 
-                # First get all relevant role information
+                # Get the user's tenant (their own family) and role there
                 cur.execute("""
-                    SELECT 
-                        tu_current.role as current_role,
-                        tu_current.user_id as current_user_id,
-                        up_current.display_name as current_name,
-                        c.posted_as_id,
-                        c.author_id as comment_author_id,
-                        tu_posted.role as posted_as_role,
-                        up_posted.display_name as posted_as_name
-                    FROM tenant_users tu_current
-                    LEFT JOIN user_profiles up_current ON up_current.user_id = tu_current.user_id
-                    LEFT JOIN content_comments c ON c.id = %s
-                    LEFT JOIN tenant_users tu_posted ON tu_posted.user_id = c.posted_as_id 
-                        AND tu_posted.tenant_id = tu_current.tenant_id
-                    LEFT JOIN user_profiles up_posted ON up_posted.user_id = c.posted_as_id
-                    WHERE tu_current.user_id = %s AND tu_current.tenant_id = %s
-                """, (comment_id, user['id'], comment['tenant_id']))
+                    SELECT tu.tenant_id as user_tenant_id, tu.role as user_role, t.slug as user_tenant_slug
+                    FROM tenant_users tu
+                    JOIN tenants t ON tu.tenant_id = t.id
+                    WHERE tu.user_id = %s
+                    LIMIT 1
+                """, (user['id'],))
+                user_tenant_info = cur.fetchone()
                 
-                roles = cur.fetchone()
-                if not roles:
-                    log.error(f"Failed to fetch roles for delete permission check - user: {user['id']}, comment: {comment_id}")
-                    return corsify(jsonify({"ok": False, "error": "permission_check_failed"}), origin), 500
+                if not user_tenant_info:
+                    log.error(f"User {user['id']} has no tenant membership")
+                    return corsify(jsonify({"ok": False, "error": "no_family_membership"}), origin), 403
                 
-                # Detailed logging for debugging
-                log.info(f"Child Mode Delete Check - Roles: {roles}")
-                log.info(f"Comment author_id: {roles['comment_author_id']}, posted_as_id: {roles['posted_as_id']}")
-                log.info(f"Current user role: {roles['current_role']}, Acting as child: {acting_as_child_id}")
+                user_role = user_tenant_info['user_role']
+                user_tenant_id = user_tenant_info['user_tenant_id']
                 
-                if is_root_admin or roles['current_role'] in ['ADMIN', 'OWNER']:
-                    # Admins can delete any comment regardless of child mode
+                # Check if the child (posted_as) belongs to the user's family
+                child_in_users_family = False
+                if has_posted_as_id and comment.get('posted_as_id'):
+                    cur.execute("""
+                        SELECT role FROM tenant_users
+                        WHERE tenant_id = %s AND user_id = %s
+                    """, (user_tenant_id, comment['posted_as_id']))
+                    child_membership = cur.fetchone()
+                    if child_membership:
+                        child_in_users_family = True
+                        child_role = child_membership['role']
+                
+                # Get profile info for logging
+                cur.execute("SELECT display_name FROM user_profiles WHERE user_id = %s", (user['id'],))
+                user_profile = cur.fetchone()
+                user_name = user_profile['display_name'] if user_profile else 'User'
+                
+                log.info(f"Delete permission check - User: {user_name} (role: {user_role}), Comment author: {comment['author_id']}, Posted as: {comment.get('posted_as_id')}, Child in user's family: {child_in_users_family}")
+                
+                # Permission logic
+                if is_root_admin:
                     can_delete = True
-                    reason = f"Admin/Owner {roles['current_name']} can delete any comment"
-                    log.info(f"✓ Admin permission granted: {reason}")
+                    reason = f"Root admin can delete any comment"
+                    log.info(f"✓ Root admin permission granted")
                 
-                elif roles['current_role'] in ['ADULT', 'MEMBER']:
+                elif user_role in ['ADMIN', 'OWNER']:
+                    # Admins/Owners can delete:
+                    # 1. Their own comments
+                    # 2. Any comment in their own family's posts
+                    # 3. Comments made by their family's children (even on connected family posts)
+                    if comment['author_id'] == user['id']:
+                        can_delete = True
+                        reason = f"Admin/Owner deleting their own comment"
+                    elif comment['tenant_id'] == user_tenant_id:
+                        can_delete = True
+                        reason = f"Admin/Owner deleting comment in their own family"
+                    elif child_in_users_family:
+                        can_delete = True
+                        reason = f"Admin/Owner deleting their child's comment on connected family post"
+                    else:
+                        reason = f"Admin/Owner cannot delete other family's adult comments"
+                    log.info(f"Admin check: {reason}")
+                
+                elif user_role in ['ADULT', 'MEMBER']:
                     if acting_as_child_id:
                         # Adult is in child mode
-                        if str(roles['posted_as_id']) == acting_as_child_id:
-                            # Can delete if the comment was made as this child
+                        if str(comment.get('posted_as_id')) == acting_as_child_id:
                             can_delete = True
-                            reason = f"Adult acting as child {roles['posted_as_name']} can delete their own comment"
-                            log.info(f"✓ Child mode self-delete permission granted: {reason}")
+                            reason = f"Adult acting as child can delete their own comment"
+                            log.info(f"✓ Child mode self-delete permission granted")
                         else:
-                            reason = f"Adult acting as child {acting_as_child_id} cannot delete comment made as {roles['posted_as_id']}"
+                            reason = f"Adult in child mode cannot delete other's comments"
                             log.warning(f"✗ Permission denied: {reason}")
                     else:
-                        # Adult in normal mode can delete their own comments or any child's comments
-                        if roles['comment_author_id'] == user['id'] or _is_child_role(roles['posted_as_role']):
+                        # Adult in normal mode can delete:
+                        # 1. Their own comments
+                        # 2. Comments made by children in their family (even on connected family posts)
+                        if comment['author_id'] == user['id']:
                             can_delete = True
-                            reason = f"Adult {roles['current_name']} can delete their own or child's comment"
-                            log.info(f"✓ Adult delete permission granted: {reason}")
+                            reason = f"Adult deleting their own comment"
+                        elif child_in_users_family and _is_child_role(child_role):
+                            can_delete = True
+                            reason = f"Adult deleting their child's comment"
                         else:
-                            reason = f"Adult {roles['current_name']} cannot delete other adult's comments"
-                            log.warning(f"✗ Permission denied: {reason}")
+                            reason = f"Adult cannot delete other's comments"
+                        log.info(f"Adult check: {reason}")
                 else:
-                    reason = f"User {roles['current_name']} has invalid role: {roles['current_role']}"
+                    reason = f"User has invalid role: {user_role}"
                     log.error(f"✗ Invalid role: {reason}")
 
                 log.info(f"Final delete permission decision: {can_delete} - {reason}")
