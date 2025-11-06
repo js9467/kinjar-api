@@ -5244,39 +5244,64 @@ def edit_comment(comment_id: str):
                     posted_as_role = posted_as_membership['role'] if posted_as_membership else None
 
                 # Permission logic (UPDATED: 2025-11-06):
-                # 1. Root admins and tenant ADMINs/OWNERs can edit any comment
-                # 2. Adults/Members can ONLY edit their own comments OR any child's comments
-                # 3. Children can ONLY edit their own comments (not other children's or adults')
+                # Enhanced error handling and logging for comment permissions
                 
                 can_edit = False
                 reason = ""
                 
-                if is_root_admin or current_role in ['ADMIN', 'OWNER']:
-                    # ADMINS: Can edit any comment in their family
+                # First get all relevant role information
+                cur.execute("""
+                    SELECT 
+                        tu_current.role as current_role,
+                        tu_author.role as author_role,
+                        up_current.display_name as current_name,
+                        up_author.display_name as author_name
+                    FROM tenant_users tu_current
+                    LEFT JOIN user_profiles up_current ON up_current.user_id = tu_current.user_id
+                    LEFT JOIN tenant_users tu_author ON tu_author.user_id = %s AND tu_author.tenant_id = %s
+                    LEFT JOIN user_profiles up_author ON up_author.user_id = tu_author.user_id
+                    WHERE tu_current.user_id = %s AND tu_current.tenant_id = %s
+                """, (comment['author_id'], comment['tenant_id'], user['id'], comment['tenant_id']))
+                
+                roles = cur.fetchone()
+                if not roles:
+                    log.error(f"Failed to fetch roles for edit permission check - user: {user['id']}, comment: {comment['id']}")
+                    return corsify(jsonify({"ok": False, "error": "permission_check_failed"}), origin), 500
+                
+                # Detailed logging for debugging
+                log.info(f"Edit permission check - Roles: {roles}")
+                log.info(f"Comment author ID: {comment['author_id']}, Current user ID: {user['id']}")
+                log.info(f"Current user role: {roles['current_role']}, Author role: {roles['author_role']}")
+                
+                if is_root_admin or roles['current_role'] in ['ADMIN', 'OWNER']:
                     can_edit = True
-                    reason = f"Admin/Owner {user['id']} can edit any comment in the family"
-                elif current_role in ['ADULT', 'MEMBER']:
-                    # Adults can edit their own comments OR any child's comments
+                    reason = f"Admin/Owner {roles['current_name'] or user['id']} can edit any comment"
+                    log.info(f"✓ Admin permission granted: {reason}")
+                
+                elif roles['current_role'] in ['ADULT', 'MEMBER']:
                     if comment['author_id'] == user['id']:
                         can_edit = True
-                        reason = f"Adult {user['id']} can edit their own comment"
+                        reason = f"Adult {roles['current_name'] or user['id']} can edit their own comment"
+                        log.info(f"✓ Adult self-edit permission granted: {reason}")
+                    elif roles['author_role'] and _is_child_role(roles['author_role']):
+                        can_edit = True
+                        reason = f"Adult {roles['current_name'] or user['id']} can edit child's comment"
+                        log.info(f"✓ Adult editing child comment permission granted: {reason}")
                     else:
-                        # Check if comment author is a child
-                        cur.execute("""
-                            SELECT role FROM tenant_users 
-                            WHERE user_id = %s AND tenant_id = %s
-                        """, (comment['author_id'], comment["tenant_id"]))
-                        author_info = cur.fetchone()
-                        if author_info and _is_child_role(author_info['role']):
-                            can_edit = True
-                            reason = f"Adult {user['id']} can edit child's comment (author role: {author_info['role']})"
-                elif current_role and _is_child_role(current_role):
-                    # Children can ONLY edit their own comments
+                        reason = f"Adult {roles['current_name'] or user['id']} cannot edit other adult's comments"
+                        log.warning(f"✗ Permission denied: {reason}")
+                
+                elif roles['current_role'] and _is_child_role(roles['current_role']):
                     if comment['author_id'] == user['id']:
                         can_edit = True
-                        reason = f"Child {user['id']} can edit their own comment"
+                        reason = f"Child {roles['current_name'] or user['id']} can edit their own comment"
+                        log.info(f"✓ Child self-edit permission granted: {reason}")
                     else:
-                        reason = f"Child {user['id']} cannot edit other users' comments"
+                        reason = f"Child {roles['current_name'] or user['id']} cannot edit other users' comments"
+                        log.warning(f"✗ Permission denied: {reason}")
+                else:
+                    reason = f"User {roles['current_name'] or user['id']} has invalid role: {roles['current_role']}"
+                    log.error(f"✗ Invalid role: {reason}")
                 
                 log.info(f"Edit permission check: {reason}")
                 log.info(f"DEBUG EDIT: user_id={user['id']}, comment_author_id={comment['author_id']}, current_role={current_role}, is_root_admin={is_root_admin}")
@@ -5410,39 +5435,64 @@ def delete_comment_by_uuid(comment_id: str):
                     posted_as_role = posted_as_membership['role'] if posted_as_membership else None
                 
                 # Permission logic (UPDATED: 2025-11-06):
-                # 1. Root admins and tenant ADMINs/OWNERs can delete any comment
-                # 2. Adults/Members can ONLY delete their own comments OR any child's comments
-                # 3. Children can ONLY delete their own comments (not other children's or adults')
+                # Enhanced error handling and logging for comment permissions
                 
                 can_delete = False
                 reason = ""
                 
-                if is_root_admin or current_role in ['ADMIN', 'OWNER']:
-                    # ADMINS: Can delete any comment in their family
+                # First get all relevant role information
+                cur.execute("""
+                    SELECT 
+                        tu_current.role as current_role,
+                        tu_author.role as author_role,
+                        up_current.display_name as current_name,
+                        up_author.display_name as author_name
+                    FROM tenant_users tu_current
+                    LEFT JOIN user_profiles up_current ON up_current.user_id = tu_current.user_id
+                    LEFT JOIN tenant_users tu_author ON tu_author.user_id = %s AND tu_author.tenant_id = %s
+                    LEFT JOIN user_profiles up_author ON up_author.user_id = tu_author.user_id
+                    WHERE tu_current.user_id = %s AND tu_current.tenant_id = %s
+                """, (comment['author_id'], comment['tenant_id'], user['id'], comment['tenant_id']))
+                
+                roles = cur.fetchone()
+                if not roles:
+                    log.error(f"Failed to fetch roles for delete permission check - user: {user['id']}, comment: {comment['id']}")
+                    return corsify(jsonify({"ok": False, "error": "permission_check_failed"}), origin), 500
+                
+                # Detailed logging for debugging
+                log.info(f"Delete permission check - Roles: {roles}")
+                log.info(f"Comment author ID: {comment['author_id']}, Current user ID: {user['id']}")
+                log.info(f"Current user role: {roles['current_role']}, Author role: {roles['author_role']}")
+                
+                if is_root_admin or roles['current_role'] in ['ADMIN', 'OWNER']:
                     can_delete = True
-                    reason = f"Admin/Owner {user['id']} can delete any comment in the family"
-                elif current_role in ['ADULT', 'MEMBER']:
-                    # Adults can delete their own comments OR any child's comments
+                    reason = f"Admin/Owner {roles['current_name'] or user['id']} can delete any comment"
+                    log.info(f"✓ Admin permission granted: {reason}")
+                
+                elif roles['current_role'] in ['ADULT', 'MEMBER']:
                     if comment['author_id'] == user['id']:
                         can_delete = True
-                        reason = f"Adult {user['id']} can delete their own comment"
+                        reason = f"Adult {roles['current_name'] or user['id']} can delete their own comment"
+                        log.info(f"✓ Adult self-delete permission granted: {reason}")
+                    elif roles['author_role'] and _is_child_role(roles['author_role']):
+                        can_delete = True
+                        reason = f"Adult {roles['current_name'] or user['id']} can delete child's comment"
+                        log.info(f"✓ Adult deleting child comment permission granted: {reason}")
                     else:
-                        # Check if comment author is a child
-                        cur.execute("""
-                            SELECT role FROM tenant_users 
-                            WHERE user_id = %s AND tenant_id = %s
-                        """, (comment['author_id'], comment["tenant_id"]))
-                        author_info = cur.fetchone()
-                        if author_info and _is_child_role(author_info['role']):
-                            can_delete = True
-                            reason = f"Adult {user['id']} can delete child's comment (author role: {author_info['role']})"
-                elif current_role and _is_child_role(current_role):
-                    # Children can ONLY delete their own comments
+                        reason = f"Adult {roles['current_name'] or user['id']} cannot delete other adult's comments"
+                        log.warning(f"✗ Permission denied: {reason}")
+                
+                elif roles['current_role'] and _is_child_role(roles['current_role']):
                     if comment['author_id'] == user['id']:
                         can_delete = True
-                        reason = f"Child {user['id']} can delete their own comment"
+                        reason = f"Child {roles['current_name'] or user['id']} can delete their own comment"
+                        log.info(f"✓ Child self-delete permission granted: {reason}")
                     else:
-                        reason = f"Child {user['id']} cannot delete other users' comments"
+                        reason = f"Child {roles['current_name'] or user['id']} cannot delete other users' comments"
+                        log.warning(f"✗ Permission denied: {reason}")
+                else:
+                    reason = f"User {roles['current_name'] or user['id']} has invalid role: {roles['current_role']}"
+                    log.error(f"✗ Invalid role: {reason}")
                 
                 log.info(f"Permission check: {reason}")
                 log.info(f"DEBUG DELETE: user_id={user['id']}, comment_author_id={comment['author_id']}, current_role={current_role}, is_root_admin={is_root_admin}")
@@ -6265,12 +6315,15 @@ def list_family_members():
                 if not membership:
                     return corsify(jsonify({"ok": False, "error": "not_tenant_member"}), origin), 403
 
-                # Get all family members with profiles
+                # Get all family members with profiles and additional fields
                 cur.execute("""
                     SELECT 
                         u.id, u.email, u.created_at,
                         tu.role,
-                        up.display_name, up.avatar_url, up.bio, up.phone
+                        up.display_name, up.avatar_url, up.bio, up.phone,
+                        up.avatar_color,
+                        up.birthdate,
+                        COALESCE(up.display_name, SPLIT_PART(u.email, '@', 1)) as name
                     FROM tenant_users tu
                     JOIN users u ON tu.user_id = u.id
                     LEFT JOIN user_profiles up ON u.id = up.user_id
@@ -6279,10 +6332,15 @@ def list_family_members():
                         CASE tu.role 
                             WHEN 'OWNER' THEN 1 
                             WHEN 'ADMIN' THEN 2 
-                            WHEN 'MEMBER' THEN 3 
-                            ELSE 4 
+                            WHEN 'ADULT' THEN 3
+                            WHEN 'MEMBER' THEN 4 
+                            ELSE 
+                                CASE 
+                                    WHEN tu.role LIKE 'CHILD_%' THEN 5
+                                    ELSE 6
+                                END
                         END,
-                        up.display_name, u.email
+                        COALESCE(up.display_name, u.email)
                 """, (tenant["id"],))
                 
                 members = [dict(row) for row in cur.fetchall()]

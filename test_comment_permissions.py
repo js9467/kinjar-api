@@ -174,5 +174,6 @@ class TestCommentPermissions(unittest.TestCase):
                 deleted = cur.fetchone()
                 self.assertIsNotNone(deleted, "Child should be able to delete their own comment")
 
-if __name__ == '__main__':
-    unittest.main()
+def pytest_configure(config):
+    """This is needed for pytest integration"""
+    os.environ["DATABASE_URL"] = os.getenv("DATABASE_URL", "postgresql://localhost/kinjar_test")
