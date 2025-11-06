@@ -38,8 +38,14 @@ CORS(app,
          'https://www.kinjar.com',           # WWW subdomain
          'http://localhost:3000',            # Local development
          'https://kinjar.vercel.app',        # Vercel deployments
+         r'https://*.kinjar.com',           # All subdomains
      ],
-     allow_headers=['Content-Type', 'Authorization', 'x-tenant-slug'],
+     allow_headers=[
+         'Content-Type',
+         'Authorization', 
+         'x-tenant-slug',
+         'x-acting-as-child'
+     ],
      methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
      supports_credentials=True
 )
@@ -49,17 +55,20 @@ CORS(app,
 def after_request(response):
     origin = request.headers.get('Origin')
     if origin:
-        # Allow specific Kinjar domains
-        allowed_origins = [
+        # Check if origin matches any Kinjar domain pattern
+        is_allowed = False
+        if origin in [
             'https://slaughterbeck.kinjar.com',
             'https://kinjar.com',
             'https://www.kinjar.com',
             'http://localhost:3000',
             'https://kinjar.vercel.app'
-        ]
-        if origin in allowed_origins:
+        ] or re.match(r'^https://[a-zA-Z0-9-]+\.kinjar\.com$', origin):
+            is_allowed = True
+        
+        if is_allowed:
             response.headers['Access-Control-Allow-Origin'] = origin
-            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-tenant-slug'
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-tenant-slug, x-acting-as-child'
             response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS'
             response.headers['Access-Control-Allow-Credentials'] = 'true'
     return response
@@ -69,17 +78,21 @@ def handle_preflight():
     if request.method == "OPTIONS":
         origin = request.headers.get('Origin')
         if origin:
-            allowed_origins = [
+            # Check if origin matches any Kinjar domain pattern
+            is_allowed = False
+            if origin in [
                 'https://slaughterbeck.kinjar.com',
                 'https://kinjar.com', 
                 'https://www.kinjar.com',
                 'http://localhost:3000',
                 'https://kinjar.vercel.app'
-            ]
-            if origin in allowed_origins:
+            ] or re.match(r'^https://[a-zA-Z0-9-]+\.kinjar\.com$', origin):
+                is_allowed = True
+            
+            if is_allowed:
                 response = make_response()
                 response.headers['Access-Control-Allow-Origin'] = origin
-                response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-tenant-slug'
+                response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-tenant-slug, x-acting-as-child'
                 response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS'
                 response.headers['Access-Control-Allow-Credentials'] = 'true'
                 return response
