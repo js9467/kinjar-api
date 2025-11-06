@@ -5285,9 +5285,9 @@ def delete_comment_by_uuid(comment_id: str):
 
                 log.info(f"Comment found: author={comment['author_id']}, tenant={comment['tenant_id']}, posted_as={comment.get('posted_as_id')}")
 
-                # Get current user's role and family in this tenant
+                # Get current user's role in this tenant (family)
                 cur.execute("""
-                    SELECT role, family_id FROM tenant_users
+                    SELECT role FROM tenant_users
                     WHERE tenant_id = %s AND user_id = %s
                 """, (comment["tenant_id"], user["id"]))
                 membership = cur.fetchone()
@@ -5297,12 +5297,29 @@ def delete_comment_by_uuid(comment_id: str):
                     return corsify(jsonify({"ok": False, "error": "not_member"}), origin), 403
                 
                 current_role = membership['role']
-                current_family = membership['family_id']
                 is_root_admin = user.get("is_root_admin", False)
+                
+                # Get comment author's role in this tenant (family)
+                cur.execute("""
+                    SELECT role FROM tenant_users
+                    WHERE tenant_id = %s AND user_id = %s
+                """, (comment["tenant_id"], comment['author_id']))
+                author_membership = cur.fetchone()
+                author_role = author_membership['role'] if author_membership else None
+                
+                # Get posted_as user's role if applicable
+                posted_as_role = None
+                if has_posted_as_id and comment.get('posted_as_id'):
+                    cur.execute("""
+                        SELECT role FROM tenant_users
+                        WHERE tenant_id = %s AND user_id = %s
+                    """, (comment["tenant_id"], comment['posted_as_id']))
+                    posted_as_membership = cur.fetchone()
+                    posted_as_role = posted_as_membership['role'] if posted_as_membership else None
                 
                 # Permission logic:
                 # 1. Root admins and tenant ADMINs/OWNERs can delete any comment
-                # 2. Adults can delete their own comments OR child comments from their family
+                # 2. Adults can delete their own comments OR child comments (posted_as_id refers to a CHILD)
                 # 3. Children can ONLY delete their own comments (not other children's)
                 
                 can_delete = False
@@ -5316,21 +5333,10 @@ def delete_comment_by_uuid(comment_id: str):
                     if comment['author_id'] == user['id']:
                         can_delete = True
                         reason = f"Adult {user['id']} can delete their own comment"
-                    # Adults can delete child comments from their family (if posted as child)
-                    elif has_posted_as_id and comment.get('posted_as_id'):
-                        # Get the posted_as user's info
-                        cur.execute("""
-                            SELECT tu.family_id, tu.role 
-                            FROM tenant_users tu
-                            WHERE tu.tenant_id = %s AND tu.user_id = %s
-                        """, (comment["tenant_id"], comment['posted_as_id']))
-                        posted_as_info = cur.fetchone()
-                        
-                        if (posted_as_info and 
-                            posted_as_info['role'] == 'CHILD' and 
-                            posted_as_info['family_id'] == current_family):
-                            can_delete = True
-                            reason = f"Adult {user['id']} can delete child comment from their family"
+                    # Adults can delete child comments (where posted_as_id refers to a child)
+                    elif has_posted_as_id and comment.get('posted_as_id') and posted_as_role == 'CHILD':
+                        can_delete = True
+                        reason = f"Adult {user['id']} can delete child comment (posted_as child with role {posted_as_role})"
                 elif current_role == 'CHILD':
                     # Children can ONLY delete their own comments
                     if comment['author_id'] == user['id']:
@@ -5339,7 +5345,7 @@ def delete_comment_by_uuid(comment_id: str):
                     # Children CANNOT delete other children's comments
                     else:
                         can_delete = False
-                        reason = f"Child {user['id']} cannot delete other users' comments"
+                        reason = f"Child {user['id']} cannot delete other users' comments (author: {comment['author_id']}, author_role: {author_role})"
                 
                 log.info(f"Permission check: {reason}")
                 
