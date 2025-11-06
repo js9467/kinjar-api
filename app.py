@@ -7277,6 +7277,79 @@ def get_family_info(family_slug: str):
         log.exception("Failed to get family info")
         return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
 
+@app.get("/api/users/<user_id>/profile")
+def get_user_profile(user_id: str):
+    """Get a user's profile information"""
+    origin = request.headers.get("Origin")
+    
+    try:
+        with_db()
+        with pool.connection() as con:
+            with con.cursor(row_factory=dict_row) as cur:
+                # Get user profile
+                cur.execute("""
+                    SELECT 
+                        u.id AS user_id,
+                        u.email,
+                        up.display_name,
+                        up.avatar_url,
+                        up.avatar_color,
+                        up.birthdate,
+                        up.bio,
+                        up.phone
+                    FROM users u
+                    LEFT JOIN user_profiles up ON up.user_id = u.id
+                    WHERE u.id = %s
+                """, (user_id,))
+                
+                user_row = cur.fetchone()
+                
+                if not user_row:
+                    return corsify(jsonify({"ok": False, "error": "user_not_found"}), origin), 404
+                
+                display_name = user_row.get("display_name") or (user_row.get("email") or "").split("@")[0]
+                email = user_row.get("email")
+                # Hide internal placeholder emails for child accounts
+                if email and email.endswith("@kinjar.internal"):
+                    email = ""
+                
+                birthdate_val = user_row.get("birthdate")
+                birthdate_iso = birthdate_val.isoformat() if birthdate_val else None
+                age = calculate_age(birthdate_val) if birthdate_val else None
+                
+                # Get their role in the current tenant if specified
+                tenant_slug = request.headers.get("x-tenant-slug")
+                role = None
+                if tenant_slug:
+                    cur.execute("""
+                        SELECT tu.role
+                        FROM tenant_users tu
+                        JOIN tenants t ON tu.tenant_id = t.id
+                        WHERE tu.user_id = %s AND t.slug = %s
+                    """, (user_id, tenant_slug))
+                    role_row = cur.fetchone()
+                    role = role_row["role"] if role_row else "GUEST"
+                
+                user_profile = {
+                    "id": user_id,
+                    "userId": user_id,
+                    "name": display_name,
+                    "email": email,
+                    "role": role,
+                    "avatarColor": user_row.get("avatar_color") or "#3B82F6",
+                    "avatarUrl": user_row.get("avatar_url"),
+                    "birthdate": birthdate_iso,
+                    "age": age,
+                    "bio": user_row.get("bio"),
+                    "phone": user_row.get("phone"),
+                }
+                
+                return corsify(jsonify({"ok": True, "profile": user_profile}), origin)
+                
+    except Exception as e:
+        log.exception("Failed to get user profile")
+        return corsify(jsonify({"ok": False, "error": "fetch_failed"}), origin), 500
+
 @app.get("/api/families/<family_slug>/posts")
 def get_family_posts(family_slug: str):
     """Get posts for a specific family"""
