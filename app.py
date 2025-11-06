@@ -5358,15 +5358,15 @@ def delete_comment_by_uuid(comment_id: str):
                 log.info(f"Comment found: author={comment['author_id']}, tenant={comment['tenant_id']}, posted_as={comment.get('posted_as_id')}")
                 
                 # Get author details for logging
-                cur.execute("SELECT username FROM users WHERE id = %s", (comment['author_id'],))
+                cur.execute("SELECT email FROM users WHERE id = %s", (comment['author_id'],))
                 author_user = cur.fetchone()
-                author_name = author_user['username'] if author_user else 'UNKNOWN'
+                author_email = author_user['email'] if author_user else 'UNKNOWN'
                 
-                cur.execute("SELECT username FROM users WHERE id = %s", (user['id'],))
+                cur.execute("SELECT email FROM users WHERE id = %s", (user['id'],))
                 current_user = cur.fetchone()
-                current_user_name = current_user['username'] if current_user else 'UNKNOWN'
+                current_user_email = current_user['email'] if current_user else 'UNKNOWN'
                 
-                log.info(f"DELETE REQUEST: User {current_user_name} ({user['id']}) attempting to delete comment by {author_name} ({comment['author_id']})")
+                log.info(f"DELETE REQUEST: User {current_user_email} ({user['id']}) attempting to delete comment by {author_email} ({comment['author_id']})")
 
                 # Get current user's role in this tenant (family)
                 cur.execute("""
