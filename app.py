@@ -5290,8 +5290,10 @@ def edit_comment(comment_id: str):
                 log.info(f"DEBUG EDIT: can_edit={can_edit}, role_match={comment['author_id'] == user['id']}, _is_child_role={_is_child_role(current_role) if current_role else 'N/A'}")
                 
                 if not can_edit:
-                    log.warning(f"Edit permission denied: {reason}")
+                    log.warning(f"⛔ EDIT BLOCKED: Edit permission denied: {reason}")
                     return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+                
+                log.info(f"✅ EDIT ALLOWED: {reason}")
 
                 # Update comment
                 cur.execute("""
@@ -5370,6 +5372,17 @@ def delete_comment_by_uuid(comment_id: str):
                     return corsify(jsonify({"ok": False, "error": "comment_not_found"}), origin), 404
 
                 log.info(f"Comment found: author={comment['author_id']}, tenant={comment['tenant_id']}, posted_as={comment.get('posted_as_id')}")
+                
+                # Get author details for logging
+                cur.execute("SELECT username FROM users WHERE id = %s", (comment['author_id'],))
+                author_user = cur.fetchone()
+                author_name = author_user['username'] if author_user else 'UNKNOWN'
+                
+                cur.execute("SELECT username FROM users WHERE id = %s", (user['id'],))
+                current_user = cur.fetchone()
+                current_user_name = current_user['username'] if current_user else 'UNKNOWN'
+                
+                log.info(f"DELETE REQUEST: User {current_user_name} ({user['id']}) attempting to delete comment by {author_name} ({comment['author_id']})")
 
                 # Get current user's role in this tenant (family)
                 cur.execute("""
@@ -5450,8 +5463,10 @@ def delete_comment_by_uuid(comment_id: str):
                 log.info(f"DEBUG DELETE: can_delete={can_delete}, role_match={comment['author_id'] == user['id']}, _is_child_role={_is_child_role(current_role) if current_role else 'N/A'}")
                 
                 if not can_delete:
-                    log.warning(f"Permission denied: {reason}")
+                    log.warning(f"⛔ DELETE BLOCKED: Permission denied: {reason}")
                     return corsify(jsonify({"ok": False, "error": "insufficient_permissions"}), origin), 403
+                
+                log.info(f"✅ DELETE ALLOWED: {reason}")
 
                 # Delete the comment
                 log.info(f"Deleting comment {comment_id}")
