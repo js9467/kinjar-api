@@ -332,26 +332,65 @@ DATABASE_URL = os.getenv("DATABASE_URL")  # may be unset/invalid at boot
 pool: Optional[ConnectionPool] = None
 DB_READY = False
 DB_ERR = None
+DB_ERR_AT = 0.0
+
+# Neon scales this database to zero when idle; the first connection after a
+# suspend waits for compute to wake. Bound each connect attempt with libpq's
+# connect_timeout (unless DATABASE_URL already sets one), validate pooled
+# connections on checkout (Neon drops them on suspend), and don't let one
+# failed cold start disable the DB for the life of the worker.
+DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "15"))
+DB_INIT_RETRY_AFTER = float(os.getenv("DB_INIT_RETRY_AFTER", "30"))
+
+
+def _db_pool_kwargs(url: str) -> dict:
+    kwargs = {"autocommit": True, "prepare_threshold": 0}
+    try:
+        has_timeout = "connect_timeout" in psycopg.conninfo.conninfo_to_dict(url)
+    except Exception:
+        has_timeout = "connect_timeout" in url
+    if not has_timeout:
+        kwargs["connect_timeout"] = DB_CONNECT_TIMEOUT
+    return kwargs
+
 
 def db_connect_once():
     """
     Initialize global connection pool and run DDL (idempotent).
     """
-    global pool, DB_READY, DB_ERR
-    if DB_READY or DB_ERR:
+    global pool, DB_READY, DB_ERR, DB_ERR_AT
+    if DB_READY:
+        return
+    if DB_ERR and (DB_ERR == "Database not configured" or time.time() - DB_ERR_AT < DB_INIT_RETRY_AFTER):
         return
     try:
         if not DATABASE_URL or DATABASE_URL == "postgresql://localhost/kinjar_dev":
             log.warning("DATABASE_URL not set or using development default - some features may not work")
             DB_ERR = "Database not configured"
             return
-            
-        pool = ConnectionPool(
-            DATABASE_URL,
-            min_size=0,
-            max_size=5,
-            kwargs={"autocommit": True, "prepare_threshold": 0},
-        )
+
+        if pool is None:
+            pool = ConnectionPool(
+                DATABASE_URL,
+                min_size=0,
+                max_size=5,
+                kwargs=_db_pool_kwargs(DATABASE_URL),
+                check=ConnectionPool.check_connection,
+            )
+        # No extra retry loop needed here: pool.connection() keeps retrying the
+        # connect (with backoff) for up to the pool timeout (30s), each attempt
+        # bounded by connect_timeout, which covers a Neon cold start.
+        _db_init_ddl()
+
+        DB_READY = True
+        DB_ERR = None
+    except Exception as e:
+        DB_ERR = str(e)
+        DB_ERR_AT = time.time()
+        log.exception("DB init failed; continuing without DB (will retry in %ss)", DB_INIT_RETRY_AFTER)
+
+
+def _db_init_ddl():
         with pool.connection() as con, con.cursor() as cur:
             # --- existing media_objects DDL ---
             cur.execute("""
@@ -699,12 +738,6 @@ def db_connect_once():
                 CREATE INDEX IF NOT EXISTS idx_tenant_invitations_tenant
                   ON tenant_invitations (tenant_id, created_at DESC);
             """)
-
-        DB_READY = True
-        DB_ERR = None
-    except Exception as e:
-        DB_ERR = str(e)
-        log.exception("DB init failed; continuing without DB")
 
 def with_db():
     db_connect_once()
