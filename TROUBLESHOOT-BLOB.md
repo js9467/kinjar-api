@@ -19,7 +19,7 @@ fly secrets list
 
 ### 3. Set the correct secret
 ```powershell
-fly secrets set BLOB_READ_WRITE_TOKEN="vercel_blob_rw_ZHcVEZkPvrrn4k2C_Pinuk0x4wXUGhwjGPq1MLuwG4DGXli"
+fly secrets set BLOB_READ_WRITE_TOKEN="$BLOB_READ_WRITE_TOKEN"   # export it from your Vercel Blob store first; never commit the value
 ```
 
 ### 4. Verify it's set
