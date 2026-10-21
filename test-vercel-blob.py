@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """
 Test Vercel Blob integration directly
@@ -7,7 +8,7 @@ import sys
 
 def test_vercel_blob_direct():
     """Test Vercel Blob API directly"""
-    token = "vercel_blob_rw_ZHcVEZkPvrrn4k2C_Pinuk0x4wXUGhwjGPq1MLuwG4DGXli"
+    token = os.environ["BLOB_READ_WRITE_TOKEN"]  # set in your shell; never commit the value
     
     # Test file content
     test_content = b"Test image content for Vercel Blob"
@@ -23,7 +24,6 @@ def test_vercel_blob_direct():
     
     print(f"🧪 Testing Vercel Blob API directly...")
     print(f"URL: {upload_url}")
-    print(f"Token: {token[:20]}...")
     
     try:
         # Use PUT request with direct file upload

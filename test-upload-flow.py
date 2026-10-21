@@ -49,7 +49,7 @@ def test_upload_and_post():
         "description": "Test family for upload verification",
         "adminName": "Test Admin",
         "adminEmail": f"test{int(time.time())}@testupload.family", 
-        "password": "TestPass123!",
+        "password": os.environ["TEST_FAMILY_PASSWORD"],
         "isPublic": True
     }
     
